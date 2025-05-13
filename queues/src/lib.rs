@@ -1,4 +1,5 @@
 pub mod spsc;
+pub mod mpsc;
 
 pub use spsc::LamportQueue;
 pub use spsc::DynListQueue;
@@ -10,6 +11,8 @@ pub use spsc::PopError;
 pub use spsc::IffqQueue;
 pub use spsc::BiffqQueue;
 pub use spsc::FfqQueue;
+
+pub use mpsc::DrescherQueue;
 
 // Common interface for all spsc queues.
 pub trait SpscQueue<T: Send>: Send + 'static {
@@ -25,4 +28,30 @@ pub trait SpscQueue<T: Send>: Send + 'static {
     fn available(&self) -> bool;
     /// True when a subsequent `pop` will fail.
     fn empty(&self) -> bool;
+}
+
+// Common interface for all MPSC queues.
+pub trait MpscQueue<T: Send>: Send + Sync + 'static { // Added Sync since producers access it concurrently
+    // Error on push, e.g., when the queue is full or allocation fails.
+    // Using T allows the producer to retrieve the item if push fails.
+    type PushError;
+    // Error on pop, e.g., when the queue is empty.
+    type PopError;
+
+    // Attempts to push an item into the queue.
+    // Called by producers.
+    fn push(&self, item: T) -> Result<(), Self::PushError>;
+
+    // Attempts to pop an item from the queue.
+    // Called by the single consumer.
+    fn pop(&self) -> Result<T, Self::PopError>;
+
+    // Returns `true` if the queue is empty.
+    // Typically called by the consumer.
+    fn is_empty(&self) -> bool;
+
+    // Returns `true` if the queue is full or cannot accept more items at the moment.
+    // Typically called by producers.
+    // For DrescherQueue, this would relate to the node pool capacity.
+    fn is_full(&self) -> bool; // Or consider `has_capacity()` or `can_push()`
 }

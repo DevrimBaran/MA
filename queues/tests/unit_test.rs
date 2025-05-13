@@ -1,8 +1,6 @@
-// spsc_queues/tests/unit_test.rs
-
-use spsc_queues::DehnaviQueue; 
-use spsc_queues::SpscQueue;    
-use spsc_queues::spsc::PopError; // Ensure this path is valid based on your exports
+use queues::DehnaviQueue; 
+use queues::SpscQueue;    
+use queues::spsc::PopError; // Ensure this path is valid based on your exports
 
 
 use std::sync::atomic::Ordering; 

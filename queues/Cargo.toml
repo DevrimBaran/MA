@@ -1,5 +1,5 @@
 [package]
-name = "spsc_queues"
+name = "queues"
 version = "0.1.0"
 edition = "2021"
 
@@ -20,7 +20,12 @@ nix        = "0.30.1"
 bench = ["criterion"]
 
 [[bench]]
-name = "process_bench"
+name = "spsc_bench"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "mpsc_bench"
 harness = false
 required-features = ["bench"]
 

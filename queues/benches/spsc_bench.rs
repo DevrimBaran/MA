@@ -11,7 +11,7 @@ use nix::{
 }; 
 
 // Import all necessary queue types and the main SpscQueue trait 
-use spsc_queues::{ 
+use queues::{ 
    BQueue, LamportQueue, MultiPushQueue, UnboundedQueue, SpscQueue, DynListQueue, DehnaviQueue,
    IffqQueue, BiffqQueue, FfqQueue
 }; 

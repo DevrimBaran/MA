@@ -1,3 +1,4 @@
+// bqueue from wang et al. 2013
 #![allow(clippy::cast_possible_truncation)]
 
 use crate::SpscQueue;
@@ -6,17 +7,16 @@ use std::mem;
 use std::mem::MaybeUninit;
 use std::ptr;
 
-// B-Queue from Wang
 #[repr(C)]
 pub struct BQueue<T: Send + 'static> {
     buf: *mut MaybeUninit<Option<T>>,
     cap: usize,
     mask: usize,
-    head: Cell<usize>, // next slot to write (producer)
-    batch_head: Cell<usize>, // probe boundary (producer)
-    tail: Cell<usize>, // next slot to read (consumer)
-    batch_tail: Cell<usize>, // probe boundary (consumer)
-    history: Cell<usize>, // adaptive backtracking start size
+    head: Cell<usize>,
+    batch_head: Cell<usize>,
+    tail: Cell<usize>,
+    batch_tail: Cell<usize>,
+    history: Cell<usize>,
 }
 
 // Fixed batch size constant, available throughout the module
@@ -137,7 +137,7 @@ impl<T: Send + 'static> BQueue<T> {
                 return Err(());
             }
         }
-        // retry fast path
+        // retry faster way
         let t2 = self.tail.get();
         unsafe {
             let slot = self.buf.add(t2) as *mut Option<T>;

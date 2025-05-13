@@ -29,7 +29,7 @@ struct RingSlot<T: Send + 'static> {
     pid:  AtomicU32,
     len:  AtomicUsize,
     flag: AtomicU32, // CHILD_READY | BOTH_READY
-    initialized: AtomicBool, // Whether this slot is ready to use
+    initialized: AtomicBool, // Whether slot is ready to use
 }
 
 // queue header
@@ -73,7 +73,7 @@ impl<T: Send + 'static> UnboundedQueue<T> {
         }
     
         // For anonymous shared memory, we don't need to check FDs
-        // We just need to make sure the pointers are valid
+        // make sure pointers are valid
         unsafe {
             let write_ptr = *self.write.get();
             let read_ptr = *self.read.get();
@@ -92,7 +92,7 @@ impl<T: Send + 'static> UnboundedQueue<T> {
         }
     }
     
-    // Get a new ring buffer - wait-free operation
+    // Get a new ring buffer
     fn get_new_ring(&self) -> Option<*mut LamportQueue<T>> {
         // First try to get a preallocated ring
         let next_free = self.next_free_ring.load(Ordering::Relaxed);
@@ -107,12 +107,11 @@ impl<T: Send + 'static> UnboundedQueue<T> {
             }
         }
         
-        // Then try to get one from the pool (non-blocking)
+        // Then try to get one from the pool
         if let Some((ring, _, _, _)) = self.pool_pop_prod_nonblocking() {
             return Some(ring);
         }
         
-        // As a fallback for truly exceptional cases (not wait-free but rarely needed)
         // Just return none to indicate no ring is available
         None
     }
@@ -150,7 +149,7 @@ impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
             return Err(());
         }
     
-        // 1) Fast‐path: try the current producer ring
+        // first try the current producer ring
         let cur = unsafe { *self.write.get() };
         if cur.is_null() {
             return Err(());
@@ -160,26 +159,26 @@ impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
             return unsafe { (&*cur).push(item) };
         }
     
-        // 2) Slow‐path: ring is full → grab a fresh one (wait-free)
+        // ring is full → grab a fresh one
         let new_ring = self
             .get_new_ring()
             .ok_or(())?;
     
-        // 3) Publish it for future pushes
+        // Publish it for future pushes
         unsafe { *self.write.get() = new_ring; }
     
-        // 4) Push into the fresh, empty ring (must succeed)
+        // Push into the fresh, empty ring
         unsafe { (&*new_ring).push(item) }.map_err(|_| ())
     }
     
-    // Wait-free pop implementation
+    // pop implementation
     fn pop(&self) -> Result<T, Self::PopError> {
-        // 0) Sanity check
+        // Sanity check
         if !self.ensure_fixed() {
             return Err(());
         }
     
-        // 1) Fast‐path: pop from the current consumer ring
+        // first try to pop from the current consumer ring
         let mut cur = unsafe { *self.read.get() };
         if cur.is_null() {
             return Err(());
@@ -188,20 +187,16 @@ impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
             return Ok(v);
         }
     
-        // 2) If ring is empty but producer has moved on, we must switch rings
+        // If ring is empty but producer has moved on, switch rings
         let write_ptr = unsafe { *self.write.get() };
         if cur == write_ptr {
             // truly empty
             return Err(());
         }
     
-        // 3) Double-check emptiness (avoid races), then recycle old ring
+        // Double-check emptiness (avoid races), then recycle old ring
         if unsafe { (&*cur).empty() } {
             // Return this now-empty ring to the shared pool
-            //
-            //   fd = u32::MAX (we don’t use FDs here),
-            //   len = the ring’s shared_size (fixed_len),
-            //   is_static = false
             let len = self.fixed_len.load(Ordering::Acquire);
             self.pool_push_prod(cur, u32::MAX, len, false);
     
@@ -215,7 +210,7 @@ impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
             cur = next;
         }
     
-        // 4) Finally, pop from that new ring
+        // Finally, pop from that new ring
         unsafe { (&*cur).pop() }
     }
     
@@ -358,7 +353,7 @@ impl<T: Send + 'static> UnboundedQueue<T> {
     }
 }
 
-// pool helpers – producer (non-blocking)
+// pool helpers – producer
 impl<T: Send + 'static> UnboundedQueue<T> {
    // Attempts to get a buffer from the pool without blocking
     fn pool_pop_prod_nonblocking(&self) -> Option<(*mut LamportQueue<T>, u32, usize, bool)> {
@@ -431,7 +426,7 @@ impl<T: Send + 'static> UnboundedQueue<T> {
             if is_static {
                 0
             } else {
-                // Here we cast inside the unsafe, so no dangling `as` at top level
+                // cast inside the unsafe, so no dangling `as` at top level
                 unsafe { libc::getpid() as u32 }
             },
             Ordering::Relaxed,

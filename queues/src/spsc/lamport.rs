@@ -12,7 +12,7 @@ use std::{
 #[derive(Debug)]
 pub struct LamportQueue<T: Send> {
    mask: usize, // cap − 1
-   buf : ManuallyDrop<Box<[UnsafeCell<Option<T>>]>>, // shared ring storage
+   pub buf : ManuallyDrop<Box<[UnsafeCell<Option<T>>]>>, // shared ring storage (pub so dspsc can use it)
    head: AtomicUsize, // mutated by consumer
    tail: AtomicUsize, // mutated by producer
 }
@@ -76,6 +76,32 @@ impl<T: Send> LamportQueue<T> {
    }
 }
 
+// helper for mspsc:
+impl<T: Send> LamportQueue<T> {
+   // Ring capacity (power‑of‑two)
+   #[inline] pub fn capacity(&self) -> usize { self.mask + 1 }
+
+   // Producer cursor (called `head` in Torquati’s multipush code).
+   #[inline] pub fn head_relaxed(&self) -> usize {
+      self.tail.load(Ordering::Relaxed)
+   }
+
+   // Consumer cursor (`tail` in Torquati’s notation).
+   #[inline] pub fn tail_relaxed(&self) -> usize {
+      self.head.load(Ordering::Relaxed)
+   }
+
+   // Write without checking space. Caller guarantees at least one free slot.
+   // Used only by the producer side of MultiPushQueue.
+   #[inline]
+   pub unsafe fn push_unchecked(&mut self, item: T) {
+      let tail = self.tail.load(Ordering::Relaxed);
+      let slot = self.idx(tail);
+      (*self.buf[slot].get()) = Some(item);
+      self.tail.store(tail.wrapping_add(1), Ordering::Relaxed);
+   }
+}
+
 // queue operations
 impl<T: Send + 'static> SpscQueue<T> for LamportQueue<T> {
    type PushError = ();
@@ -83,7 +109,6 @@ impl<T: Send + 'static> SpscQueue<T> for LamportQueue<T> {
 
    #[inline]
    fn push(&self, item: T) -> Result<(), ()> {
-      // CHANGES: Relaxed -> Acquire/Release memory ordering for process safety
       
       // Load the current tail position
       let tail = self.tail.load(Ordering::Acquire);
@@ -123,7 +148,7 @@ impl<T: Send + 'static> SpscQueue<T> for LamportQueue<T> {
       let slot = self.idx(head);
       
       // Take the item from the queue
-      // We use take() to move the value out, leaving None in its place
+      // using take() to move the value out, leaving None in its place
       let cell_ptr = &self.buf[slot];
       let val = unsafe {         
          // Extract the value
@@ -143,7 +168,7 @@ impl<T: Send + 'static> SpscQueue<T> for LamportQueue<T> {
 
    #[inline]
    fn available(&self) -> bool {
-      // changes: Use consistent memory ordering
+      // Use consistent memory ordering
       let tail = self.tail.load(Ordering::Acquire);
       let head = self.head.load(Ordering::Acquire);
       tail.wrapping_sub(head) < self.mask
@@ -151,7 +176,7 @@ impl<T: Send + 'static> SpscQueue<T> for LamportQueue<T> {
 
    #[inline]
    fn empty(&self) -> bool {
-      // changes: Use consistent memory ordering for both loads
+      // Use consistent memory ordering for both loads
       let head = self.head.load(Ordering::Acquire);
       let tail = self.tail.load(Ordering::Acquire);
       head == tail

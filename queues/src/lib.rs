@@ -5,12 +5,17 @@ pub use spsc::DynListQueue;
 pub use spsc::UnboundedQueue;
 pub use spsc::MultiPushQueue;
 pub use spsc::BQueue;
+pub use spsc::DehnaviQueue;
+pub use spsc::PopError;
+pub use spsc::IffqQueue;
+pub use spsc::BiffqQueue;
+pub use spsc::FfqQueue;
 
-/// Common interface for all queues.
+// Common interface for all spsc queues.
 pub trait SpscQueue<T: Send>: Send + 'static {
-    /// Error on push when the queue is full.
+    // Error on push when the queue is full.
     type PushError;
-    /// Error on pop when the queue is empty.
+    // Error on pop when the queue is empty.
     type PopError;
 
     fn push(&self, item: T) -> Result<(), Self::PushError>;

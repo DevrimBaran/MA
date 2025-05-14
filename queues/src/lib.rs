@@ -13,6 +13,7 @@ pub use spsc::BiffqQueue;
 pub use spsc::FfqQueue;
 
 pub use mpsc::DrescherQueue;
+pub use mpsc::JayantiPetrovicMpscQueue;
 
 // Common interface for all spsc queues.
 pub trait SpscQueue<T: Send>: Send + 'static {
@@ -54,4 +55,11 @@ pub trait MpscQueue<T: Send>: Send + Sync + 'static { // Added Sync since produc
     // Typically called by producers.
     // For DrescherQueue, this would relate to the node pool capacity.
     fn is_full(&self) -> bool; // Or consider `has_capacity()` or `can_push()`
+}
+
+pub trait BenchMpscQueue<T: Send>: Send + Sync + 'static {
+    fn bench_push(&self, item: T, producer_id: usize) -> Result<(), ()>;
+    fn bench_pop(&self) -> Result<T, ()>;
+    fn bench_is_empty(&self) -> bool;
+    fn bench_is_full(&self) -> bool;
 }

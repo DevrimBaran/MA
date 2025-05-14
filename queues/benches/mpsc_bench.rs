@@ -18,7 +18,7 @@ use nix::{
 const PERFORMANCE_TEST: bool = false; // Set to false for testing
 
 // Constants for MPSC benchmark
-const NUM_PRODUCERS: usize = 5;
+const NUM_PRODUCERS: usize = 14;
 const ITEMS_PER_PRODUCER: usize = 1_000_000;
 const TOTAL_ITEMS: usize = NUM_PRODUCERS * ITEMS_PER_PRODUCER;
 const NODE_CAPACITY: usize = TOTAL_ITEMS + NUM_PRODUCERS;
@@ -187,8 +187,8 @@ where
 
    if (consumed_count < total_items_to_produce) && (PERFORMANCE_TEST == false) {
        eprintln!(
-           "Warning: MPSC Consumer consumed {}/{} items. Queue type: JayantiPetrovicMpscQueue",
-           consumed_count, total_items_to_produce
+           "Warning: MPSC Consumer consumed {}/{} items. Queue type: {}",
+           consumed_count, total_items_to_produce, std::any::type_name::<Q>()
        );
    }
 
@@ -275,7 +275,7 @@ criterion_group! {
    name = mpsc_benches;
    config = custom_criterion();
    targets =
-      //bench_drescher_mpsc,
+      bench_drescher_mpsc,
       bench_jayanti_petrovic_mpsc,
 }
 criterion_main!(mpsc_benches);

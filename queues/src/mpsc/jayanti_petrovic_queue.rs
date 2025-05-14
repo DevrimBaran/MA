@@ -432,24 +432,30 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
 
     // Dequeue method (Single Consumer)
     pub fn dequeue(&self) -> Option<T> {
-        unsafe {
-            if self.num_producers == 0 { return None; } 
-            let root_node = self.get_tree_node(0);
-            let min_info_at_root = root_node.read_min_info();
-
-            if min_info_at_root.ts == INFINITY_TS {
-                return None; // Queue is empty
-            }
-
-            let target_producer_id = min_info_at_root.leaf_idx;
-            // Basic sanity check, though a correct tree should always yield valid idx if not INFINITY_TS
-            if target_producer_id >= self.num_producers { 
-                 eprintln!(
-                    "JayantiPetrovicMpscQueue: Corrupted tree state. Root MinInfo: {:?}, NumProducers: {}",
-                     min_info_at_root, self.num_producers
-                 );
-                 return None; // Or panic, indicates serious corruption
-            }
+      unsafe {
+         if self.num_producers == 0 { return None; } 
+         let root_node = self.get_tree_node(0);
+         let min_info_at_root = root_node.read_min_info();
+ 
+         if min_info_at_root.ts == INFINITY_TS {
+             return None; // Queue is empty
+         }
+ 
+         let target_producer_id = min_info_at_root.leaf_idx;
+         // Enhanced bounds check - handle the invalid leaf_idx case
+         if target_producer_id >= self.num_producers || target_producer_id == usize::MAX { 
+             // Instead of just logging, we can try to recover by refreshing the tree
+             self.refresh(0); // Try refreshing the root node
+             // Try reading again
+             let min_info_at_root_retry = root_node.read_min_info();
+             if min_info_at_root_retry.ts == INFINITY_TS || 
+                min_info_at_root_retry.leaf_idx >= self.num_producers ||
+                min_info_at_root_retry.leaf_idx == usize::MAX {
+                 return None; // Still corrupted, can't recover
+             }
+             // If we recovered, use the new value
+             return self.dequeue();
+         }
 
             let local_q_to_dequeue = self.get_local_queue(target_producer_id);
             

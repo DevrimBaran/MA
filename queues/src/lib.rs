@@ -14,6 +14,7 @@ pub use spsc::FfqQueue;
 
 pub use mpsc::DrescherQueue;
 pub use mpsc::JayantiPetrovicMpscQueue;
+pub use mpsc::JiffyQueue;
 
 // Common interface for all spsc queues.
 pub trait SpscQueue<T: Send>: Send + 'static {

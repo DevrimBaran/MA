@@ -18,17 +18,15 @@ use nix::{
 
 const PERFORMANCE_TEST: bool = false;
 
-const NUM_PRODUCERS_CONFIG: usize = 14;
+// ITEMS_PER_PRODUCER_TARGET defines how many items EACH producer will send in a given run.
+// The total number of items processed will be num_producers * ITEMS_PER_PRODUCER_TARGET.
 const ITEMS_PER_PRODUCER_TARGET: usize = 1_000_000; 
 
-// Capacity calculations for specific queues
-const DRESCHER_NODE_CAPACITY_DEFAULT: usize = (NUM_PRODUCERS_CONFIG * ITEMS_PER_PRODUCER_TARGET) + NUM_PRODUCERS_CONFIG;
+// JiffyQueue specific parameters, nodes per buffer remains constant.
 const JIFFY_NODES_PER_BUFFER_BENCH: usize = 4860;
-const JIFFY_MAX_BUFFERS_BENCH_DEFAULT: usize = if (NUM_PRODUCERS_CONFIG * ITEMS_PER_PRODUCER_TARGET) > 0 && JIFFY_NODES_PER_BUFFER_BENCH > 0 {
-    ((NUM_PRODUCERS_CONFIG * ITEMS_PER_PRODUCER_TARGET) / JIFFY_NODES_PER_BUFFER_BENCH) + NUM_PRODUCERS_CONFIG + 10
-} else {
-    NUM_PRODUCERS_CONFIG + 10
-};
+
+// Array of producer counts to test
+const PRODUCER_COUNTS_TO_TEST: &[usize] = &[1, 2, 4, 8, 14];
 
 trait BenchMpscQueue<T: Send>: Send + Sync + 'static {
     fn bench_push(&self, item: T, producer_id: usize) -> Result<(), ()>;
@@ -203,91 +201,94 @@ where
 }
 
 
-// Benchmark Functions
+// --- Benchmark Functions ---
 
 fn bench_drescher_mpsc(c: &mut Criterion) {
     let mut group = c.benchmark_group("DrescherMPSC");
-    let num_prods = NUM_PRODUCERS_CONFIG.max(1); 
-    let items_per_prod = ITEMS_PER_PRODUCER_TARGET; // Each producer sends this many
-    let total_items_run = num_prods * items_per_prod;
+    for &num_prods_current_run in PRODUCER_COUNTS_TO_TEST.iter().filter(|&&p| p > 0) {
+        let items_per_prod = ITEMS_PER_PRODUCER_TARGET; 
+        let total_items_run = num_prods_current_run * items_per_prod;
 
-    group.bench_function(
-        format!("{}Prod_{}ItemsPer", num_prods, items_per_prod),
-        |b: &mut Bencher| {
-            b.iter_custom(|_iters| {
-                fork_and_run_mpsc::<DrescherQueue<usize>, _>(
-                || {
-                    let node_cap = total_items_run + num_prods; // Capacity based on total items for this run
-                    let bytes = DrescherQueue::<usize>::shared_size(node_cap);
-                    let shm_ptr = unsafe { map_shared(bytes) };
-                    let q = unsafe { DrescherQueue::init_in_shared(shm_ptr, node_cap) };
-                    (q, shm_ptr, bytes)
-                },
-                num_prods,
-                items_per_prod, // Pass items EACH producer should send
-                )
-            })
-        },
-    );
+        group.bench_function(
+            format!("{}Prod_{}ItemsPer", num_prods_current_run, items_per_prod),
+            |b: &mut Bencher| {
+                b.iter_custom(|_iters| {
+                    fork_and_run_mpsc::<DrescherQueue<usize>, _>(
+                    || {
+                        let node_cap = total_items_run + num_prods_current_run;
+                        let bytes = DrescherQueue::<usize>::shared_size(node_cap);
+                        let shm_ptr = unsafe { map_shared(bytes) };
+                        let q = unsafe { DrescherQueue::init_in_shared(shm_ptr, node_cap) };
+                        (q, shm_ptr, bytes)
+                    },
+                    num_prods_current_run,
+                    items_per_prod,
+                    )
+                })
+            },
+        );
+    }
     group.finish();
 }
 
 fn bench_jayanti_petrovic_mpsc(c: &mut Criterion) {
     let mut group = c.benchmark_group("JayantiPetrovicMPSC");
-    let num_prods = NUM_PRODUCERS_CONFIG.max(1);
-    let items_per_prod = ITEMS_PER_PRODUCER_TARGET; // Each producer sends this many
-    let total_items_run = num_prods * items_per_prod;
-    let node_pool_capacity = total_items_run + num_prods * 2; // Pool capacity based on total
+    for &num_prods_current_run in PRODUCER_COUNTS_TO_TEST.iter().filter(|&&p| p > 0) {
+        let items_per_prod = ITEMS_PER_PRODUCER_TARGET;
+        let total_items_run = num_prods_current_run * items_per_prod;
+        let node_pool_capacity = total_items_run + num_prods_current_run * 2;
 
-    group.bench_function(
-        format!("{}Prod_{}ItemsPer", num_prods, items_per_prod),
-        |b: &mut Bencher| {
-            b.iter_custom(|_iters| {
-                fork_and_run_mpsc::<JayantiPetrovicMpscQueue<usize>, _>(
-                    || {
-                        let bytes = JayantiPetrovicMpscQueue::<usize>::shared_size(num_prods, node_pool_capacity);
-                        let shm_ptr = unsafe { map_shared(bytes) };
-                        let q = unsafe { JayantiPetrovicMpscQueue::init_in_shared(shm_ptr, num_prods, node_pool_capacity) };
-                        (q, shm_ptr, bytes)
-                    },
-                    num_prods,
-                    items_per_prod,
-                )
-            })
-        },
-    );
+        group.bench_function(
+            format!("{}Prod_{}ItemsPer", num_prods_current_run, items_per_prod),
+            |b: &mut Bencher| {
+                b.iter_custom(|_iters| {
+                    fork_and_run_mpsc::<JayantiPetrovicMpscQueue<usize>, _>(
+                        || {
+                            let bytes = JayantiPetrovicMpscQueue::<usize>::shared_size(num_prods_current_run, node_pool_capacity);
+                            let shm_ptr = unsafe { map_shared(bytes) };
+                            let q = unsafe { JayantiPetrovicMpscQueue::init_in_shared(shm_ptr, num_prods_current_run, node_pool_capacity) };
+                            (q, shm_ptr, bytes)
+                        },
+                        num_prods_current_run,
+                        items_per_prod,
+                    )
+                })
+            },
+        );
+    }
     group.finish();
 }
 
 fn bench_jiffy_mpsc(c: &mut Criterion) {
     let mut group = c.benchmark_group("JiffyMPSC");
-    let num_prods = NUM_PRODUCERS_CONFIG.max(1);
-    let items_per_prod = ITEMS_PER_PRODUCER_TARGET; // Each producer sends this many
-    let total_items_run = num_prods * items_per_prod;
-    
-    let jiffy_max_buffers = if total_items_run > 0 && JIFFY_NODES_PER_BUFFER_BENCH > 0 {
-        (total_items_run / JIFFY_NODES_PER_BUFFER_BENCH) + num_prods + 10
-    } else {
-        num_prods + 10
-    };
+    for &num_prods_current_run in PRODUCER_COUNTS_TO_TEST.iter().filter(|&&p| p > 0) {
+        let items_per_prod = ITEMS_PER_PRODUCER_TARGET;
+        let total_items_run = num_prods_current_run * items_per_prod;
+        
+        let jiffy_max_buffers = if total_items_run > 0 && JIFFY_NODES_PER_BUFFER_BENCH > 0 {
+            (total_items_run / JIFFY_NODES_PER_BUFFER_BENCH) + num_prods_current_run + 10
+        } else {
+            num_prods_current_run + 10
+        };
 
-    group.bench_function(
-        format!("{}Prod_{}ItemsPer", num_prods, items_per_prod),
-        |b: &mut Bencher| {
-            b.iter_custom(|_iters| {
-                fork_and_run_mpsc::<JiffyQueue<usize>, _>(
-                    || {
-                        let bytes = JiffyQueue::<usize>::shared_size(JIFFY_NODES_PER_BUFFER_BENCH, jiffy_max_buffers);
-                        let shm_ptr = unsafe { map_shared(bytes) };
-                        let q = unsafe { JiffyQueue::init_in_shared(shm_ptr, JIFFY_NODES_PER_BUFFER_BENCH, jiffy_max_buffers) };
-                        (q, shm_ptr, bytes)
-                    },
-                    num_prods,
-                    items_per_prod,
-                )
-            })
-        },
-    );
+        group.bench_function(
+            format!("{}Prod_{}ItemsPer", num_prods_current_run, items_per_prod),
+            |b: &mut Bencher| {
+                b.iter_custom(|_iters| {
+                    fork_and_run_mpsc::<JiffyQueue<usize>, _>(
+                        || {
+                            let bytes = JiffyQueue::<usize>::shared_size(JIFFY_NODES_PER_BUFFER_BENCH, jiffy_max_buffers);
+                            let shm_ptr = unsafe { map_shared(bytes) };
+                            let q = unsafe { JiffyQueue::init_in_shared(shm_ptr, JIFFY_NODES_PER_BUFFER_BENCH, jiffy_max_buffers) };
+                            (q, shm_ptr, bytes)
+                        },
+                        num_prods_current_run,
+                        items_per_prod,
+                    )
+                })
+            },
+        );
+    }
     group.finish();
 }
 

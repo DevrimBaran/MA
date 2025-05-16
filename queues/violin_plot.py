@@ -17,10 +17,11 @@ BENCHMARK_FUNCTION_IDS = [
    "Dehnavi",
    "Iffq",
    "Biffq",
-   "FFq"
+   "FFq",
+   "JiffySPSC"
 ]
 
-OUTPUT_PLOT_FILE = 'spsc_queue_performance_violin.png'
+OUTPUT_PLOT_FILE = 'spsc_queue_performance_violin_test.png'
 PLOT_TITLE = 'Performance Comparison for IPC SPSC Queues via shared memory'
 Y_AXIS_LABEL = 'Execution Time per Iteration (microseconds)'
 

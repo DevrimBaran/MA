@@ -13,9 +13,9 @@ use std::{
 #[inline(always)]
 const fn null_node<T: Send>() -> *mut Node<T> { null_mut() }
 
-const PREALLOCATED_NODES: usize = 1024; 
-const NODE_CACHE_CAPACITY: usize = 4096; 
-const CACHE_LINE_SIZE: usize = 512;
+const PREALLOCATED_NODES: usize = 16384; 
+const NODE_CACHE_CAPACITY: usize = 32768; 
+const CACHE_LINE_SIZE: usize = 8192;
 
 // Simple logging for debugging
 fn log_msg(msg: &str) {

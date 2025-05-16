@@ -298,38 +298,6 @@ fn bench_jiffy_mpsc(c: &mut Criterion) {
     group.finish();
 }
 
-// --- Test with larger number of producers ---
-fn bench_jiffy_mpsc_many_producers(c: &mut Criterion) {
-    let mut group = c.benchmark_group("JiffyMPSC_ManyProducers");
-    
-    // Test with larger number of producers
-    for num_producers in [16, 32, 64].iter() {
-        group.bench_function(
-            format!("{}Prod_{}ItemsPerProd", num_producers, ITEMS_PER_PRODUCER / num_producers),
-            |b: &mut Bencher| {
-                b.iter_custom(|_iters| {
-                    fork_and_run_mpsc::<JiffyQueue<usize>, _>(
-                        || {
-                            // We need more buffers for many producers
-                            let adjusted_max_buffers = JIFFY_MAX_BUFFERS_BENCH + num_producers;
-                            
-                            let bytes = JiffyQueue::<usize>::shared_size(JIFFY_NODES_PER_BUFFER_BENCH, adjusted_max_buffers);
-                            let shm_ptr = unsafe { map_shared(bytes) };
-                            let q_mut_ref = unsafe { 
-                                JiffyQueue::init_in_shared(shm_ptr, JIFFY_NODES_PER_BUFFER_BENCH, adjusted_max_buffers) 
-                            };
-                            (q_mut_ref, shm_ptr, bytes)
-                        },
-                        *num_producers,
-                        ITEMS_PER_PRODUCER / num_producers, // Scale items to keep total constant
-                    )
-                })
-            },
-        );
-    }
-    group.finish();
-}
-
 // --- Criterion Setup ---
 fn custom_criterion() -> Criterion {
    Criterion::default()
@@ -342,8 +310,8 @@ criterion_group! {
    name = mpsc_benches;
    config = custom_criterion();
    targets =
-      //bench_drescher_mpsc,
-      //bench_jayanti_petrovic_mpsc,
+      bench_drescher_mpsc,
+      bench_jayanti_petrovic_mpsc,
       bench_jiffy_mpsc,
 }
 criterion_main!(mpsc_benches);

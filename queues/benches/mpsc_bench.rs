@@ -7,6 +7,7 @@ use criterion::{criterion_group, criterion_main, Criterion, Bencher};
 use queues::mpsc::{DrescherQueue, JayantiPetrovicMpscQueue, JiffyQueue}; // Added JiffyQueue
 use queues::MpscQueue; // Use the main MpscQueue trait from your crate
 
+use core::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use std::ptr;
@@ -87,7 +88,7 @@ impl<T: Send + Clone + 'static> BenchMpscQueue<T> for JayantiPetrovicMpscQueue<T
 }
 
 // --- Impl for JiffyQueue using the local BenchMpscQueue trait ---
-impl<T: Send + 'static + Clone> BenchMpscQueue<T> for JiffyQueue<T> {
+impl<T: Send + 'static + Clone + fmt::Debug> BenchMpscQueue<T> for JiffyQueue<T> {
     fn bench_push(&self, item: T, _producer_id: usize) -> Result<(), ()> {
         // Jiffy's MpscQueue impl of push doesn't use producer_id from its signature
         MpscQueue::push(self, item).map_err(|_| ())
@@ -341,8 +342,8 @@ criterion_group! {
    name = mpsc_benches;
    config = custom_criterion();
    targets =
-      bench_drescher_mpsc,
-      bench_jayanti_petrovic_mpsc,
+      //bench_drescher_mpsc,
+      //bench_jayanti_petrovic_mpsc,
       bench_jiffy_mpsc,
 }
 criterion_main!(mpsc_benches);

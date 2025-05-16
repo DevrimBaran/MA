@@ -15,9 +15,6 @@ use queues::{
    BQueue, LamportQueue, MultiPushQueue, UnboundedQueue, SpscQueue, DynListQueue, DehnaviQueue,
    IffqQueue, BiffqQueue, FfqQueue
 }; 
-// Import JiffyQueue and the MpscQueue trait for the adapter
-use queues::mpsc::JiffyQueue;
-use queues::MpscQueue as GenericMpscQueue;
 
 use std::sync::atomic::{AtomicU32, Ordering}; // AtomicBool no longer needed for fork_and_run
 
@@ -25,14 +22,6 @@ const PERFORMANCE_TEST: bool = false; // Set to true for actual perf runs, false
 
 const RING_CAP: usize = 65_536;
 const ITERS:     usize = 40_000_000; 
-
-// JiffyQueue specific parameters for SPSC benchmark context
-const JIFFY_NODES_PER_BUFFER_SPSC: usize = 4860; 
-const JIFFY_MAX_BUFFERS_SPSC: usize = if ITERS > 0 && JIFFY_NODES_PER_BUFFER_SPSC > 0 {
-    (ITERS / JIFFY_NODES_PER_BUFFER_SPSC) + 1 + 10 // +1 for the single producer, +10 for safety
-} else {
-    1 + 10
-};
 
 
 // Helper trait for benchmarking SPSC-like queues
@@ -121,12 +110,7 @@ impl<T: Send + 'static> BenchSpscQueue<T> for FfqQueue<T> {
    fn bench_is_empty(&self) -> bool { SpscQueue::empty(self) }
    fn bench_is_full(&self) -> bool { !SpscQueue::available(self) }
 }
-impl<T: Send + 'static> BenchSpscQueue<T> for JiffyQueue<T> {
-    fn bench_push(&self, item: T) -> Result<(), ()> { GenericMpscQueue::push(self, item).map_err(|_| ()) }
-    fn bench_pop(&self) -> Result<T, ()> { GenericMpscQueue::pop(self).map_err(|_| ()) }
-    fn bench_is_empty(&self) -> bool { GenericMpscQueue::is_empty(self) }
-    fn bench_is_full(&self) -> bool { GenericMpscQueue::is_full(self) }
-}
+
 
 
 // --- Benchmark Functions ---
@@ -264,19 +248,6 @@ fn bench_ffq(c: &mut Criterion) {
    });
 }
 
-fn bench_jiffy_spsc(c: &mut Criterion) {
-    c.bench_function("JiffySPSC", |b| { 
-        b.iter_custom(|_iters| {
-            let bytes = JiffyQueue::<usize>::shared_size(JIFFY_NODES_PER_BUFFER_SPSC, JIFFY_MAX_BUFFERS_SPSC);
-            let shm_ptr = unsafe { map_shared(bytes) };
-            let q = unsafe { JiffyQueue::init_in_shared(shm_ptr, JIFFY_NODES_PER_BUFFER_SPSC, JIFFY_MAX_BUFFERS_SPSC) };
-            let dur = fork_and_run(q); 
-            unsafe { unmap_shared(shm_ptr, bytes); }
-            dur
-        })
-    });
-}
-
 
 // Generic fork-and-run helper - Reverted to the older, simpler style
 fn fork_and_run<Q>(q: &'static Q) -> std::time::Duration 
@@ -402,7 +373,6 @@ criterion_group!{
       bench_iffq,  
       bench_biffq,
       bench_ffq,
-      bench_jiffy_spsc, 
 } 
 criterion_main!(benches);
 

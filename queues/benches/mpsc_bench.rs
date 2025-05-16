@@ -29,7 +29,7 @@ const NODE_CAPACITY: usize = TOTAL_ITEMS + NUM_PRODUCERS;
 
 // Parameters for JiffyQueue for benchmarking
 // These need to be sensible for the scale of TOTAL_ITEMS
-const JIFFY_NODES_PER_BUFFER_BENCH: usize = 1620; // Default from Jiffy implementation
+const JIFFY_NODES_PER_BUFFER_BENCH: usize = 4860; // Default from Jiffy implementation
 const JIFFY_MAX_BUFFERS_BENCH: usize = if TOTAL_ITEMS > 0 && JIFFY_NODES_PER_BUFFER_BENCH > 0 {
     (TOTAL_ITEMS / JIFFY_NODES_PER_BUFFER_BENCH) + NUM_PRODUCERS + 10 // Ensure enough buffers + safety margin
 } else {

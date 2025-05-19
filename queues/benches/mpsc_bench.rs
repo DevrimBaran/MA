@@ -356,18 +356,18 @@ fn bench_d_queue_mpsc(c: &mut Criterion) {
 
 fn custom_criterion() -> Criterion {
     Criterion::default()
-        .warm_up_time(Duration::from_secs(3)) // Kept your original values
-        .measurement_time(Duration::from_secs(15)) 
-        .sample_size(10) 
+        .warm_up_time(Duration::from_secs(3))
+        .measurement_time(Duration::from_secs(175)) 
+        .sample_size(100) 
 }
 
 criterion_group! {
     name = mpsc_benches;
     config = custom_criterion();
     targets =
-        //bench_drescher_mpsc,
-        //bench_jayanti_petrovic_mpsc,
-        //bench_jiffy_mpsc,
-        bench_d_queue_mpsc, // <-- Add DQueue to targets
+        bench_drescher_mpsc,
+        bench_jayanti_petrovic_mpsc,
+        bench_jiffy_mpsc,
+        bench_d_queue_mpsc,
 }
 criterion_main!(mpsc_benches);

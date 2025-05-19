@@ -16,7 +16,7 @@ macro_rules! dqueue_log {
     };
 }
 
-// Needs to be sized correctly since segment recycling is not shown in paper
+// Needs to be sized correctly
 pub const L_LOCAL_BUFFER_CAPACITY: usize = 65536;  // Local buffer size for each producer
 pub const N_SEGMENT_CAPACITY: usize = 262144;     // Number of cells per segment (should be power of 2)
 

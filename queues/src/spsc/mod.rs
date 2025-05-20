@@ -8,6 +8,7 @@ pub mod biffq;
 pub mod iffq;
 pub mod ffq;
 pub mod llq;
+pub mod blq;
 
 pub use lamport::LamportQueue;
 pub use mspsc::MultiPushQueue;
@@ -20,3 +21,4 @@ pub use iffq::IffqQueue;
 pub use biffq::BiffqQueue;
 pub use ffq::FfqQueue;
 pub use llq::LlqQueue;
+pub use blq::BlqQueue;

@@ -3,7 +3,6 @@
 
 use criterion::{criterion_group, criterion_main, Criterion}; 
 use std::time::Duration; 
-use std::mem::ManuallyDrop;
 use std::ptr; 
 use nix::{ 
    libc, 
@@ -14,12 +13,13 @@ use nix::{
 // Import all necessary SPSC queue types and the main SpscQueue trait 
 use queues::{ 
    BQueue, LamportQueue, MultiPushQueue, UnboundedQueue, SpscQueue, DynListQueue, DehnaviQueue,
-   IffqQueue, BiffqQueue, FfqQueue,
+   IffqQueue, BiffqQueue, FfqQueue, BlqQueue
 }; 
 
 use std::sync::atomic::{AtomicU32, Ordering}; // AtomicBool no longer needed for fork_and_run
 
 use queues::spsc::llq::{LlqQueue, K_CACHE_LINE_SLOTS};
+use queues::spsc::blq::K_CACHE_LINE_SLOTS as BLQ_K_SLOTS;
 
 const PERFORMANCE_TEST: bool = false; // Set to true for actual perf runs, false for quicker debug runs
 
@@ -119,6 +119,12 @@ impl<T: Send + 'static> BenchSpscQueue<T> for LlqQueue<T> {
    fn bench_is_empty(&self) -> bool { SpscQueue::empty(self) }
    fn bench_is_full(&self) -> bool { !SpscQueue::available(self) }
 }
+impl<T: Send + 'static> BenchSpscQueue<T> for BlqQueue<T> {
+   fn bench_push(&self, item: T) -> Result<(), ()> { SpscQueue::push(self, item).map_err(|_| ()) }
+   fn bench_pop(&self) -> Result<T, ()> { SpscQueue::pop(self).map_err(|_| ()) }
+   fn bench_is_empty(&self) -> bool { SpscQueue::empty(self) }
+   fn bench_is_full(&self) -> bool { SpscQueue::available(self) }
+}
 
 
 
@@ -174,8 +180,6 @@ fn bench_mp(c: &mut Criterion) {
          let q       = unsafe { MultiPushQueue::init_in_shared(shm_ptr, RING_CAP) }; 
          let dur = fork_and_run(q); 
          unsafe { 
-            // If MultiPushQueue requires explicit drop before unmap, ensure its Drop impl handles it.
-            // Generally, unmapping shared memory is the primary cleanup for shm-initialized objects.
             unmap_shared(shm_ptr, bytes); 
          } 
          dur 
@@ -244,7 +248,7 @@ fn bench_biffq(c: &mut Criterion) {
 }
 
 fn bench_ffq(c: &mut Criterion) {
-    c.bench_function("FFq", |b| { 
+   c.bench_function("FFq", |b| { 
       b.iter_custom(|_iters| {
          assert!(RING_CAP.is_power_of_two() && RING_CAP > 0);
          let bytes = FfqQueue::<usize>::shared_size(RING_CAP);
@@ -277,30 +281,46 @@ fn bench_llq(c: &mut Criterion) {
          
          let dur = fork_and_run(q_static);
          
-         // Manual cleanup for items in the shared memory queue before unmapping
-         unsafe {
-            if std::mem::needs_drop::<usize>() { 
-                  let mut_q_header = &mut *(q_static as *const _ as *mut LlqQueue<usize>);
-                  let mut current_read = mut_q_header.shared_indices.read.load(Ordering::Relaxed);
-                  let current_write = mut_q_header.shared_indices.write.load(Ordering::Relaxed);
-                  while current_read != current_write {
-                     let slot_idx = current_read & mut_q_header.mask;
-                     (*mut_q_header.buffer.get_unchecked_mut(slot_idx)).get_mut().assume_init_drop();
-                     current_read = current_read.wrapping_add(1);
-                  }
-            }
-            let mut_q_for_box_defusal = &mut *(q_static as *const _ as *mut LlqQueue<usize>);
-            let md_box = std::ptr::read(&mut_q_for_box_defusal.buffer);
-            let b = ManuallyDrop::into_inner(md_box);
-            let _raw_slice_ptr = Box::into_raw(b);
-         }
-         
          unsafe { unmap_shared(shm_ptr, bytes); }
          dur
       })
    });
 }
 
+fn bench_blq(c: &mut Criterion) {
+   c.bench_function("Blq", |b| {
+      b.iter_custom(|_iters| {
+         // Ensure current_ring_cap meets BlqQueue's requirements
+         // BLQ, like LLQ, requires capacity > K_CACHE_LINE_SLOTS.
+         let current_ring_cap = if RING_CAP <= BLQ_K_SLOTS {
+            // If RING_CAP is too small, find the next power of two that is > BLQ_K_SLOTS
+            let mut min_valid_cap = (BLQ_K_SLOTS + 1).next_power_of_two();
+            if min_valid_cap <= BLQ_K_SLOTS { // Ensure it's strictly greater
+               min_valid_cap = (BLQ_K_SLOTS + 1).next_power_of_two();
+               if min_valid_cap == 0 { // next_power_of_two can return 0 for large inputs
+                  min_valid_cap = 1 << (BLQ_K_SLOTS.leading_zeros() as usize +1); // A sufficiently large power of 2
+               }
+            }
+             // As a fallback for very small K_SLOTS or edge cases with next_power_of_two:
+            if min_valid_cap < 16 { 16 } else { min_valid_cap }
+         } else {
+            RING_CAP.next_power_of_two()
+         };
+         
+         assert!(current_ring_cap.is_power_of_two());
+         assert!(current_ring_cap > BLQ_K_SLOTS);
+
+         let bytes = BlqQueue::<usize>::shared_size(current_ring_cap);
+         let shm_ptr = unsafe { map_shared(bytes) };
+         let q_static = unsafe { BlqQueue::<usize>::init_in_shared(shm_ptr, current_ring_cap) };
+         
+         let dur = fork_and_run(q_static); // Uses global ITERS
+
+         unsafe { unmap_shared(shm_ptr, bytes); }
+         dur
+      })
+   });
+}
 
 // Generic fork-and-run helper - Reverted to the older, simpler style
 fn fork_and_run<Q>(q: &'static Q) -> std::time::Duration 
@@ -379,7 +399,7 @@ where
          
          // Ensure producer has actually signaled done before waitpid, avoids racing on exit
          while sync_atomic_flag.load(Ordering::Acquire) != 3 {
-             std::hint::spin_loop();
+            std::hint::spin_loop();
          }
          waitpid(child, None).expect("SPSC waitpid failed"); 
          
@@ -435,6 +455,7 @@ criterion_group!{
       //bench_biffq,
       //bench_ffq,
       bench_llq,
+      //bench_blq,
 } 
 criterion_main!(benches);
 

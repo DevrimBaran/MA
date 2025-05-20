@@ -3,6 +3,7 @@
 
 use criterion::{criterion_group, criterion_main, Criterion}; 
 use std::time::Duration; 
+use std::mem::ManuallyDrop;
 use std::ptr; 
 use nix::{ 
    libc, 
@@ -13,10 +14,12 @@ use nix::{
 // Import all necessary SPSC queue types and the main SpscQueue trait 
 use queues::{ 
    BQueue, LamportQueue, MultiPushQueue, UnboundedQueue, SpscQueue, DynListQueue, DehnaviQueue,
-   IffqQueue, BiffqQueue, FfqQueue
+   IffqQueue, BiffqQueue, FfqQueue,
 }; 
 
 use std::sync::atomic::{AtomicU32, Ordering}; // AtomicBool no longer needed for fork_and_run
+
+use queues::spsc::llq::{LlqQueue, K_CACHE_LINE_SLOTS};
 
 const PERFORMANCE_TEST: bool = false; // Set to true for actual perf runs, false for quicker debug runs
 
@@ -107,6 +110,12 @@ impl<T: Send + 'static> BenchSpscQueue<T> for BiffqQueue<T> {
 impl<T: Send + 'static> BenchSpscQueue<T> for FfqQueue<T> {
    fn bench_push(&self, item: T) -> Result<(), ()> { SpscQueue::push(self, item).map_err(|_e| ()) }
    fn bench_pop(&self) -> Result<T, ()> { SpscQueue::pop(self).map_err(|_e| ()) }
+   fn bench_is_empty(&self) -> bool { SpscQueue::empty(self) }
+   fn bench_is_full(&self) -> bool { !SpscQueue::available(self) }
+}
+impl<T: Send + 'static> BenchSpscQueue<T> for LlqQueue<T> {
+   fn bench_push(&self, item: T) -> Result<(), ()> { SpscQueue::push(self, item).map_err(|_| ()) }
+   fn bench_pop(&self) -> Result<T, ()> { SpscQueue::pop(self).map_err(|_| ()) }
    fn bench_is_empty(&self) -> bool { SpscQueue::empty(self) }
    fn bench_is_full(&self) -> bool { !SpscQueue::available(self) }
 }
@@ -248,6 +257,50 @@ fn bench_ffq(c: &mut Criterion) {
    });
 }
 
+fn bench_llq(c: &mut Criterion) {
+   c.bench_function("Llq", |b| {
+      b.iter_custom(|_iters| {
+         // Ensure current_ring_cap meets LLQ's requirements
+         let current_ring_cap = if RING_CAP <= K_CACHE_LINE_SLOTS {
+            let min_valid_cap = (K_CACHE_LINE_SLOTS + 1).next_power_of_two();
+            if min_valid_cap < 16 { 16 } else {min_valid_cap} 
+         } else {
+            RING_CAP.next_power_of_two() 
+         };
+         
+         assert!(current_ring_cap.is_power_of_two());
+         assert!(current_ring_cap > K_CACHE_LINE_SLOTS);
+
+         let bytes = LlqQueue::<usize>::llq_shared_size(current_ring_cap);
+         let shm_ptr = unsafe { map_shared(bytes) };
+         let q_static = unsafe { LlqQueue::<usize>::init_in_shared(shm_ptr, current_ring_cap) };
+         
+         let dur = fork_and_run(q_static);
+         
+         // Manual cleanup for items in the shared memory queue before unmapping
+         unsafe {
+            if std::mem::needs_drop::<usize>() { 
+                  let mut_q_header = &mut *(q_static as *const _ as *mut LlqQueue<usize>);
+                  let mut current_read = mut_q_header.shared_indices.read.load(Ordering::Relaxed);
+                  let current_write = mut_q_header.shared_indices.write.load(Ordering::Relaxed);
+                  while current_read != current_write {
+                     let slot_idx = current_read & mut_q_header.mask;
+                     (*mut_q_header.buffer.get_unchecked_mut(slot_idx)).get_mut().assume_init_drop();
+                     current_read = current_read.wrapping_add(1);
+                  }
+            }
+            let mut_q_for_box_defusal = &mut *(q_static as *const _ as *mut LlqQueue<usize>);
+            let md_box = std::ptr::read(&mut_q_for_box_defusal.buffer);
+            let b = ManuallyDrop::into_inner(md_box);
+            let _raw_slice_ptr = Box::into_raw(b);
+         }
+         
+         unsafe { unmap_shared(shm_ptr, bytes); }
+         dur
+      })
+   });
+}
+
 
 // Generic fork-and-run helper - Reverted to the older, simpler style
 fn fork_and_run<Q>(q: &'static Q) -> std::time::Duration 
@@ -342,6 +395,14 @@ where
                std::any::type_name::<Q>() 
             ); 
          } 
+         if !PERFORMANCE_TEST && consumed_count > ITERS { 
+            eprintln!( 
+               "Warning (SPSC): Consumed {}/{} items. Q: {}",  
+               consumed_count,  
+               ITERS, 
+               std::any::type_name::<Q>() 
+            ); 
+         } 
          duration 
       } 
       Err(e) => { 
@@ -356,23 +417,24 @@ where
 fn custom_criterion() -> Criterion { 
    Criterion::default() 
       .warm_up_time(Duration::from_secs(2)) 
-      .measurement_time(Duration::from_secs(170)) 
-      .sample_size(100) 
+      .measurement_time(Duration::from_secs(15)) 
+      .sample_size(10) 
 } 
 
 criterion_group!{ 
    name = benches; 
    config = custom_criterion(); 
    targets = 
-      bench_lamport, 
-      bench_bqueue, 
-      bench_mp, 
-      bench_unbounded, 
-      bench_dspsc, 
-      bench_dehnavi,
-      bench_iffq,  
-      bench_biffq,
-      bench_ffq,
+      //bench_lamport, 
+      //bench_bqueue, 
+      //bench_mp, 
+      //bench_unbounded, 
+      //bench_dspsc, 
+      //bench_dehnavi,
+      //bench_iffq,  
+      //bench_biffq,
+      //bench_ffq,
+      bench_llq,
 } 
 criterion_main!(benches);
 

@@ -7,6 +7,7 @@ pub mod dehnavi_queue;
 pub mod biffq;
 pub mod iffq;
 pub mod ffq;
+pub mod llq;
 
 pub use lamport::LamportQueue;
 pub use mspsc::MultiPushQueue;
@@ -18,3 +19,4 @@ pub use dehnavi_queue::PopError;
 pub use iffq::IffqQueue;
 pub use biffq::BiffqQueue;
 pub use ffq::FfqQueue;
+pub use llq::LlqQueue;

@@ -11,6 +11,7 @@ pub use spsc::PopError;
 pub use spsc::IffqQueue;
 pub use spsc::BiffqQueue;
 pub use spsc::FfqQueue;
+pub use spsc::LlqQueue;
 
 pub use mpsc::DrescherQueue;
 pub use mpsc::JayantiPetrovicMpscQueue;

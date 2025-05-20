@@ -210,6 +210,13 @@ where
             consumed_count, total_items_to_produce, std::any::type_name::<Q>(), num_producers
         );
     }
+
+    if !PERFORMANCE_TEST && consumed_count > total_items_to_produce {
+        eprintln!(
+            "Warning (MPSC): Consumed {}/{} items. Q: {}, Prods: {}",
+            consumed_count, total_items_to_produce, std::any::type_name::<Q>(), num_producers
+        );
+    }
     
     unsafe {
         if !q_shm_ptr.is_null() { unmap_shared(q_shm_ptr, q_shm_size); }

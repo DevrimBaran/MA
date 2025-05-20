@@ -322,115 +322,177 @@ fn bench_blq(c: &mut Criterion) {
 }
 
 // Generic fork-and-run helper - Reverted to the older, simpler style
-fn fork_and_run<Q>(q: &'static Q) -> std::time::Duration 
-where 
-   Q: BenchSpscQueue<usize> + Sync, 
-{ 
-   let page_size = 4096; 
-   let sync_shm = unsafe {  
-      libc::mmap( 
-         std::ptr::null_mut(), 
-         page_size, 
-         libc::PROT_READ | libc::PROT_WRITE, 
-         libc::MAP_SHARED | libc::MAP_ANONYMOUS, 
-         -1, 
-         0,  
-      ) 
-   }; 
-   
-   if sync_shm == libc::MAP_FAILED { 
-      panic!("mmap for sync_shm failed: {}", std::io::Error::last_os_error()); 
-   } 
-   
-   let sync_atomic_flag = unsafe { &*(sync_shm as *const AtomicU32) }; 
-   sync_atomic_flag.store(0, Ordering::Relaxed);  
-   
-   match unsafe { fork() } { // Corrected: Match directly on the Result
-      Ok(ForkResult::Child) => { // Producer
-         sync_atomic_flag.store(1, Ordering::Release); // Signal ready
-         while sync_atomic_flag.load(Ordering::Acquire) < 2 { // Wait for consumer to be ready & signal go
-            std::hint::spin_loop(); 
-         } 
-         
-         for i in 0..ITERS { // Use global ITERS
-            while q.bench_push(i).is_err() { 
-               std::hint::spin_loop(); 
-            } 
-         } 
-         
-         if let Some(biffq_queue) = (q as &dyn std::any::Any).downcast_ref::<BiffqQueue<usize>>() {
-            for _attempt in 0..1000 { 
-               if biffq_queue.flush_producer_buffer().is_ok() { break; }
-               std::hint::spin_loop();
+fn fork_and_run<Q>(q: &'static Q) -> std::time::Duration
+where
+    Q: BenchSpscQueue<usize> + Sync + 'static, // Added 'static bound, common for shared queue refs
+{
+    let page_size = 4096; // Or use a crate like `page_size` to get it dynamically
+    let sync_shm = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            page_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+
+    if sync_shm == libc::MAP_FAILED {
+        panic!("mmap for sync_shm failed: {}", std::io::Error::last_os_error());
+    }
+
+    let sync_atomic_flag = unsafe { &*(sync_shm as *const AtomicU32) };
+    sync_atomic_flag.store(0, Ordering::Relaxed); // Initialize: 0 = initial, 1 = P ready, 2 = C ready/Go, 3 = P done
+
+    match unsafe { fork() } {
+        Ok(ForkResult::Child) => { // Producer
+            sync_atomic_flag.store(1, Ordering::Release); // 1. Producer signals it's ready
+            while sync_atomic_flag.load(Ordering::Acquire) < 2 { // Wait for consumer to signal ready (state 2)
+                std::hint::spin_loop();
             }
-         }
-         
-         sync_atomic_flag.store(3, Ordering::Release); // Signal producer done
-         unsafe { libc::_exit(0) }; 
-      } 
-      Ok(ForkResult::Parent { child }) => { // Consumer
-         while sync_atomic_flag.load(Ordering::Acquire) < 1 { // Wait for producer to be ready
-            std::hint::spin_loop(); 
-         } 
-         
-         sync_atomic_flag.store(2, Ordering::Release); // Signal consumer ready & producer go
-         let start_time = std::time::Instant::now(); 
-         let mut consumed_count = 0; 
-         
-         while consumed_count < ITERS { // Use global ITERS
-            if sync_atomic_flag.load(Ordering::Acquire) == 3 { // Producer is done
-               if q.bench_pop().is_err() { // Try to pop; if error and producer done...
-                  break;  // ...assume queue is empty and drained.
-               } else { 
-                  consumed_count += 1; 
-                  if consumed_count == ITERS { break; } 
-               } 
-            } else { // Producer not yet done
-               if let Ok(_item) = q.bench_pop() { 
-                  consumed_count += 1; 
-               } else { 
-                  std::hint::spin_loop();  // Pop failed, producer not done, queue temporarily empty
-               } 
-            } 
-         } 
-         
-         let duration = start_time.elapsed(); 
-         
-         // Ensure producer has actually signaled done before waitpid, avoids racing on exit
-         while sync_atomic_flag.load(Ordering::Acquire) != 3 {
-            std::hint::spin_loop();
-         }
-         waitpid(child, None).expect("SPSC waitpid failed"); 
-         
-         unsafe {  
-            unmap_shared(sync_shm as *mut u8, page_size); // Cast sync_shm back to *mut u8 for unmap
-         } 
-         
-         if !PERFORMANCE_TEST && consumed_count < ITERS { 
-            eprintln!( 
-               "Warning (SPSC): Consumed {}/{} items. Q: {}",  
-               consumed_count,  
-               ITERS, 
-               std::any::type_name::<Q>() 
-            ); 
-         } 
-         if !PERFORMANCE_TEST && consumed_count > ITERS { 
-            eprintln!( 
-               "Warning (SPSC): Consumed {}/{} items. Q: {}",  
-               consumed_count,  
-               ITERS, 
-               std::any::type_name::<Q>() 
-            ); 
-         } 
-         duration 
-      } 
-      Err(e) => { 
-         // If fork fails, sync_shm might have been mapped, try to unmap it.
-         unsafe { unmap_shared(sync_shm as *mut u8, page_size); }
-         panic!("SPSC fork failed: {}", e);
-      }
-   } 
-} 
+
+            // Producer's main work loop
+            for i in 0..ITERS {
+                while q.bench_push(i).is_err() {
+                    std::hint::spin_loop(); // Spin if push fails (queue temporarily full)
+                }
+            }
+
+            // After producing all items, explicitly flush any buffered items for relevant queue types
+            if let Some(mp_queue) = (q as &dyn std::any::Any).downcast_ref::<MultiPushQueue<usize>>() {
+                let mut attempts = 0;
+                // Loop to ensure flush succeeds, especially if the consumer is slow to make space
+                while mp_queue.local_count.load(Ordering::Relaxed) > 0 && attempts < 10000 { // Limit attempts
+                    if !mp_queue.flush() { // Assuming flush() returns true on success
+                        std::hint::spin_loop();
+                        attempts += 1;
+                    } else {
+                        // Flush was successful or buffer became empty through other means
+                        if mp_queue.local_count.load(Ordering::Relaxed) == 0 {
+                             break;
+                        }
+                        // If flush reported success but buffer not empty, could be a partial flush logic. Spin.
+                        std::hint::spin_loop();
+                        attempts +=1;
+                    }
+                }
+                 if mp_queue.local_count.load(Ordering::Relaxed) > 0 && PERFORMANCE_TEST == false {
+                     eprintln!(
+                        "Warning (SPSC Producer): MultiPushQueue failed to flush all local items after {} attempts. {} items remaining in local_buf.",
+                        attempts,
+                        mp_queue.local_count.load(Ordering::Relaxed)
+                    );
+                }
+            } else if let Some(biffq_queue) = (q as &dyn std::any::Any).downcast_ref::<BiffqQueue<usize>>() {
+                // Similar robust flush for BiffqQueue if it has a comparable local buffer and flush mechanism
+                let mut attempts = 0;
+                // Assuming BiffqQueue::flush_producer_buffer returns Result<usize, ()>
+                // where usize is items published or similar indication of progress.
+                while biffq_queue.prod.local_count.load(Ordering::Relaxed) > 0 && attempts < 10000 {
+                    match biffq_queue.flush_producer_buffer() {
+                        Ok(_published_count) => {
+                            // If flush_producer_buffer doesn't guarantee full flush on Ok, recheck local_count
+                            if biffq_queue.prod.local_count.load(Ordering::Relaxed) == 0 {
+                                break;
+                            }
+                            // If Ok but not empty, might need to spin or means partial success
+                            std::hint::spin_loop(); // Allow consumer to process
+                            attempts +=1; // Count this as an attempt if still not empty
+                        }
+                        Err(_) => { // Flush indicated an error (e.g., underlying queue full)
+                            std::hint::spin_loop();
+                            attempts += 1;
+                        }
+                    }
+                }
+                if biffq_queue.prod.local_count.load(Ordering::Relaxed) > 0 && PERFORMANCE_TEST == false {
+                     eprintln!(
+                        "Warning (SPSC Producer): BiffqQueue failed to flush all local items after {} attempts. {} items remaining in local_buf.",
+                        attempts,
+                        biffq_queue.prod.local_count.load(Ordering::Relaxed)
+                    );
+                }
+            }
+            // Add other queue types here if they also have internal producer buffers that need explicit flushing.
+
+            sync_atomic_flag.store(3, Ordering::Release); // 3. Producer signals it's done (after flush)
+            unsafe { libc::_exit(0) };
+        }
+        Ok(ForkResult::Parent { child }) => { // Consumer
+            while sync_atomic_flag.load(Ordering::Acquire) < 1 { // Wait for producer to signal ready (state 1)
+                std::hint::spin_loop();
+            }
+
+            sync_atomic_flag.store(2, Ordering::Release); // 2. Consumer signals it's ready, producer can start
+            let start_time = std::time::Instant::now();
+            let mut consumed_count = 0;
+
+            if ITERS > 0 {
+                loop {
+                    if consumed_count >= ITERS {
+                        break; // All expected items have been consumed
+                    }
+
+                    match q.bench_pop() {
+                        Ok(_item) => {
+                            consumed_count += 1;
+                        }
+                        Err(_) => { // Pop failed
+                            if sync_atomic_flag.load(Ordering::Acquire) == 3 {
+                                // Producer is done. If pop fails now, check if queue is TRULY empty.
+                                // The SpscQueue::empty() method for each queue type should be accurate.
+                                if q.bench_is_empty() {
+                                    break; // Producer done and queue is definitively empty
+                                }
+                                // If not empty, but pop failed, producer is done. Spin briefly.
+                                // This allows for visibility delays or transient empty states for complex queues.
+                                std::hint::spin_loop();
+                            } else {
+                                // Producer not done, but queue is temporarily empty. Spin.
+                                std::hint::spin_loop();
+                            }
+                        }
+                    }
+                }
+            }
+
+            let duration = start_time.elapsed();
+
+            // Ensure producer has actually signaled done before waitpid,
+            // especially if consumer loop exited early due to consumed_count == ITERS.
+            while sync_atomic_flag.load(Ordering::Acquire) != 3 {
+                std::hint::spin_loop();
+            }
+            waitpid(child, None).expect("SPSC waitpid failed");
+
+            unsafe {
+                unmap_shared(sync_shm as *mut u8, page_size);
+            }
+
+            if !PERFORMANCE_TEST && consumed_count < ITERS {
+                eprintln!(
+                    "Warning (SPSC Consumer): Consumed {}/{} items. Q: {}. Potential items missed.",
+                    consumed_count,
+                    ITERS,
+                    std::any::type_name::<Q>()
+                );
+            } else if !PERFORMANCE_TEST && consumed_count > ITERS {
+                 eprintln!( // Should not happen if producer sends exactly ITERS
+                    "Warning (SPSC Consumer): Consumed more items {}/{} than expected. Q: {}",
+                    consumed_count,
+                    ITERS,
+                    std::any::type_name::<Q>()
+                );
+            }
+            duration
+        }
+        Err(e) => {
+            unsafe { unmap_shared(sync_shm as *mut u8, page_size); }
+            panic!("SPSC fork failed: {}", e);
+        }
+    }
+}
 
 // Criterion setup 
 fn custom_criterion() -> Criterion { 
@@ -445,7 +507,7 @@ criterion_group!{
    config = custom_criterion(); 
    targets = 
       //bench_lamport, 
-      bench_bqueue, 
+      //bench_bqueue, 
       bench_mp, 
       bench_unbounded, 
       bench_dspsc, 

@@ -12,11 +12,11 @@ const LOCAL_BATCH_SIZE: usize = 32;
 type Slot<T> = Option<T>;
 
 #[repr(C, align(64))] 
-struct ProducerFieldsB<T: Send + 'static> { 
+pub struct ProducerFieldsB<T: Send + 'static> { 
    write: AtomicUsize,
    limit: AtomicUsize,
    local_buffer: UnsafeCell<[MaybeUninit<T>; LOCAL_BATCH_SIZE]>,
-   local_count: AtomicUsize, 
+   pub local_count: AtomicUsize, 
 }
 
 #[repr(C, align(64))] 
@@ -27,7 +27,7 @@ struct ConsumerFieldsB {
 
 #[repr(C, align(64))] 
 pub struct BiffqQueue<T: Send + 'static> {
-   prod: ProducerFieldsB<T>, 
+   pub prod: ProducerFieldsB<T>, 
    cons: ConsumerFieldsB,    
    capacity: usize,
    mask: usize,

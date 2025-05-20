@@ -11,10 +11,10 @@ use std::{
 
 #[derive(Debug)]
 pub struct LamportQueue<T: Send> {
-   mask: usize, // cap − 1
+   pub mask: usize, // cap − 1
    pub buf : ManuallyDrop<Box<[UnsafeCell<Option<T>>]>>, // shared ring storage (pub so dspsc can use it)
-   head: AtomicUsize, // mutated by consumer
-   tail: AtomicUsize, // mutated by producer
+   pub head: AtomicUsize, // mutated by consumer
+   pub tail: AtomicUsize, // mutated by producer
 }
 
 unsafe impl<T: Send> Sync for LamportQueue<T> {}

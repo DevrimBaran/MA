@@ -17,11 +17,6 @@ const PREALLOCATED_NODES: usize = 16384;
 const NODE_CACHE_CAPACITY: usize = 32768; 
 const CACHE_LINE_SIZE: usize = 8192;
 
-// Simple logging for debugging
-fn log_msg(msg: &str) {
-    //eprintln!("[dSPSC] {}", msg);
-}
-
 // node
 
 // strict alignment and adequate size for Node
@@ -86,15 +81,12 @@ impl<T: Send + 'static> DynListQueue<T> {
         let (final_layout, _) = layout2.align_to(lamport_align).unwrap()
             .extend(Layout::from_size_align(lamport_cache_size, lamport_align).unwrap()).unwrap();
         
-        log_msg(&format!("DynListQueue::shared_size() = {}", final_layout.size()));
-        
         final_layout.size()
     }
 }
 
 impl<T: Send + 'static> DynListQueue<T> {
     pub fn new() -> Self {
-        log_msg("DynListQueue::new()");
         
         // Create dummy node - this is the first node in the queue
         // and doesn't hold a value, just points to the next node
@@ -135,7 +127,6 @@ impl<T: Send + 'static> DynListQueue<T> {
     }
 
     pub unsafe fn init_in_shared(mem_ptr: *mut u8) -> &'static mut Self {
-        log_msg(&format!("DynListQueue::init_in_shared({:p})", mem_ptr));
         
         let self_ptr = mem_ptr as *mut Self;
 
@@ -243,8 +234,6 @@ impl<T: Send + 'static> DynListQueue<T> {
         }
 
         // Last resort: allocate from heap
-        let count = self.heap_allocs.fetch_add(1, Ordering::Relaxed) + 1;
-        log_msg(&format!("Heap allocation #{}", count));
         
         // Allocate with alignment
         let layout = Layout::from_size_align(std::mem::size_of::<Node<T>>(), 128).unwrap();
@@ -262,7 +251,6 @@ impl<T: Send + 'static> DynListQueue<T> {
             });
         }
         
-        log_msg(&format!("Allocated heap node at {:p}", ptr));
         ptr
     }
 
@@ -304,8 +292,6 @@ impl<T: Send + 'static> DynListQueue<T> {
             // No retry loops that could cause issues
         } else {
             // For heap nodes, always deallocate
-            let count = self.heap_frees.fetch_add(1, Ordering::Relaxed) + 1;
-            log_msg(&format!("Heap deallocation #{}", count));
             
             unsafe {
                 let layout = Layout::from_size_align(std::mem::size_of::<Node<T>>(), 128).unwrap();
@@ -320,7 +306,6 @@ impl<T: Send + 'static> SpscQueue<T> for DynListQueue<T> {
     type PopError = (); 
 
     fn push(&self, item: T) -> Result<(), ()> {
-        log_msg("push: entry");
         
         // Producer allocates a new node
         let new_node = self.alloc_node(item);
@@ -334,7 +319,6 @@ impl<T: Send + 'static> SpscQueue<T> for DynListQueue<T> {
         // Validate tail pointer before using it
         if current_tail_ptr.is_null() {
             // This shouldn't happen, but guard against it
-            log_msg("ERROR: Null tail pointer in push!");
             return Err(());
         }
         
@@ -359,7 +343,6 @@ impl<T: Send + 'static> SpscQueue<T> for DynListQueue<T> {
         
         // Validate head pointer
         if current_dummy_ptr.is_null() {
-            log_msg("ERROR: Null head pointer in pop!");
             return Err(());
         }
         
@@ -387,7 +370,6 @@ impl<T: Send + 'static> SpscQueue<T> for DynListQueue<T> {
                 value
             } else {
                 // No value found (shouldn't happen, but be defensive)
-                log_msg("ERROR: Node without value in pop!");
                 return Err(());
             }
         };
@@ -430,9 +412,6 @@ impl<T: Send + 'static> SpscQueue<T> for DynListQueue<T> {
 impl<T: Send + 'static> Drop for DynListQueue<T> {
     fn drop(&mut self) {
         // Print diagnostics
-        let allocs = self.heap_allocs.load(Ordering::Relaxed);
-        let frees = self.heap_frees.load(Ordering::Relaxed);
-        log_msg(&format!("Dropping queue - heap allocs: {}, heap frees: {}", allocs, frees));
         
         if self.owns_all {
             // Drain the queue

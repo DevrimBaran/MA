@@ -16,7 +16,7 @@ use queues::{
    IffqQueue, BiffqQueue, FfqQueue, BlqQueue
 }; 
 
-use std::sync::atomic::{AtomicU32, Ordering}; // AtomicBool no longer needed for fork_and_run
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use queues::spsc::llq::{LlqQueue, K_CACHE_LINE_SLOTS};
 use queues::spsc::blq::K_CACHE_LINE_SLOTS as BLQ_K_SLOTS;
@@ -31,7 +31,6 @@ const ITERS:     usize = 40_000_000;
 trait BenchSpscQueue<T: Send>: Send + Sync + 'static { 
    fn bench_push(&self, item: T) -> Result<(), ()>; 
    fn bench_pop(&self) -> Result<T, ()>; 
-   // Added these for completeness, though not strictly used by the reverted fork_and_run's breaking condition
    fn bench_is_empty(&self) -> bool; 
    fn bench_is_full(&self) -> bool;
 } 
@@ -446,16 +445,16 @@ criterion_group!{
    config = custom_criterion(); 
    targets = 
       //bench_lamport, 
-      //bench_bqueue, 
-      //bench_mp, 
-      //bench_unbounded, 
-      //bench_dspsc, 
-      //bench_dehnavi,
-      //bench_iffq,  
-      //bench_biffq,
-      //bench_ffq,
+      bench_bqueue, 
+      bench_mp, 
+      bench_unbounded, 
+      bench_dspsc, 
+      bench_dehnavi,
+      bench_iffq,  
+      bench_biffq,
+      bench_ffq,
       bench_llq,
-      //bench_blq,
+      bench_blq,
 } 
 criterion_main!(benches);
 

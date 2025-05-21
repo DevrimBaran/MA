@@ -40,7 +40,7 @@ impl<T: Send> LamportQueue<T> {
    }
 
    #[inline]
-   fn idx(&self, i: usize) -> usize {
+   pub fn idx(&self, i: usize) -> usize {
       i & self.mask
    }
 }

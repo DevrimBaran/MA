@@ -364,8 +364,8 @@ fn bench_d_queue_mpsc(c: &mut Criterion) {
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(3))
-        .measurement_time(Duration::from_secs(175)) 
-        .sample_size(100) 
+        .measurement_time(Duration::from_secs(25)) 
+        .sample_size(10) 
 }
 
 criterion_group! {

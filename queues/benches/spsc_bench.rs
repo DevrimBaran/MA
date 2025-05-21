@@ -58,7 +58,7 @@ unsafe fn unmap_shared(ptr: *mut u8, len: usize) {
    }
 }
 
-// --- BenchSpscQueue Implementations ---
+// BenchSpscQueue Implementations
 impl<T: Send + 'static> BenchSpscQueue<T> for DehnaviQueue<T> {
    fn bench_push(&self, item: T) -> Result<(), ()> { SpscQueue::push(self, item).map_err(|_| ()) }
    fn bench_pop(&self) -> Result<T, ()> { SpscQueue::pop(self).map_err(|_| ()) }
@@ -128,25 +128,16 @@ impl<T: Send + 'static> BenchSpscQueue<T> for BlqQueue<T> {
 
 
 
-// --- Benchmark Functions ---
+// Benchmark Functions
 fn bench_dehnavi(c: &mut Criterion) {
    c.bench_function("Dehnavi", |b| {
       b.iter_custom(|_iters_arg_ignored| {
-         // For DehnaviQueue, k must be > 1.
-         // Effective storable capacity is k-1.
-         // To store ITERS_GENERAL items without becoming full (in a lossless model),
-         // k needs to be ITERS_GENERAL + 1.
-         // This also ensures k > 1 if ITERS_GENERAL >= 1.
+         // Dehnavi is a lossy queue, it will overwrite the beginning of the queue if consumer not fast enough.
          let dehnavi_k_param = if ITERS_GENERAL == 0 { 2 } else { ITERS_GENERAL + 1 };
-
-         // Ensure dehnavi_k_param is at least 2, as per DehnaviQueue::new assertion.
          let current_ring_cap_param = dehnavi_k_param.max(2);
-
          let bytes = DehnaviQueue::<usize>::shared_size(current_ring_cap_param);
          let shm_ptr = unsafe { map_shared(bytes) };
          let q = unsafe { DehnaviQueue::init_in_shared(shm_ptr, current_ring_cap_param) };
-
-         // The number of iterations will be ITERS_GENERAL
          let dur = fork_and_run(q, ITERS_GENERAL);
          unsafe {
             unmap_shared(shm_ptr, bytes);
@@ -361,9 +352,7 @@ where
          for i in 0..iterations {
                while q.bench_push(i).is_err() {
                   // If queue is full, yield to allow consumer to progress.
-                  // This is important for bounded queues in a lossless test.
                   std::thread::yield_now();
-                  // std::hint::spin_loop(); // Previous spin, yield_now is often better
                }
          }
 
@@ -443,7 +432,6 @@ where
                               std::thread::yield_now(); // Yield if producer done but queue not empty
                            } else {
                               std::thread::yield_now(); // Yield if queue temporarily empty
-                              // std::hint::spin_loop(); // Previous spin
                            }
                      }
                   }
@@ -501,7 +489,7 @@ criterion_group!{
       bench_mp,
       bench_unbounded,
       bench_dspsc,
-      bench_dehnavi, // This will now use the adjusted capacity
+      bench_dehnavi,
       bench_iffq,
       bench_biffq,
       bench_ffq,

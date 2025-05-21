@@ -370,39 +370,6 @@ impl<T: Send + 'static> UnboundedQueue<T> {
             }
         }
     }
-    
-    // Remove a segment from the linked list
-    unsafe fn remove_from_segment_list(&self, segment_ptr: *mut LamportQueue<T>) {
-        let mut prev: *mut SegmentNode<T> = ptr::null_mut();  // Add type annotation here
-        let mut current = self.segments_head.load(Ordering::Acquire);
-        
-        while !current.is_null() {
-            if (*current).segment == segment_ptr {
-                // Found it - remove from list
-                let next = (*current).next.load(Ordering::Acquire);
-                
-                if prev.is_null() {
-                    // It's the head
-                    self.segments_head.store(next, Ordering::Release);
-                } else {
-                    // It's in the middle
-                    (*prev).next.store(next, Ordering::Release);
-                }
-                
-                // If it's the tail, update tail
-                if *self.segments_tail.get() == current {
-                    *self.segments_tail.get() = prev;
-                }
-                
-                // Free the node (but not the segment)
-                let _ = Box::from_raw(current);
-                return;
-            }
-            
-            prev = current;
-            current = (*current).next.load(Ordering::Acquire);
-        }
-    }
 }
 
 impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {

@@ -1,4 +1,5 @@
 // Dehanvi 2021
+// Eventhough a spinloop is used denavi proved that all operations hav a finite worst case execution time, so all operations end in a finite time meaning it is wait-free.
 use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;

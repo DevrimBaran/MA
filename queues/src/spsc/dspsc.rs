@@ -234,7 +234,6 @@ impl<T: Send + 'static> DynListQueue<T> {
         }
 
         // Last resort: allocate from heap
-        let count = self.heap_allocs.fetch_add(1, Ordering::Relaxed) + 1;
         
         // Allocate with alignment
         let layout = Layout::from_size_align(std::mem::size_of::<Node<T>>(), 128).unwrap();
@@ -292,7 +291,6 @@ impl<T: Send + 'static> DynListQueue<T> {
             let _ = self.node_cache.push(NodePtr(node_to_recycle));
             // No retry loops that could cause issues
         } else {
-            let count = self.heap_frees.fetch_add(1, Ordering::Relaxed) + 1;
             // For heap nodes, always deallocate
             
             unsafe {
@@ -413,8 +411,6 @@ impl<T: Send + 'static> SpscQueue<T> for DynListQueue<T> {
 
 impl<T: Send + 'static> Drop for DynListQueue<T> {
     fn drop(&mut self) {
-        let allocs = self.heap_allocs.load(Ordering::Relaxed);
-        let frees = self.heap_frees.load(Ordering::Relaxed);
         // Print diagnostics
         
         if self.owns_all {

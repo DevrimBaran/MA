@@ -508,7 +508,7 @@ criterion_group!{
    targets = 
       //bench_lamport, 
       //bench_bqueue, 
-      bench_mp, 
+      //bench_mp, 
       bench_unbounded, 
       bench_dspsc, 
       bench_dehnavi,

@@ -6,18 +6,8 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use crate::MpscQueue;
 
-const DQUEUE_LOG_ENABLED: bool = false;
-
-macro_rules! dqueue_log {
-    ($($arg:tt)*) => {
-        if DQUEUE_LOG_ENABLED {
-            println!("[DQueue] {}", format!($($arg)*));
-        }
-    };
-}
-
 // Needs to be sized correctly
-pub const L_LOCAL_BUFFER_CAPACITY: usize = 65536;  // Local buffer size for each producer
+pub const L_LOCAL_BUFFER_CAPACITY: usize = 131072;  // Local buffer size for each producer
 pub const N_SEGMENT_CAPACITY: usize = 262144;     // Number of cells per segment (should be power of 2)
 
 #[repr(C, align(64))]  // Ensure cache line alignment
@@ -123,7 +113,6 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         num_producers: usize, 
         segment_pool_capacity: usize
     ) -> &'static mut Self {
-        dqueue_log!("init_in_shared: ENTER num_prods={}, seg_pool_cap={}", num_producers, segment_pool_capacity);
         
         let mut current_offset = 0usize;
         
@@ -182,7 +171,6 @@ impl<T: Send + Clone + 'static> DQueue<T> {
             cseg: AtomicPtr::new(init_seg_ptr),
         });
         
-        dqueue_log!("init_in_shared: EXIT. Next_free_seg_idx: {}", (*q_ptr).next_free_segment_idx.load(Ordering::Relaxed));
         
         &mut *q_ptr
     }
@@ -200,7 +188,6 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         if idx >= seg_pool_cap {
             // Pool exhausted, roll back
             next_free_idx_atomic.fetch_sub(1, Ordering::Relaxed);
-            dqueue_log!("alloc_segment_from_pool_raw: POOL EXHAUSTED. seg_id={}, idx={}, cap={}", seg_id, idx, seg_pool_cap);
             return ptr::null_mut();
         }
         
@@ -218,14 +205,12 @@ impl<T: Send + Clone + 'static> DQueue<T> {
             ptr::write((*(cells_start_ptr.add(i))).get(), MaybeUninit::new(None));
         }
         
-        dqueue_log!("alloc_segment_from_pool_raw: Allocated seg_id={} at idx={}, ptr={:p}", seg_id, idx, seg_meta_ptr);
         
         seg_meta_ptr
     }
 
     // Allocate a new segment
     unsafe fn new_segment(&self, id: u64) -> *mut Segment<T> {
-        dqueue_log!("new_segment: ENTER for id={}", id);
         
         // Allocate from pool
         let seg_ptr = Self::alloc_segment_from_pool_raw(
@@ -239,9 +224,6 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         if !seg_ptr.is_null() {
             // Initialize next pointer
             (*seg_ptr).next.store(ptr::null_mut(), Ordering::Relaxed);
-            dqueue_log!("new_segment: EXIT success for id={}, ptr={:p}", id, seg_ptr);
-        } else {
-            dqueue_log!("new_segment: EXIT FAILED for id={}", id);
         }
         
         seg_ptr
@@ -251,8 +233,6 @@ impl<T: Send + Clone + 'static> DQueue<T> {
     unsafe fn find_segment(&self, sp_cache: *mut Segment<T>, target_cid: u64) -> *mut Segment<T> {
         let target_segment_id = target_cid / N_SEGMENT_CAPACITY as u64;
         
-        dqueue_log!("find_segment: target_cid={}, target_seg_id={}, sp_cache={:p}", 
-                   target_cid, target_segment_id, sp_cache);
         
         // Fast path: check if the cached segment is the target
         if !sp_cache.is_null() {
@@ -264,8 +244,6 @@ impl<T: Send + Clone + 'static> DQueue<T> {
             
             // If cached segment is past our target, restart from qseg
             if cached_id > target_segment_id {
-                dqueue_log!("find_segment: cached segment id {} > target_seg_id {}, using qseg", 
-                           cached_id, target_segment_id);
                 let qseg = self.qseg.load(Ordering::Acquire);
                 return self.find_segment(qseg, target_cid);
             }
@@ -273,14 +251,12 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         
         // Start with the cache or qseg
         let starting_seg_ptr = if sp_cache.is_null() {
-            dqueue_log!("find_segment: sp_cache is null, loading from qseg");
             self.qseg.load(Ordering::Acquire)
         } else {
             sp_cache
         };
         
         if starting_seg_ptr.is_null() {
-            dqueue_log!("find_segment: current_seg_ptr is NULL. Target_cid={}. Returning NULL.", target_cid);
             return ptr::null_mut();
         }
         
@@ -293,7 +269,6 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         while (*current_seg_ptr).id < target_segment_id {
             loop_count += 1;
             if loop_count > max_loops {
-                dqueue_log!("find_segment: Possible infinite loop after {} iterations", loop_count);
                 return ptr::null_mut();
             }
             
@@ -303,13 +278,10 @@ impl<T: Send + Clone + 'static> DQueue<T> {
             // Create new segment if needed
             if next_ptr.is_null() {
                 let next_expected_id = (*current_seg_ptr).id + 1;
-                dqueue_log!("find_segment: seg_id {} next is null. Attempting to alloc new segment for id {}", 
-                           (*current_seg_ptr).id, next_expected_id);
                 
                 let new_seg_ptr = self.new_segment(next_expected_id);
                 
                 if new_seg_ptr.is_null() {
-                    dqueue_log!("find_segment: new_segment alloc FAILED for id {}. Returning null.", next_expected_id);
                     return ptr::null_mut();
                 }
                 
@@ -323,12 +295,10 @@ impl<T: Send + Clone + 'static> DQueue<T> {
                     Ok(_) => {
                         // Successfully linked our new segment
                         next_ptr = new_seg_ptr;
-                        dqueue_log!("find_segment: CAS success - linked new segment id={}, ptr={:p}", (*next_ptr).id, next_ptr);
                     }
                     Err(existing_next) => {
                         // Another thread linked a segment, use that one
                         next_ptr = existing_next;
-                        dqueue_log!("find_segment: CAS failed - using existing next segment ptr={:p}", next_ptr);
                     }
                 }
             }
@@ -336,18 +306,15 @@ impl<T: Send + Clone + 'static> DQueue<T> {
             current_seg_ptr = next_ptr;
             
             if current_seg_ptr.is_null() {
-                dqueue_log!("find_segment: next_ptr became null unexpectedly");
                 return ptr::null_mut();
             }
         }
         
         // Return the found segment
-        dqueue_log!("find_segment: EXIT found segment id={}, target_id={}", (*current_seg_ptr).id, target_segment_id);
         current_seg_ptr
     }
 
     unsafe fn dump_local_buffer(&self, producer_idx: usize) {
-        dqueue_log!("dump_local_buffer: ENTER producer_idx={}", producer_idx);
         
         if self.num_producers == 0 || producer_idx >= self.num_producers {
             return;
@@ -363,7 +330,6 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         let tail_idx = local_tail.load(Ordering::Relaxed);
         
         if head_idx == tail_idx {
-            dqueue_log!("dump_local_buffer: Producer {} buffer empty", producer_idx);
             return;
         }
         
@@ -382,7 +348,6 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         while current_idx != tail_idx {
             iter_count += 1;
             if iter_count > max_iters {
-                dqueue_log!("dump_local_buffer: Possible stuck loop, producer_idx={}, iter={}", producer_idx, iter_count);
                 break;
             }
             
@@ -402,7 +367,6 @@ impl<T: Send + Clone + 'static> DQueue<T> {
                 current_seg = self.find_segment(producer_pseg, cid);
                 
                 if current_seg.is_null() {
-                    dqueue_log!("dump_local_buffer: find_segment for cid {} returned null. ABORTING DUMP.", cid);
                     break;
                 }
                 
@@ -425,11 +389,9 @@ impl<T: Send + Clone + 'static> DQueue<T> {
             dumped_count += 1;
         }
         
-        dqueue_log!("dump_local_buffer: EXIT producer_idx={} dumped {} items", producer_idx, dumped_count);
     }
 
     unsafe fn help_enqueue(&self) {
-        dqueue_log!("help_enqueue: Consumer ENTER");
     
         if self.num_producers == 0 { return; }
     
@@ -450,7 +412,6 @@ impl<T: Send + Clone + 'static> DQueue<T> {
             let mut iter = 0;
             while h != t {
                 if iter > L_LOCAL_BUFFER_CAPACITY + 5 {
-                    dqueue_log!("help_enqueue: producer {} unusual long buffer", i);
                     break;
                 }
                 iter += 1;
@@ -478,7 +439,6 @@ impl<T: Send + Clone + 'static> DQueue<T> {
             }
         }
     
-        dqueue_log!("help_enqueue: Consumer EXIT");
     }
     
     // Enqueue an item into the queue
@@ -496,7 +456,6 @@ impl<T: Send + Clone + 'static> DQueue<T> {
             // Check if buffer is full
             let current_tail = local_tail.load(Ordering::Relaxed);
             if Producer::<T>::local_next(current_tail) == local_head.load(Ordering::Acquire) {
-                dqueue_log!("enqueue: producer {} local buffer full. Dumping...", producer_idx);
                 self.dump_local_buffer(producer_idx);
                 
                 // If buffer is still full after dumping, we can't enqueue
@@ -520,7 +479,6 @@ impl<T: Send + Clone + 'static> DQueue<T> {
             // Update the tail pointer
             local_tail.store(Producer::<T>::local_next(tail_idx), Ordering::Release);
             
-            dqueue_log!("enqueue: producer={} stored cid={} in local_idx={}", producer_idx, cid, tail_idx);
         }
         
         Ok(())
@@ -528,18 +486,12 @@ impl<T: Send + Clone + 'static> DQueue<T> {
 
     // Dequeue an item from the queue
     pub fn dequeue(&self) -> Option<T> {
-        dqueue_log!(
-            "dequeue: Consumer ENTER. q_head={}, q_tail={}",
-            self.q_head.load(Ordering::Relaxed),
-            self.q_tail.load(Ordering::Relaxed)
-        );
 
         unsafe {
             let head_val = self.q_head.load(Ordering::Acquire);
             let seg_hint = self.cseg.load(Ordering::Acquire);
             let seg = self.find_segment(seg_hint, head_val);
             if seg.is_null() {
-                dqueue_log!("dequeue: find_segment({}) returned null", head_val);
                 return None;
             }
             if seg != seg_hint {
@@ -561,16 +513,13 @@ impl<T: Send + Clone + 'static> DQueue<T> {
                     // Fast path
                     ptr::write((*(*cell_ptr).get()).as_mut_ptr(), None);
                     self.q_head.store(head_val + 1, Ordering::Release);
-                    dqueue_log!("dequeue: SUCCESS head={}", head_val);
                     return Some(item);
                 }
                 None => {
                     let tail_now = self.q_tail.load(Ordering::Acquire);
                     if head_val == tail_now {
-                        dqueue_log!("dequeue: queue empty (head==tail)");
                         return None;
                     }
-                    dqueue_log!("dequeue: empty cell, helping producers");
                     self.help_enqueue();
 
                     // ---------- FIX 2 -------------------------------------------------
@@ -583,10 +532,8 @@ impl<T: Send + Clone + 'static> DQueue<T> {
                     if let Some(item) = item_opt_after {
                         ptr::write((*(*cell_ptr).get()).as_mut_ptr(), None);
                         self.q_head.store(head_val + 1, Ordering::Release);
-                        dqueue_log!("dequeue: SUCCESS after help head={}", head_val);
                         return Some(item);
                     }
-                    dqueue_log!("dequeue: still empty after help");
                     None
                 }
             }

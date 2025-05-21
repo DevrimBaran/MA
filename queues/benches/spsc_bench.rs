@@ -448,16 +448,9 @@ where
                unmap_shared(sync_shm as *mut u8, page_size);
          }
 
-         if !PERFORMANCE_TEST && consumed_count < iterations {
+         if !PERFORMANCE_TEST && consumed_count != iterations {
                eprintln!(
                   "Warning (SPSC Consumer): Consumed {}/{} items. Q: {}. Potential items missed.",
-                  consumed_count,
-                  iterations,
-                  std::any::type_name::<Q>()
-               );
-         } else if !PERFORMANCE_TEST && consumed_count > iterations {
-               eprintln!(
-                  "Warning (SPSC Consumer): Consumed more items {}/{} than expected. Q: {}",
                   consumed_count,
                   iterations,
                   std::any::type_name::<Q>()

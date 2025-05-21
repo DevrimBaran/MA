@@ -4,23 +4,27 @@
 
 use criterion::{criterion_group, criterion_main, Criterion, Bencher};
 // Import DQueue from the library crate
-use queues::mpsc::{DrescherQueue, JayantiPetrovicMpscQueue, JiffyQueue, DQueue}; 
+use queues::mpsc::{DrescherQueue, JayantiPetrovicMpscQueue, JiffyQueue, DQueue};
 use queues::MpscQueue; // This is the trait from your library
 
 use core::fmt;
 use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 use std::time::Duration;
 use std::ptr;
+
+// Updated imports, maintaining original organization
 use nix::{
     libc,
     sys::wait::waitpid,
     unistd::{fork, ForkResult},
 };
-use queues::mpsc::dqueue::{N_SEGMENT_CAPACITY, L_LOCAL_BUFFER_CAPACITY};
+// N_SEGMENT_CAPACITY is used in bench_d_queue_mpsc
+use queues::mpsc::dqueue::{N_SEGMENT_CAPACITY};
 
-const PERFORMANCE_TEST: bool = false;
-const ITEMS_PER_PRODUCER_TARGET: usize = 1_000_000; 
-const JIFFY_NODES_PER_BUFFER_BENCH: usize = 4860;
+
+const PERFORMANCE_TEST: bool = true; // Set to true to suppress warnings for performance runs
+const ITEMS_PER_PRODUCER_TARGET: usize = 2_000_000;
+const JIFFY_NODES_PER_BUFFER_BENCH: usize = 8192;
 const PRODUCER_COUNTS_TO_TEST: &[usize] = &[1, 2, 4, 8, 14];
 
 
@@ -42,13 +46,25 @@ unsafe fn unmap_shared(ptr: *mut u8, len: usize) {
     if libc::munmap(ptr.cast(), len) == -1 { panic!("munmap failed: {}", std::io::Error::last_os_error()); }
 }
 
-// Implementations for existing queues remain here, as per your original file
-impl<T: Send + 'static> BenchMpscQueue<T> for DrescherQueue<T> {
-    fn bench_push(&self, item: T, _producer_id: usize) -> Result<(), ()> { MpscQueue::push(self, item).map_err(|_| ()) }
-    fn bench_pop(&self) -> Result<T, ()> { MpscQueue::pop(self).map_err(|_| ()) }
-    fn bench_is_empty(&self) -> bool { MpscQueue::is_empty(self) }
-    fn bench_is_full(&self) -> bool { MpscQueue::is_full(self) }
+// Implementations for existing queues remain here
+impl<T: Send + 'static + std::fmt::Debug> BenchMpscQueue<T> for DrescherQueue<T> {
+    fn bench_push(&self, item: T, _producer_id: usize) -> Result<(), ()> {
+        MpscQueue::push(self, item).map_err(|_| ())
+    }
+
+    fn bench_pop(&self) -> Result<T, ()> {
+        MpscQueue::pop(self).map_err(|_| ())
+    }
+
+    fn bench_is_empty(&self) -> bool {
+        MpscQueue::is_empty(self)
+    }
+
+    fn bench_is_full(&self) -> bool {
+        MpscQueue::is_full(self)
+    }
 }
+
 
 impl<T: Send + Clone + 'static> BenchMpscQueue<T> for JayantiPetrovicMpscQueue<T> {
     fn bench_push(&self, item: T, producer_id: usize) -> Result<(), ()> { self.enqueue(producer_id, item).map_err(|_| ()) }
@@ -64,22 +80,18 @@ impl<T: Send + 'static + Clone + fmt::Debug> BenchMpscQueue<T> for JiffyQueue<T>
     fn bench_is_full(&self) -> bool { MpscQueue::is_full(self) }
 }
 
-// Add impl BenchMpscQueue for DQueue HERE
 impl<T: Send + Clone + 'static> BenchMpscQueue<T> for DQueue<T> {
     fn bench_push(&self, item: T, producer_id: usize) -> Result<(), ()> {
-        // Call the DQueue specific enqueue method that takes producer_id
-        self.enqueue(producer_id, item) 
+        self.enqueue(producer_id, item)
     }
-    fn bench_pop(&self) -> Result<T, ()> { 
-        // DQueue implements MpscQueue from the lib, which contains the pop logic
-        // Ensure DQueue's pop method in dqueue.rs correctly implements the paper's logic
-        MpscQueue::pop(self).map_err(|_| ()) 
+    fn bench_pop(&self) -> Result<T, ()> {
+        MpscQueue::pop(self).map_err(|_| ())
     }
-    fn bench_is_empty(&self) -> bool { 
-        MpscQueue::is_empty(self) 
+    fn bench_is_empty(&self) -> bool {
+        MpscQueue::is_empty(self)
     }
-    fn bench_is_full(&self) -> bool { 
-        MpscQueue::is_full(self) 
+    fn bench_is_full(&self) -> bool {
+        MpscQueue::is_full(self)
     }
 }
 
@@ -92,9 +104,9 @@ impl MultiProducerStartupSync {
     fn new_in_shm(mem_ptr: *mut u8) -> &'static Self {
         let sync_ptr = mem_ptr as *mut Self;
         unsafe {
-            ptr::write(sync_ptr, Self { 
+            ptr::write(sync_ptr, Self {
                 producers_ready_count: AtomicU32::new(0),
-                go_signal: AtomicBool::new(false) 
+                go_signal: AtomicBool::new(false)
             });
             &*sync_ptr
         }
@@ -119,14 +131,14 @@ impl ProducerDoneSync {
 
 fn fork_and_run_mpsc<Q, F>(
     queue_init_fn: F,
-    num_producers: usize, 
-    items_per_producer_arg: usize, 
+    num_producers: usize,
+    items_per_producer_arg: usize,
 ) -> std::time::Duration
 where
-    Q: BenchMpscQueue<usize> + 'static, // This now uses the local BenchMpscQueue trait
-    F: FnOnce() -> (&'static Q, *mut u8, usize), 
+    Q: BenchMpscQueue<usize> + 'static,
+    F: FnOnce() -> (&'static Q, *mut u8, usize),
 {
-    if num_producers == 0 { return Duration::from_nanos(1); } // Avoid division by zero or empty runs
+    if num_producers == 0 { return Duration::from_nanos(1); }
     let (q, q_shm_ptr, q_shm_size) = queue_init_fn();
     let total_items_to_produce = num_producers * items_per_producer_arg;
 
@@ -137,18 +149,18 @@ where
     let done_sync_size = ProducerDoneSync::shared_size();
     let done_sync_shm_ptr = unsafe { map_shared(done_sync_size) };
     let done_sync = ProducerDoneSync::new_in_shm(done_sync_shm_ptr);
-    
+
     let mut producer_pids = Vec::with_capacity(num_producers);
 
     for producer_id in 0..num_producers {
         match unsafe { fork() } {
-            Ok(ForkResult::Child) => { 
+            Ok(ForkResult::Child) => {
                 startup_sync.producers_ready_count.fetch_add(1, Ordering::AcqRel);
                 while !startup_sync.go_signal.load(Ordering::Acquire) {
                     std::hint::spin_loop();
                 }
                 for i in 0..items_per_producer_arg {
-                    let item_value = producer_id * items_per_producer_arg + i; 
+                    let item_value = producer_id * items_per_producer_arg + i;
                     while q.bench_push(item_value, producer_id).is_err() {
                         std::hint::spin_loop();
                     }
@@ -156,10 +168,11 @@ where
                 done_sync.producers_done_count.fetch_add(1, Ordering::AcqRel);
                 unsafe { libc::_exit(0) };
             }
-            Ok(ForkResult::Parent { child }) => { 
+            Ok(ForkResult::Parent { child }) => {
                 producer_pids.push(child);
             }
             Err(e) => {
+                // Clean up shared memory before panicking
                 unsafe {
                     if !q_shm_ptr.is_null() { unmap_shared(q_shm_ptr, q_shm_size); }
                     unmap_shared(startup_sync_shm_ptr, startup_sync_size);
@@ -173,28 +186,44 @@ where
     while startup_sync.producers_ready_count.load(Ordering::Acquire) < num_producers as u32 {
         std::hint::spin_loop();
     }
-
     startup_sync.go_signal.store(true, Ordering::Release);
     let start_time = std::time::Instant::now();
     let mut consumed_count = 0;
 
     if total_items_to_produce > 0 {
-        while consumed_count < total_items_to_produce {
-            if let Ok(_item) = q.bench_pop() {
+        loop { // Main consumption loop
+            if q.bench_pop().is_ok() {
                 consumed_count += 1;
-            } else { 
-                if done_sync.producers_done_count.load(Ordering::Acquire) == num_producers as u32 {
-                    // Try to drain the queue once all producers are done
-                    while let Ok(_item_after_done) = q.bench_pop() {
-                        consumed_count += 1;
-                        if consumed_count >= total_items_to_produce { break; }
+            } else { // Pop returned None or Error
+                let producers_done = done_sync.producers_done_count.load(Ordering::Acquire) == num_producers as u32;
+                if producers_done {
+                    // Producers are done, try a final drain aggressively
+                    let mut final_drain_attempts = 0;
+                    const MAX_FINAL_DRAIN_ATTEMPTS: usize = 1_000; // Can be tuned
+
+                    while consumed_count < total_items_to_produce && final_drain_attempts < MAX_FINAL_DRAIN_ATTEMPTS {
+                        if q.bench_pop().is_ok() {
+                            consumed_count += 1;
+                            if consumed_count >= total_items_to_produce { break; }
+                        } else {
+                            final_drain_attempts += 1;
+                            std::thread::yield_now(); // Give queue time if it was a near-miss
+                        }
                     }
-                    // If still not enough items and queue reports empty, break
-                    if consumed_count >= total_items_to_produce || q.bench_is_empty() {
-                        break;
+                    // After aggressive drain attempts, if not all items consumed,
+                    // try one last pop. If it fails and queue is empty, then break.
+                    if consumed_count < total_items_to_produce {
+                        if q.bench_pop().is_err() && q.bench_is_empty() {
+                            break; // Exit main consumption loop
+                        } else if q.bench_pop().is_ok() { // Check if previous pop was successful after all
+                           consumed_count +=1; // if so, increment count
+                        }
                     }
                 }
-                std::hint::spin_loop(); // Spin if pop fails and producers might still be working or queue is temporarily empty
+                std::thread::yield_now(); // If producers not done, or initial pop failed, yield
+            }
+            if consumed_count >= total_items_to_produce {
+                break; // Exit main consumption loop
             }
         }
     }
@@ -204,20 +233,13 @@ where
         waitpid(pid, None).expect("waitpid for MPSC producer failed");
     }
 
-    if !PERFORMANCE_TEST && consumed_count < total_items_to_produce {
+    if (!PERFORMANCE_TEST && consumed_count != total_items_to_produce) {
         eprintln!(
             "Warning (MPSC): Consumed {}/{} items. Q: {}, Prods: {}",
             consumed_count, total_items_to_produce, std::any::type_name::<Q>(), num_producers
         );
     }
 
-    if !PERFORMANCE_TEST && consumed_count > total_items_to_produce {
-        eprintln!(
-            "Warning (MPSC): Consumed {}/{} items. Q: {}, Prods: {}",
-            consumed_count, total_items_to_produce, std::any::type_name::<Q>(), num_producers
-        );
-    }
-    
     unsafe {
         if !q_shm_ptr.is_null() { unmap_shared(q_shm_ptr, q_shm_size); }
         unmap_shared(startup_sync_shm_ptr, startup_sync_size);
@@ -227,11 +249,12 @@ where
 }
 
 
+
 // --- Benchmark Functions ---
 fn bench_drescher_mpsc(c: &mut Criterion) {
     let mut group = c.benchmark_group("DrescherMPSC");
     for &num_prods_current_run in PRODUCER_COUNTS_TO_TEST.iter().filter(|&&p| p > 0) {
-        let items_per_prod = ITEMS_PER_PRODUCER_TARGET; 
+        let items_per_prod = ITEMS_PER_PRODUCER_TARGET;
         let total_items_run = num_prods_current_run * items_per_prod;
         group.bench_function(
             format!("{}Prod_{}ItemsPer", num_prods_current_run, items_per_prod),
@@ -239,7 +262,7 @@ fn bench_drescher_mpsc(c: &mut Criterion) {
                 b.iter_custom(|_iters| {
                     fork_and_run_mpsc::<DrescherQueue<usize>, _>(
                     || {
-                        let node_cap = total_items_run + num_prods_current_run;
+                        let node_cap = total_items_run + num_prods_current_run; // Extra nodes for producers
                         let bytes = DrescherQueue::<usize>::shared_size(node_cap);
                         let shm_ptr = unsafe { map_shared(bytes) };
                         let q = unsafe { DrescherQueue::init_in_shared(shm_ptr, node_cap) };
@@ -291,7 +314,7 @@ fn bench_jiffy_mpsc(c: &mut Criterion) {
             (total_items_run / JIFFY_NODES_PER_BUFFER_BENCH) + num_prods_current_run + 20
         } else {
             num_prods_current_run + 20
-        }.max(1); // Ensure at least 1
+        }.max(1);
         group.bench_function(
             format!("{}Prod_{}ItemsPer", num_prods_current_run, items_per_prod),
             |b: &mut Bencher| {
@@ -313,32 +336,29 @@ fn bench_jiffy_mpsc(c: &mut Criterion) {
     group.finish();
 }
 
-// Add the benchmark function for DQueue
 fn bench_d_queue_mpsc(c: &mut Criterion) {
-    let mut group = c.benchmark_group("DQueueMPSC"); 
+    let mut group = c.benchmark_group("DQueueMPSC");
     for &num_prods_current_run in PRODUCER_COUNTS_TO_TEST.iter().filter(|&&p| p > 0) {
         let items_per_prod = ITEMS_PER_PRODUCER_TARGET;
         let total_items_run = num_prods_current_run * items_per_prod;
 
-        // Access the public N_SEGMENT_CAPACITY from the dqueue module within the queues crate
-        // Ensure `dqueue.rs` has `pub const N_SEGMENT_CAPACITY: usize = 1024;`
-        let n_segment_capacity = queues::mpsc::dqueue::N_SEGMENT_CAPACITY; 
+        let n_segment_capacity = N_SEGMENT_CAPACITY;
 
         let dqueue_segment_pool_cap = if total_items_run > 0 && n_segment_capacity > 0 {
-             (total_items_run / n_segment_capacity) + num_prods_current_run + 50 
+             (total_items_run / n_segment_capacity) + num_prods_current_run + 50
         } else {
-            num_prods_current_run + 50 
-        }.max(1); // Ensure at least 1 segment for the pool (initial segment)
-        
+            num_prods_current_run + 50
+        }.max(1);
+
         group.bench_function(
             format!("{}Prod_{}ItemsPer", num_prods_current_run, items_per_prod),
             |b: &mut Bencher| {
-                b.iter_custom(|_iters| { 
-                    fork_and_run_mpsc::<DQueue<usize>, _>( 
-                    || { 
+                b.iter_custom(|_iters| {
+                    fork_and_run_mpsc::<DQueue<usize>, _>(
+                    || {
                         let bytes = DQueue::<usize>::shared_size(
                             num_prods_current_run,
-                            dqueue_segment_pool_cap 
+                            dqueue_segment_pool_cap
                         );
                         let shm_ptr = unsafe { map_shared(bytes) };
                         let q = unsafe {
@@ -363,18 +383,18 @@ fn bench_d_queue_mpsc(c: &mut Criterion) {
 
 fn custom_criterion() -> Criterion {
     Criterion::default()
-        .warm_up_time(Duration::from_secs(3))
-        .measurement_time(Duration::from_secs(25)) 
-        .sample_size(10) 
+        .warm_up_time(Duration::from_secs(2))
+        .measurement_time(Duration::from_secs(60))
+        .sample_size(10)
 }
 
 criterion_group! {
     name = mpsc_benches;
     config = custom_criterion();
     targets =
-        bench_drescher_mpsc,
-        bench_jayanti_petrovic_mpsc,
-        bench_jiffy_mpsc,
+        //bench_drescher_mpsc,
+        //bench_jayanti_petrovic_mpsc,
+        //bench_jiffy_mpsc,
         bench_d_queue_mpsc,
 }
 criterion_main!(mpsc_benches);

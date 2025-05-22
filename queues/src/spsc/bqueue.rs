@@ -1,27 +1,30 @@
-// bqueue from wang et al. 2013
-#![allow(clippy::cast_possible_truncation)]
+// B-Queue from Wang et al. 2013
+// Efficient and Practical Queuing for Fast Core-to-Core Communication
 
 use crate::SpscQueue;
 use std::cell::Cell;
-use std::mem;
-use std::mem::MaybeUninit;
+use std::mem::{self, MaybeUninit};
 use std::ptr;
 
 #[repr(C)]
 pub struct BQueue<T: Send + 'static> {
-    buf: *mut MaybeUninit<Option<T>>,
+    // The buffer stores both data and a validity flag
+    // Paper uses NULL detection - we use a separate valid array
+    buf: *mut MaybeUninit<T>,
+    valid: *mut bool,  // Tracks if slot contains valid data (non-NULL in paper)
     cap: usize,
     mask: usize,
-    head: Cell<usize>, 
-    batch_head: Cell<usize>, 
+    
+    // Producer local variables
+    head: Cell<usize>,
+    batch_head: Cell<usize>,
+    
+    // Consumer local variables
     tail: Cell<usize>,
-    batch_tail: Cell<usize>, 
-    history: Cell<usize>,
+    batch_tail: Cell<usize>,
 }
 
 const BATCH_SIZE: usize = 256;
-const BQUEUE_BATCH_MAX: usize = BATCH_SIZE;
-const BQUEUE_INCREMENT: usize = 1;
 
 unsafe impl<T: Send + 'static> Sync for BQueue<T> {}
 unsafe impl<T: Send + 'static> Send for BQueue<T> {}
@@ -29,210 +32,267 @@ unsafe impl<T: Send + 'static> Send for BQueue<T> {}
 impl<T: Send + 'static> BQueue<T> {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity.is_power_of_two(), "capacity must be power of two");
-        let mut v: Vec<MaybeUninit<Option<T>>> = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            v.push(MaybeUninit::new(None));
-        }
-        let buf_ptr = Box::into_raw(v.into_boxed_slice()) as *mut MaybeUninit<Option<T>>;
         
-        // Initialize batch_head and batch_tail to be 'edge' (cap - 1).
-        // This forces an immediate probe on first push/pop to establish a valid batch.
-        let edge = capacity - 1; 
-        let initial_history = BATCH_SIZE.min(capacity); // Initial history value
-
+        // Allocate buffer for data
+        let mut buf_vec: Vec<MaybeUninit<T>> = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            buf_vec.push(MaybeUninit::uninit());
+        }
+        let buf = Box::into_raw(buf_vec.into_boxed_slice()) as *mut MaybeUninit<T>;
+        
+        // Allocate validity tracking array (represents NULL/non-NULL in paper)
+        let valid = Box::into_raw(
+            vec![false; capacity].into_boxed_slice()
+        ) as *mut bool;
+        
         BQueue {
-            buf: buf_ptr,
+            buf,
+            valid,
             cap: capacity,
-            mask: capacity - 1, // Mask is cap - 1 for power-of-two capacities
+            mask: capacity - 1,
             head: Cell::new(0),
-            batch_head: Cell::new(edge), // Initial batch_head (forces probe)
+            batch_head: Cell::new(0),
             tail: Cell::new(0),
-            batch_tail: Cell::new(edge), // Initial batch_tail (forces backtrack)
-            history: Cell::new(initial_history),
+            batch_tail: Cell::new(0),
         }
     }
 
     pub const fn shared_size(capacity: usize) -> usize {
-        mem::size_of::<Self>() + capacity * mem::size_of::<MaybeUninit<Option<T>>>()
+        mem::size_of::<Self>() + 
+        capacity * mem::size_of::<MaybeUninit<T>>() +
+        capacity * mem::size_of::<bool>()
     }
 
     pub unsafe fn init_in_shared(mem: *mut u8, capacity: usize) -> &'static mut Self {
         assert!(capacity.is_power_of_two(), "capacity must be power of two");
-        let header = mem as *mut Self;
-        let buf_ptr = mem.add(mem::size_of::<Self>()) as *mut MaybeUninit<Option<T>>;
         
-        // Initialize the BQueue struct fields first
-        ptr::write(header, BQueue::new_inplace(buf_ptr, capacity));
+        let header_ptr = mem as *mut Self;
+        let buf_ptr = mem.add(mem::size_of::<Self>()) as *mut MaybeUninit<T>;
+        let valid_ptr = mem.add(mem::size_of::<Self>() + capacity * mem::size_of::<MaybeUninit<T>>()) as *mut bool;
         
-        // Then initialize the buffer content
+        // Initialize buffer
         for i in 0..capacity {
-            ptr::write(buf_ptr.add(i), MaybeUninit::new(None));
+            ptr::write(buf_ptr.add(i), MaybeUninit::uninit());
+            ptr::write(valid_ptr.add(i), false);
         }
-        &mut *header
-    }
-
-    fn new_inplace(buf_ptr: *mut MaybeUninit<Option<T>>, capacity: usize) -> Self {
-        let edge = capacity - 1;
-        let initial_history = BATCH_SIZE.min(capacity);
-        BQueue {
+        
+        ptr::write(header_ptr, BQueue {
             buf: buf_ptr,
+            valid: valid_ptr,
             cap: capacity,
             mask: capacity - 1,
             head: Cell::new(0),
-            batch_head: Cell::new(edge),
+            batch_head: Cell::new(0),
             tail: Cell::new(0),
-            batch_tail: Cell::new(edge),
-            history: Cell::new(initial_history),
-        }
+            batch_tail: Cell::new(0),
+        });
+        
+        &mut *header_ptr
     }
 
     #[inline]
     fn next(&self, idx: usize) -> usize {
         (idx + 1) & self.mask
     }
+    
+    #[inline]
+    fn mod_(&self, idx: usize) -> usize {
+        idx & self.mask
+    }
 
+    // Algorithm 1: Enqueue operation (Figure 7 in paper)
     pub fn push(&self, item: T) -> Result<(), T> {
-        let h = self.head.get();
-        if h == self.batch_head.get() { // Need to probe for a new batch
-            let new_bh = (h + BATCH_SIZE -1) & self.mask;
+        let head = self.head.get();
+        
+        // Line Q03: if (head == batch_head)
+        if head == self.batch_head.get() {
+            // Need to find a new batch of empty slots
             
+            // Line Q04: batch_head = MOD(head + BATCH_SIZE)
+            let probe_idx = self.mod_(head + BATCH_SIZE);
+            
+            // Line Q05: if (buffer[batch_head] != NULL) return FULL
             unsafe {
-                if (*self.buf.add(new_bh)).assume_init_ref().is_some() {
-                    return Err(item);
+                if *self.valid.add(probe_idx) {
+                    return Err(item); // Queue is full
                 }
             }
-            self.batch_head.set(new_bh);
+            
+            // Line Q06: // Update batch_head
+            self.batch_head.set(probe_idx);
         }
+        
+        // Line Q08: buffer[head] = element
         unsafe {
-            let slot = self.buf.add(h) as *mut Option<T>;
-            ptr::write(slot, Some(item));
+            ptr::write(self.buf.add(head), MaybeUninit::new(item));
+            *self.valid.add(head) = true; // Mark as non-NULL
         }
-        self.head.set(self.next(h));
+        
+        // Line Q09: head = NEXT(head)
+        self.head.set(self.next(head));
+        
+        // Line Q10: return SUCCESS
         Ok(())
     }
 
+    // Algorithm 2: Dequeue operation (Figure 7 in paper)
     pub fn pop(&self) -> Result<T, ()> {
-        let t = self.tail.get(); // Current tail: Fig 7, local var 'tail'
-
-        if t != self.batch_tail.get() {
-            // Fast path: items are believed to be in the current batch
-            unsafe {
-                let slot_ptr = self.buf.add(t) as *mut Option<T>;
-                // Directly attempt to read.
-                if let Some(v) = ptr::read(slot_ptr) { // Fig 7, Q19: *value = buffer[tail]
-                    ptr::write(slot_ptr, None);        // Fig 7, Q20: buffer[tail] = NULL
-                    self.tail.set(self.next(t));       // Fig 7, Q21: tail = NEXT(tail)
-                    return Ok(v);                      // Fig 7, Q22: return SUCCESS
-                }
-            }
-        }
-
-        // 1. Initialize batch_size for probing based on history (Fig 10, N03-N06)
-        let mut current_adaptive_hist_val = self.history.get().min(self.cap); // Start with history.
-        if current_adaptive_hist_val < BQUEUE_BATCH_MAX { // Fig 10, N03
-            current_adaptive_hist_val = BQUEUE_BATCH_MAX.min(current_adaptive_hist_val + BQUEUE_INCREMENT); // Fig 10, N04
-        }
-        // 'current_adaptive_hist_val' is now the 'batch_history' to be used for this attempt's initial 'batch_size'.
+        let tail = self.tail.get();
         
-        let mut current_probe_batch_size = current_adaptive_hist_val; // Fig 10, N06: batch_size = batch_history;
-        let mut new_found_batch_tail_candidate; // Local 'batch_tail' for probing in Fig 10.
-
-        // 2. Backtracking search loop (Fig 10, N08-N16)
-        loop {
-            if current_probe_batch_size == 0 {
-                // This should ideally not be hit if history starts >= 1 and decrements correctly.
-                // If it does, it means an exhaustive search failed.
-                self.history.set(1); // Reset history to minimal probe size.
-                return Err(()); // Corresponds to Fig 10, N15 (FAILURE)
-            }
-            // Fig 10, N07 & N12: batch_tail = MOD(tail + batch_size - 1)
-            new_found_batch_tail_candidate = (t + current_probe_batch_size - 1) & self.mask;
-
-            unsafe {
-                // Fig 10, N08: while (!buffer[batch_tail]) -- loop if slot is NULL
-                if (*self.buf.add(new_found_batch_tail_candidate)).assume_init_ref().is_some() {
-                    // Found a non-empty slot. Backtracking SUCCESS.
-                    self.batch_tail.set(new_found_batch_tail_candidate); // Update the BQueue's batch_tail
-                    self.history.set(current_probe_batch_size);        // Fig 10, N17: batch_history = batch_size
-                    break; // Exit backtracking loop
+        // First check if current slot has data
+        unsafe {
+            if !*self.valid.add(tail) {
+                // Current slot is empty, need to search for data
+                match self.backtrack_deq() {
+                    Some(new_batch_tail) => {
+                        self.batch_tail.set(new_batch_tail);
+                    }
+                    None => {
+                        return Err(()); // Queue is empty
+                    }
                 }
             }
-
-            // Slot was empty.
-            // Fig 10, N09: spin_wait(TICKS); // Omitted for "producer is done" scenario.
-            if current_probe_batch_size > 1 { // Fig 10, N10
-                current_probe_batch_size >>= 1; // Fig 10, N11: Halve probe_batch_size
-            } else {
-                // current_probe_batch_size is 1, and buffer[t] (as new_found_batch_tail_candidate would be 't') was also empty.
-                // Backtracking FAILURE.
-                self.history.set(1);
-                return Err(());
-            }
         }
-
-        // 3. Dequeue item after successful backtracking (Fig 7, Q19-Q22)
+        
+        // Line Q18: value = buffer[tail]
+        let value = unsafe {
+            let item = ptr::read(self.buf.add(tail));
+            item.assume_init()
+        };
+        
+        // Line Q19: buffer[tail] = NULL
         unsafe {
-            let slot_ptr = self.buf.add(t) as *mut Option<T>;
-            if let Some(v) = ptr::read(slot_ptr) {
-                ptr::write(slot_ptr, None);
-                self.tail.set(self.next(t));
-                let items_in_new_batch = (self.batch_tail.get().wrapping_sub(t) & self.mask).wrapping_add(1);
-                self.history.set(items_in_new_batch.min(self.cap));
+            *self.valid.add(tail) = false; // Mark as NULL
+        }
+        
+        // Line Q20: tail = NEXT(tail)
+        self.tail.set(self.next(tail));
+        
+        // Line Q21: return SUCCESS
+        Ok(value)
+    }
 
-                return Ok(v);
-            } else {
-                return Err(());
+    // Basic backtracking algorithm (Figure 9 in paper)
+    fn backtrack_deq(&self) -> Option<usize> {
+        // Line B01: tail = current tail position
+        let tail = self.tail.get();
+        
+        // Line B03: batch_size = BATCH_SIZE
+        let mut batch_size = BATCH_SIZE.min(self.cap);
+        
+        // Line B04: batch_tail = MOD(tail + batch_size - 1)
+        let mut batch_tail;
+        
+        // Line B05: while (!buffer[batch_tail])
+        loop {
+            if batch_size == 0 {
+                return None; // No data found
             }
+            
+            // Line B07: batch_tail = MOD(tail + batch_size - 1)
+            batch_tail = self.mod_(tail + batch_size - 1);
+            
+            // Line B08: Check if buffer[batch_tail] != NULL
+            unsafe {
+                if *self.valid.add(batch_tail) {
+                    // Found a filled slot
+                    // Line B13: return batch_tail
+                    return Some(batch_tail);
+                }
+            }
+            
+            // Line B09: spin_wait(TICKS) - omitted as per paper's note
+            
+            // Line B10: if (batch_size > 1)
+            if batch_size > 1 {
+                // Line B11: batch_size = batch_size / 2
+                batch_size >>= 1;
+            } else {
+                // Check the current position as last resort
+                unsafe {
+                    if *self.valid.add(tail) {
+                        return Some(tail);
+                    }
+                }
+                // Line B06: return FAILURE
+                return None;
+            }
+            // Line B12: Continue loop
         }
     }
 
     pub fn available(&self) -> bool {
-        let h = self.head.get();
-        let bh = self.batch_head.get();
-        if h != bh { return true; }
-        let probe_idx = (h + BATCH_SIZE -1) & self.mask; // Sticking to existing logic's probe point for consistency.
-        unsafe { (*self.buf.add(probe_idx)).assume_init_ref().is_none() }
+        let head = self.head.get();
+        let batch_head = self.batch_head.get();
+        
+        // Fast path: we're within current batch
+        if head != batch_head {
+            return true;
+        }
+        
+        // Slow path: check if we can allocate a new batch
+        let probe_idx = self.mod_(head + BATCH_SIZE);
+        unsafe { !*self.valid.add(probe_idx) }
     }
 
     pub fn empty(&self) -> bool {
-        let t = self.tail.get();
-        let bt = self.batch_tail.get();
-        if t != bt { return false; } // Items definitely in current batch
-        unsafe { (*self.buf.add(bt)).assume_init_ref().is_none() }
+        // Check if any slot contains valid data
+        let tail = self.tail.get();
+        unsafe {
+            // Quick check: current position
+            if *self.valid.add(tail) {
+                return false;
+            }
+        }
+        
+        // Full scan to be sure
+        self.backtrack_deq().is_none()
     }
 }
 
 impl<T: Send + 'static> SpscQueue<T> for BQueue<T> {
     type PushError = ();
-    type PopError = (); 
+    type PopError = ();
 
-    fn push(&self, item: T) -> Result<(), Self::PushError> { 
-        self.push(item).map_err(|_| ()) 
+    fn push(&self, item: T) -> Result<(), Self::PushError> {
+        self.push(item).map_err(|_| ())
     }
-    fn pop(&self) -> Result<T, Self::PopError> { 
-        self.pop() 
+    
+    fn pop(&self) -> Result<T, Self::PopError> {
+        self.pop()
     }
-    fn available(&self) -> bool { 
-        self.available() 
+    
+    fn available(&self) -> bool {
+        self.available()
     }
-    fn empty(&self) -> bool { 
+    
+    fn empty(&self) -> bool {
         self.empty()
     }
 }
 
 impl<T: Send + 'static> Drop for BQueue<T> {
     fn drop(&mut self) {
-        // Drain any remaining items.
-        // This pop respects the queue logic, so it's safe.
+        // Clean up remaining items
         if std::mem::needs_drop::<T>() {
-            while let Ok(_item) = self.pop() {
-                // Item is dropped as it goes out of scope
+            let mut tail = *self.tail.get_mut();
+            let head = *self.head.get_mut();
+            
+            while tail != head {
+                unsafe {
+                    if *self.valid.add(tail) {
+                        let item = ptr::read(self.buf.add(tail));
+                        drop(item.assume_init());
+                    }
+                }
+                tail = self.next(tail);
             }
         }
-        if !self.buf.is_null() {
-            unsafe {
-                let _ = Box::from_raw(std::slice::from_raw_parts_mut(self.buf, self.cap));
-            }
+        
+        // Free allocated memory
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(self.buf, self.cap));
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(self.valid, self.cap));
         }
     }
 }

@@ -23,7 +23,7 @@ use queues::mpsc::dqueue::{N_SEGMENT_CAPACITY};
 
 
 const PERFORMANCE_TEST: bool = true; // Set to true to suppress warnings for performance runs
-const ITEMS_PER_PRODUCER_TARGET: usize = 2_000_000;
+const ITEMS_PER_PRODUCER_TARGET: usize = 3_000_000;
 const JIFFY_NODES_PER_BUFFER_BENCH: usize = 8192;
 const PRODUCER_COUNTS_TO_TEST: &[usize] = &[1, 2, 4, 8, 14];
 

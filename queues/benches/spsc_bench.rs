@@ -376,11 +376,6 @@ where
 
    match unsafe { fork() } {
       Ok(ForkResult::Child) => { // Producer
-         eprintln!("[Child] Address of q: {:p}", q); // ADD THIS
-         if (q as *const _ as usize) == 0 {
-             eprintln!("[Child] CRITICAL: q is NULL in child!");
-             // consider exiting or panicking immediately
-         }
          sync_atomic_flag.store(1, Ordering::Release);
          while sync_atomic_flag.load(Ordering::Acquire) < 2 {
                std::hint::spin_loop();
@@ -443,11 +438,6 @@ where
          unsafe { libc::_exit(0) };
       }
       Ok(ForkResult::Parent { child }) => { // Consumer
-         eprintln!("[Parent] Address of q: {:p}", q); // ADD THIS
-         if (q as *const _ as usize) == 0 {
-            eprintln!("[Parent] CRITICAL: q is NULL in parent!");
-             // consider exiting or panicking
-        }
          while sync_atomic_flag.load(Ordering::Acquire) < 1 {
                std::hint::spin_loop();
          }

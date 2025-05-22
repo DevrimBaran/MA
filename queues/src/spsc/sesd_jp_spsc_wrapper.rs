@@ -1,6 +1,3 @@
-// Simple SESD wrapper following the pattern of other queues
-// File: queues/src/spsc/sesd_jp_spsc_wrapper.rs
-
 use crate::mpsc::sesd_jp_queue::{Node as SesdNode, SesdJpQueue};
 use crate::SpscQueue;
 use std::mem::{self, MaybeUninit};
@@ -119,8 +116,6 @@ impl<T: Send + Clone + 'static> SesdJpSpscBenchWrapper<T> {
 
     #[inline]
     fn alloc_node(&self) -> *mut SesdNode<T> {
-        // Simple allocation from the pre-allocated array
-        // This is safe for SPSC because only producer calls this
         unsafe {
             let current_head = *self.free_head.get();
             
@@ -143,8 +138,6 @@ impl<T: Send + Clone + 'static> SesdJpSpscBenchWrapper<T> {
 
     #[inline]
     fn free_node(&self, node_ptr: *mut SesdNode<T>) {
-        // Simple deallocation back to the array
-        // This is safe for SPSC because only consumer calls this
         if node_ptr.is_null() {
             return;
         }
@@ -153,12 +146,6 @@ impl<T: Send + Clone + 'static> SesdJpSpscBenchWrapper<T> {
         if node_ptr == self.initial_dummy_addr || node_ptr == self.free_later_dummy_addr {
             return;
         }
-        
-        // In this simple implementation, we don't actually reuse nodes
-        // We just let them be "freed" by doing nothing
-        // This is acceptable for benchmarking as long as pool is large enough
-        
-        // For a production implementation, you'd implement a proper free list here
     }
 }
 

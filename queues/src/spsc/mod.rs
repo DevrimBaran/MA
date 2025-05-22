@@ -9,6 +9,7 @@ pub mod iffq;
 pub mod ffq;
 pub mod llq;
 pub mod blq;
+pub mod sesd_jp_spsc_wrapper;
 
 pub use lamport::LamportQueue;
 pub use mspsc::MultiPushQueue;
@@ -22,3 +23,4 @@ pub use biffq::BiffqQueue;
 pub use ffq::FfqQueue;
 pub use llq::LlqQueue;
 pub use blq::BlqQueue;
+pub use sesd_jp_spsc_wrapper::SesdJpSpscBenchWrapper;

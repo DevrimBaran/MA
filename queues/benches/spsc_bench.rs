@@ -13,7 +13,7 @@ use nix::{
 // Import all necessary SPSC queue types and the main SpscQueue trait
 use queues::{
    BQueue, LamportQueue, MultiPushQueue, UnboundedQueue, SpscQueue, DynListQueue, DehnaviQueue,
-   IffqQueue, BiffqQueue, FfqQueue, BlqQueue
+   IffqQueue, BiffqQueue, FfqQueue, BlqQueue, SesdJpSpscBenchWrapper,
 };
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -124,6 +124,20 @@ impl<T: Send + 'static> BenchSpscQueue<T> for BlqQueue<T> {
    fn bench_pop(&self) -> Result<T, ()> { SpscQueue::pop(self).map_err(|_| ()) }
    fn bench_is_empty(&self) -> bool { SpscQueue::empty(self) }
    fn bench_is_full(&self) -> bool { !SpscQueue::available(self) }
+}
+impl<T: Send + Clone + 'static> BenchSpscQueue<T> for SesdJpSpscBenchWrapper<T> {
+   fn bench_push(&self, item: T) -> Result<(), ()> { 
+       SpscQueue::push(self, item).map_err(|_| ()) 
+   }
+   fn bench_pop(&self) -> Result<T, ()> { 
+       SpscQueue::pop(self).map_err(|_| ()) 
+   }
+   fn bench_is_empty(&self) -> bool { 
+       SpscQueue::empty(self) 
+   }
+   fn bench_is_full(&self) -> bool { 
+       !SpscQueue::available(self) 
+   }
 }
 
 
@@ -318,6 +332,24 @@ fn bench_blq(c: &mut Criterion) {
    });
 }
 
+fn bench_sesd_jp(c: &mut Criterion) {
+   c.bench_function("SesdJpSPSC", |b| {
+       b.iter_custom(|_iters_arg_ignored| {
+           let pool_capacity = ITERS_GENERAL + 1000; // Extra buffer for safety
+
+           let bytes = SesdJpSpscBenchWrapper::<usize>::shared_size(pool_capacity);
+           let shm_ptr = unsafe { map_shared(bytes) };
+           let q_shared: &'static SesdJpSpscBenchWrapper<usize> = 
+               unsafe { SesdJpSpscBenchWrapper::init_in_shared(shm_ptr, pool_capacity) };
+
+           let dur = fork_and_run(q_shared, ITERS_GENERAL);
+
+           unsafe { unmap_shared(shm_ptr, bytes); }
+           dur
+       })
+   });
+}
+
 // Generic fork-and-run helper
 fn fork_and_run<Q>(q: &'static Q, iterations: usize) -> std::time::Duration
 where
@@ -344,6 +376,11 @@ where
 
    match unsafe { fork() } {
       Ok(ForkResult::Child) => { // Producer
+         eprintln!("[Child] Address of q: {:p}", q); // ADD THIS
+         if (q as *const _ as usize) == 0 {
+             eprintln!("[Child] CRITICAL: q is NULL in child!");
+             // consider exiting or panicking immediately
+         }
          sync_atomic_flag.store(1, Ordering::Release);
          while sync_atomic_flag.load(Ordering::Acquire) < 2 {
                std::hint::spin_loop();
@@ -406,6 +443,11 @@ where
          unsafe { libc::_exit(0) };
       }
       Ok(ForkResult::Parent { child }) => { // Consumer
+         eprintln!("[Parent] Address of q: {:p}", q); // ADD THIS
+         if (q as *const _ as usize) == 0 {
+            eprintln!("[Parent] CRITICAL: q is NULL in parent!");
+             // consider exiting or panicking
+        }
          while sync_atomic_flag.load(Ordering::Acquire) < 1 {
                std::hint::spin_loop();
          }
@@ -477,6 +519,7 @@ criterion_group!{
    name = benches;
    config = custom_criterion();
    targets =
+      bench_sesd_jp,
       bench_lamport,
       bench_bqueue,
       bench_mp,

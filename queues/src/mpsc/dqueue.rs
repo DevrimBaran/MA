@@ -1,4 +1,3 @@
-// queues/src/mpsc/dqueue.rs
 use std::cell::UnsafeCell;
 use std::mem::{self, MaybeUninit};
 use std::ptr;
@@ -6,47 +5,46 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use crate::MpscQueue;
 
-// Needs to be sized correctly
-pub const L_LOCAL_BUFFER_CAPACITY: usize = 131072;  // Local buffer size for each producer
-pub const N_SEGMENT_CAPACITY: usize = 262144;     // Number of cells per segment (should be power of 2)
+// Constants from the paper - these can be tuned
+pub const L_LOCAL_BUFFER_CAPACITY: usize = 131072; // 128K as in the paper
+pub const N_SEGMENT_CAPACITY: usize = 262144;      // 256K as in the paper
 
-#[repr(C, align(64))]  // Ensure cache line alignment
+/// Segment structure as described in the paper
+#[repr(C, align(64))]
 struct Segment<T> {
-    id: u64,                                  // Segment ID
-    cells: *mut UnsafeCell<MaybeUninit<Option<T>>>, // Array of cells
-    next: AtomicPtr<Segment<T>>,             // Link to next segment
+    id: u64,
+    cells: *mut UnsafeCell<MaybeUninit<Option<T>>>,
+    next: AtomicPtr<Segment<T>>,
+    next_free: AtomicPtr<Segment<T>>, // For intrusive free list
 }
 
+/// Request structure for local buffers
 #[repr(C)]
 struct Request<T> {
     val: MaybeUninit<T>,
     cid: u64,
 }
 
-// Producer's local state - one per producer thread
-#[repr(C, align(64))] // Cache line alignment
+/// Producer structure with local buffer
+#[repr(C, align(64))]
 pub struct Producer<T> {
     local_buffer: UnsafeCell<[MaybeUninit<Request<T>>; L_LOCAL_BUFFER_CAPACITY]>,
     local_head: AtomicUsize,
     local_tail: AtomicUsize,
-    pseg: AtomicPtr<Segment<T>>, // Producer's cached segment pointer
+    pseg: AtomicPtr<Segment<T>>,
 }
 
 impl<T> Producer<T> {
     unsafe fn init_in_place(producer_ptr: *mut Self, initial_segment: *mut Segment<T>) {
-        // Initialize local buffer with uninit requests
         let buffer_ptr = (*producer_ptr).local_buffer.get() as *mut MaybeUninit<Request<T>>;
         for i in 0..L_LOCAL_BUFFER_CAPACITY {
             ptr::write(buffer_ptr.add(i), MaybeUninit::uninit());
         }
-        
-        // Initialize atomic fields
         ptr::addr_of_mut!((*producer_ptr).local_head).write(AtomicUsize::new(0));
         ptr::addr_of_mut!((*producer_ptr).local_tail).write(AtomicUsize::new(0));
         ptr::addr_of_mut!((*producer_ptr).pseg).write(AtomicPtr::new(initial_segment));
     }
 
-    // Helper functions for the ring buffer operations
     #[inline(always)]
     fn local_wrap(i: usize) -> usize { i % L_LOCAL_BUFFER_CAPACITY }
     
@@ -54,548 +52,479 @@ impl<T> Producer<T> {
     fn local_next(i: usize) -> usize { Self::local_wrap(i + 1) }
 }
 
-// Main queue structure
+/// The DQueue structure
 #[repr(C, align(64))]
 pub struct DQueue<T: Send + Clone + 'static> {
-    q_head: AtomicU64,                      // Consumer's head index
-    q_tail: AtomicU64,                      // Global tail index
-    qseg: AtomicPtr<Segment<T>>,            // Queue head segment
-    
-    producers_array: *mut Producer<T>,      // Array of producer structures
-    num_producers: usize,                   // Number of producers
-    
-    segment_pool: *mut Segment<T>,          // Pool of pre-allocated segments
-    segment_cells_pool: *mut UnsafeCell<MaybeUninit<Option<T>>>, // Pool of cells
-    segment_pool_capacity: usize,           // Number of segments in the pool
-    next_free_segment_idx: AtomicUsize,     // Next available segment in pool
-    
-    cseg: AtomicPtr<Segment<T>>,            // Consumer's cached segment pointer
+    q_head: AtomicU64,
+    q_tail: AtomicU64,
+    qseg: AtomicPtr<Segment<T>>,
+    producers_array: *mut Producer<T>,
+    num_producers: usize,
+    segment_pool_metadata: *mut Segment<T>,
+    segment_cells_pool: *mut UnsafeCell<MaybeUninit<Option<T>>>,
+    segment_pool_capacity: usize,
+    next_free_segment_idx: AtomicUsize,
+    free_segment_list_head: AtomicPtr<Segment<T>>,
+    cseg: AtomicPtr<Segment<T>>,
 }
 
 unsafe impl<T: Send + Clone + 'static> Send for DQueue<T> {}
 unsafe impl<T: Send + Clone + 'static> Sync for DQueue<T> {}
 
 impl<T: Send + Clone + 'static> DQueue<T> {
-    // Calculate shared memory size required for the queue
     pub fn shared_size(num_producers: usize, segment_pool_capacity: usize) -> usize {
         let self_align = mem::align_of::<Self>();
         let producers_align = mem::align_of::<Producer<T>>();
         let segment_meta_align = mem::align_of::<Segment<T>>();
         let cell_align = mem::align_of::<UnsafeCell<MaybeUninit<Option<T>>>>();
-        
         let mut total_size = 0;
-        
-        // Align and add size for main structure
         total_size = (total_size + self_align - 1) & !(self_align - 1);
         total_size += mem::size_of::<Self>();
-        
-        // Align and add size for producer array
-        total_size = (total_size + producers_align - 1) & !(producers_align - 1);
         if num_producers > 0 {
+            total_size = (total_size + producers_align - 1) & !(producers_align - 1);
             total_size += num_producers * mem::size_of::<Producer<T>>();
         }
-        
-        // Align and add size for segment pool
         total_size = (total_size + segment_meta_align - 1) & !(segment_meta_align - 1);
         total_size += segment_pool_capacity * mem::size_of::<Segment<T>>();
-        
-        // Align and add size for segment cells pool
         total_size = (total_size + cell_align - 1) & !(cell_align - 1);
         total_size += segment_pool_capacity * N_SEGMENT_CAPACITY * mem::size_of::<UnsafeCell<MaybeUninit<Option<T>>>>();
-        
-        // Final alignment to cache line
         (total_size + 63) & !63
     }
 
-    // Initialize the queue in shared memory
     pub unsafe fn init_in_shared(
-        mem_ptr: *mut u8, 
-        num_producers: usize, 
-        segment_pool_capacity: usize
+        mem_ptr: *mut u8, num_producers: usize, segment_pool_capacity: usize
     ) -> &'static mut Self {
-        
         let mut current_offset = 0usize;
-        
-        // Helper function to align memory and advance pointer
         let align_and_advance = |co: &mut usize, size: usize, align: usize| -> *mut u8 {
             *co = (*co + align - 1) & !(align - 1);
-            let ptr = mem_ptr.add(*co);
-            *co += size;
-            ptr
+            let ptr = mem_ptr.add(*co); *co += size; ptr
         };
-        
-        // Allocate main structure
         let q_ptr = align_and_advance(&mut current_offset, mem::size_of::<Self>(), mem::align_of::<Self>()) as *mut Self;
-        
-        // Allocate producer array
         let p_arr_ptr = if num_producers > 0 {
             align_and_advance(&mut current_offset, num_producers * mem::size_of::<Producer<T>>(), mem::align_of::<Producer<T>>()) as *mut Producer<T>
-        } else {
-            ptr::null_mut()
-        };
-        
-        // Allocate segment pool
+        } else { ptr::null_mut() };
         let seg_pool_meta_ptr = align_and_advance(&mut current_offset, segment_pool_capacity * mem::size_of::<Segment<T>>(), mem::align_of::<Segment<T>>()) as *mut Segment<T>;
-        
-        // Allocate segment cells pool
         let seg_cells_pool_ptr = align_and_advance(&mut current_offset, segment_pool_capacity * N_SEGMENT_CAPACITY * mem::size_of::<UnsafeCell<MaybeUninit<Option<T>>>>(), mem::align_of::<UnsafeCell<MaybeUninit<Option<T>>>>()) as *mut UnsafeCell<MaybeUninit<Option<T>>>;
         
-        // Initialize first segment
-        let init_seg_idx_atomic = AtomicUsize::new(0);
-        let init_seg_ptr = Self::alloc_segment_from_pool_raw(seg_pool_meta_ptr, seg_cells_pool_ptr, segment_pool_capacity, &init_seg_idx_atomic, 0);
-        
-        if init_seg_ptr.is_null() {
-            panic!("DQueue: Failed to allocate initial segment.");
-        }
-        
-        (*init_seg_ptr).next.store(ptr::null_mut(), Ordering::Relaxed);
+        ptr::addr_of_mut!((*q_ptr).q_head).write(AtomicU64::new(0));
+        ptr::addr_of_mut!((*q_ptr).q_tail).write(AtomicU64::new(0));
+        ptr::addr_of_mut!((*q_ptr).producers_array).write(p_arr_ptr);
+        ptr::addr_of_mut!((*q_ptr).num_producers).write(num_producers);
+        ptr::addr_of_mut!((*q_ptr).segment_pool_metadata).write(seg_pool_meta_ptr);
+        ptr::addr_of_mut!((*q_ptr).segment_cells_pool).write(seg_cells_pool_ptr);
+        ptr::addr_of_mut!((*q_ptr).segment_pool_capacity).write(segment_pool_capacity);
+        ptr::addr_of_mut!((*q_ptr).next_free_segment_idx).write(AtomicUsize::new(0));
+        ptr::addr_of_mut!((*q_ptr).free_segment_list_head).write(AtomicPtr::new(ptr::null_mut()));
 
-        // Initialize producers
+        let self_ref_for_alloc = &*q_ptr;
+        let init_seg_ptr = self_ref_for_alloc.alloc_segment_from_pool_raw(0, true);
+        if init_seg_ptr.is_null() { panic!("DQueue: Failed to allocate initial segment."); }
+
+        ptr::addr_of_mut!((*q_ptr).qseg).write(AtomicPtr::new(init_seg_ptr));
+        ptr::addr_of_mut!((*q_ptr).cseg).write(AtomicPtr::new(init_seg_ptr));
         if num_producers > 0 && !p_arr_ptr.is_null() {
-            for i in 0..num_producers {
-                Producer::init_in_place(p_arr_ptr.add(i), init_seg_ptr);
-            }
+            for i in 0..num_producers { Producer::init_in_place(p_arr_ptr.add(i), init_seg_ptr); }
         }
-        
-        // Initialize the queue structure
-        ptr::write(q_ptr, Self {
-            q_head: AtomicU64::new(0),
-            q_tail: AtomicU64::new(0),
-            qseg: AtomicPtr::new(init_seg_ptr),
-            producers_array: p_arr_ptr,
-            num_producers,
-            segment_pool: seg_pool_meta_ptr,
-            segment_cells_pool: seg_cells_pool_ptr,
-            segment_pool_capacity,
-            next_free_segment_idx: AtomicUsize::new(init_seg_idx_atomic.load(Ordering::Relaxed)),
-            cseg: AtomicPtr::new(init_seg_ptr),
-        });
-        
-        
         &mut *q_ptr
     }
     
-    // Allocate a new segment from the pool
-    unsafe fn alloc_segment_from_pool_raw(
-        seg_pool_meta_start: *mut Segment<T>,
-        seg_cells_pool_start: *mut UnsafeCell<MaybeUninit<Option<T>>>,
-        seg_pool_cap: usize,
-        next_free_idx_atomic: &AtomicUsize,
-        seg_id: u64,
-    ) -> *mut Segment<T> {
-        let idx = next_free_idx_atomic.fetch_add(1, Ordering::Relaxed);
-        
-        if idx >= seg_pool_cap {
-            // Pool exhausted, roll back
-            next_free_idx_atomic.fetch_sub(1, Ordering::Relaxed);
+    unsafe fn alloc_segment_from_pool_raw(&self, seg_id: u64, is_initial: bool) -> *mut Segment<T> {
+        let mut head = self.free_segment_list_head.load(Ordering::Acquire);
+        while !head.is_null() {
+            let next_free_seg = (*head).next_free.load(Ordering::Relaxed);
+            match self.free_segment_list_head.compare_exchange_weak(head, next_free_seg, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(reused_seg_ptr) => {
+                    (*reused_seg_ptr).id = seg_id;
+                    let original_idx = (reused_seg_ptr as usize - self.segment_pool_metadata as usize) / mem::size_of::<Segment<T>>();
+                    (*reused_seg_ptr).cells = self.segment_cells_pool.add(original_idx * N_SEGMENT_CAPACITY);
+                    (*reused_seg_ptr).next.store(ptr::null_mut(), Ordering::Relaxed);
+                    (*reused_seg_ptr).next_free.store(ptr::null_mut(), Ordering::Relaxed);
+                    for i in 0..N_SEGMENT_CAPACITY { ptr::write((*( (*reused_seg_ptr).cells.add(i)) ).get(), MaybeUninit::new(None)); }
+                    return reused_seg_ptr;
+                }
+                Err(new_head) => head = new_head,
+            }
+        }
+        let mut idx;
+        if is_initial {
+            match self.next_free_segment_idx.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(initial_idx_val) => idx = initial_idx_val,
+                Err(_current_if_not_zero) => idx = self.next_free_segment_idx.fetch_add(1, Ordering::Relaxed),
+            }
+        } else { idx = self.next_free_segment_idx.fetch_add(1, Ordering::Relaxed); }
+        if idx >= self.segment_pool_capacity {
+            self.next_free_segment_idx.fetch_sub(1, Ordering::Relaxed);
             return ptr::null_mut();
         }
-        
-        // Get memory for the new segment
-        let seg_meta_ptr = seg_pool_meta_start.add(idx);
-        let cells_start_ptr = seg_cells_pool_start.add(idx * N_SEGMENT_CAPACITY);
-        
-        // Initialize segment fields
+        let seg_meta_ptr = self.segment_pool_metadata.add(idx);
+        let cells_start_ptr = self.segment_cells_pool.add(idx * N_SEGMENT_CAPACITY);
         ptr::addr_of_mut!((*seg_meta_ptr).id).write(seg_id);
         ptr::addr_of_mut!((*seg_meta_ptr).cells).write(cells_start_ptr);
         ptr::addr_of_mut!((*seg_meta_ptr).next).write(AtomicPtr::new(ptr::null_mut()));
-        
-        // Initialize cells to None
-        for i in 0..N_SEGMENT_CAPACITY {
-            ptr::write((*(cells_start_ptr.add(i))).get(), MaybeUninit::new(None));
-        }
-        
-        
+        ptr::addr_of_mut!((*seg_meta_ptr).next_free).write(AtomicPtr::new(ptr::null_mut()));
+        for i in 0..N_SEGMENT_CAPACITY { ptr::write((*(cells_start_ptr.add(i))).get(), MaybeUninit::new(None)); }
         seg_meta_ptr
     }
 
-    // Allocate a new segment
-    unsafe fn new_segment(&self, id: u64) -> *mut Segment<T> {
-        
-        // Allocate from pool
-        let seg_ptr = Self::alloc_segment_from_pool_raw(
-            self.segment_pool,
-            self.segment_cells_pool,
-            self.segment_pool_capacity,
-            &self.next_free_segment_idx,
-            id,
-        );
-        
-        if !seg_ptr.is_null() {
-            // Initialize next pointer
-            (*seg_ptr).next.store(ptr::null_mut(), Ordering::Relaxed);
+    unsafe fn release_segment_to_pool(&self, seg_to_free: *mut Segment<T>) {
+        if seg_to_free.is_null() { return; }
+        let mut head = self.free_segment_list_head.load(Ordering::Acquire);
+        loop {
+            (*seg_to_free).next_free.store(head, Ordering::Relaxed);
+            match self.free_segment_list_head.compare_exchange_weak(head, seg_to_free, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(new_head) => head = new_head,
+            }
         }
-        
-        seg_ptr
+    }
+    
+    unsafe fn new_segment(&self, id: u64) -> *mut Segment<T> {
+        self.alloc_segment_from_pool_raw(id, false)
     }
 
-    // Find segment containing cell with given ID - optimized version
     unsafe fn find_segment(&self, sp_cache: *mut Segment<T>, target_cid: u64) -> *mut Segment<T> {
         let target_segment_id = target_cid / N_SEGMENT_CAPACITY as u64;
-        
-        
-        // Fast path: check if the cached segment is the target
-        if !sp_cache.is_null() {
-            let cached_id = (*sp_cache).id;
-            
-            if cached_id == target_segment_id {
-                return sp_cache;
-            }
-            
-            // If cached segment is past our target, restart from qseg
-            if cached_id > target_segment_id {
-                let qseg = self.qseg.load(Ordering::Acquire);
-                return self.find_segment(qseg, target_cid);
-            }
-        }
-        
-        // Start with the cache or qseg
-        let starting_seg_ptr = if sp_cache.is_null() {
-            self.qseg.load(Ordering::Acquire)
-        } else {
+        let mut current_seg_ptr = if !sp_cache.is_null() && (*sp_cache).id <= target_segment_id {
             sp_cache
+        } else {
+            self.qseg.load(Ordering::Acquire)
         };
-        
-        if starting_seg_ptr.is_null() {
-            return ptr::null_mut();
-        }
-        
-        let mut current_seg_ptr = starting_seg_ptr;
-        
-        // Traverse segments until we find the target or go past it
-        let mut loop_count = 0;
-        let max_loops = self.segment_pool_capacity + 10; // Limit to prevent infinite loops
-        
+        if current_seg_ptr.is_null() { return ptr::null_mut(); }
+        let mut loop_count = 0; 
+        let max_loops = self.segment_pool_capacity + self.num_producers + 20;
         while (*current_seg_ptr).id < target_segment_id {
             loop_count += 1;
-            if loop_count > max_loops {
-                return ptr::null_mut();
-            }
-            
-            // Check next segment
+            if loop_count > max_loops { return ptr::null_mut(); }
             let mut next_ptr = (*current_seg_ptr).next.load(Ordering::Acquire);
-            
-            // Create new segment if needed
             if next_ptr.is_null() {
                 let next_expected_id = (*current_seg_ptr).id + 1;
-                
-                let new_seg_ptr = self.new_segment(next_expected_id);
-                
-                if new_seg_ptr.is_null() {
-                    return ptr::null_mut();
-                }
-                
-                // Link the new segment
-                match (*current_seg_ptr).next.compare_exchange(
-                    ptr::null_mut(),
-                    new_seg_ptr,
-                    Ordering::AcqRel,
-                    Ordering::Acquire
-                ) {
-                    Ok(_) => {
-                        // Successfully linked our new segment
-                        next_ptr = new_seg_ptr;
+                if next_expected_id <= target_segment_id {
+                    let new_seg_ptr = self.new_segment(next_expected_id);
+                    if new_seg_ptr.is_null() {
+                        next_ptr = (*current_seg_ptr).next.load(Ordering::Acquire);
+                        if next_ptr.is_null() { return ptr::null_mut(); }
+                    } else {
+                        match (*current_seg_ptr).next.compare_exchange(ptr::null_mut(), new_seg_ptr, Ordering::AcqRel, Ordering::Relaxed) {
+                            Ok(_) => next_ptr = new_seg_ptr,
+                            Err(existing_next) => { self.release_segment_to_pool(new_seg_ptr); next_ptr = existing_next; }
+                        }
                     }
-                    Err(existing_next) => {
-                        // Another thread linked a segment, use that one
-                        next_ptr = existing_next;
-                    }
+                } else { 
+                    current_seg_ptr = self.qseg.load(Ordering::Acquire);
+                    if current_seg_ptr.is_null() || (*current_seg_ptr).id > target_segment_id { return ptr::null_mut(); }
+                    continue; 
                 }
             }
-            
             current_seg_ptr = next_ptr;
-            
-            if current_seg_ptr.is_null() {
-                return ptr::null_mut();
+            if current_seg_ptr.is_null() { return ptr::null_mut(); }
+        }
+        if (*current_seg_ptr).id == target_segment_id { current_seg_ptr } else { ptr::null_mut() }
+    }
+
+    pub unsafe fn run_gc(&self) {
+        let q_head_snapshot = self.q_head.load(Ordering::Acquire);
+        let consumer_cached_cseg_ptr = self.cseg.load(Ordering::Acquire);
+    
+        if consumer_cached_cseg_ptr.is_null() { return; }
+    
+        let mut min_producer_referenced_seg_id = u64::MAX;
+        if self.num_producers > 0 {
+            for i in 0..self.num_producers {
+                let p_struct = self.producers_array.add(i);
+                let p_cached_seg = (*p_struct).pseg.load(Ordering::Acquire);
+                if !p_cached_seg.is_null() {
+                    min_producer_referenced_seg_id = min_producer_referenced_seg_id.min((*p_cached_seg).id);
+                }
+                let local_h = (*p_struct).local_head.load(Ordering::Relaxed);
+                let local_t = (*p_struct).local_tail.load(Ordering::Relaxed);
+                let local_buf_ptr = (*p_struct).local_buffer.get();
+                let mut current_local_idx = local_h;
+                while current_local_idx != local_t {
+                    let req_ptr = (*(local_buf_ptr as *const MaybeUninit<Request<T>>).add(current_local_idx)).as_ptr();
+                    min_producer_referenced_seg_id = min_producer_referenced_seg_id.min((*req_ptr).cid / N_SEGMENT_CAPACITY as u64);
+                    current_local_idx = Producer::<T>::local_next(current_local_idx);
+                }
             }
+        } else { 
+            min_producer_referenced_seg_id = (*consumer_cached_cseg_ptr).id;
         }
         
-        // Return the found segment
-        current_seg_ptr
+        let safe_seg_id = min_producer_referenced_seg_id;
+    
+        // Phase 1: Try to advance qseg
+        loop {
+            let current_q_seg_val = self.qseg.load(Ordering::Acquire);
+            if current_q_seg_val.is_null() || (*current_q_seg_val).id >= safe_seg_id || current_q_seg_val == consumer_cached_cseg_ptr {
+                break;
+            }
+            let end_of_current_q_seg_cid = ((*current_q_seg_val).id + 1) * (N_SEGMENT_CAPACITY as u64);
+            if q_head_snapshot >= end_of_current_q_seg_cid {
+                let next_q_seg_candidate = (*current_q_seg_val).next.load(Ordering::Acquire);
+                if next_q_seg_candidate.is_null() { break; }
+                if self.qseg.compare_exchange(current_q_seg_val, next_q_seg_candidate, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    self.release_segment_to_pool(current_q_seg_val);
+                } else {
+                    break; 
+                }
+            } else { break; }
+        }
+    
+        // Phase 2: Reclaim segments in [current qseg (after phase 1), consumer_cached_cseg_ptr->id)
+        let mut prev_seg_ptr = self.qseg.load(Ordering::Acquire); 
+        if prev_seg_ptr.is_null() { return; }
+        let mut current_seg_to_check_ptr = (*prev_seg_ptr).next.load(Ordering::Acquire);
+    
+        while !current_seg_to_check_ptr.is_null() && (*current_seg_to_check_ptr).id < (*consumer_cached_cseg_ptr).id {
+            let current_seg_id = (*current_seg_to_check_ptr).id;
+            let mut is_safe_to_reclaim = true;
+    
+            if current_seg_id < safe_seg_id {
+                 is_safe_to_reclaim = false;
+            } else {
+                for i in 0..self.num_producers {
+                    let p_struct = self.producers_array.add(i);
+                    let local_h = (*p_struct).local_head.load(Ordering::Relaxed);
+                    let local_t = (*p_struct).local_tail.load(Ordering::Relaxed);
+                    let local_buf_ptr = (*p_struct).local_buffer.get();
+                    let mut current_local_idx = local_h;
+                    let mut producer_needs_this_segment = false;
+                    while current_local_idx != local_t {
+                        let req_ptr = (*(local_buf_ptr as *const MaybeUninit<Request<T>>).add(current_local_idx)).as_ptr();
+                        if (*req_ptr).cid / N_SEGMENT_CAPACITY as u64 == current_seg_id {
+                            producer_needs_this_segment = true; break;
+                        }
+                        current_local_idx = Producer::<T>::local_next(current_local_idx);
+                    }
+                    if producer_needs_this_segment { is_safe_to_reclaim = false; break; }
+                }
+            }
+            
+            let next_seg_in_list = (*current_seg_to_check_ptr).next.load(Ordering::Acquire);
+    
+            if is_safe_to_reclaim {
+                if (*prev_seg_ptr).next.compare_exchange(current_seg_to_check_ptr, next_seg_in_list, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    self.release_segment_to_pool(current_seg_to_check_ptr);
+                    current_seg_to_check_ptr = next_seg_in_list; 
+                } else {
+                    prev_seg_ptr = (*prev_seg_ptr).next.load(Ordering::Acquire);
+                    if prev_seg_ptr.is_null() { break; }
+                    current_seg_to_check_ptr = (*prev_seg_ptr).next.load(Ordering::Acquire);
+                }
+            } else {
+                prev_seg_ptr = current_seg_to_check_ptr;
+                current_seg_to_check_ptr = next_seg_in_list;
+            }
+        }
     }
 
     unsafe fn dump_local_buffer(&self, producer_idx: usize) {
-        
-        if self.num_producers == 0 || producer_idx >= self.num_producers {
-            return;
-        }
-        
+        if self.num_producers == 0 || producer_idx >= self.num_producers { return; }
         let p_struct_ptr = self.producers_array.add(producer_idx);
-        let local_head = &(*p_struct_ptr).local_head;
-        let local_tail = &(*p_struct_ptr).local_tail;
+        let local_head_atomic = &(*p_struct_ptr).local_head;
+        let local_tail_val = (*p_struct_ptr).local_tail.load(Ordering::Relaxed); 
         let local_buf_ptr = (*p_struct_ptr).local_buffer.get();
         let pseg_atomic = &(*p_struct_ptr).pseg;
-        
-        let head_idx = local_head.load(Ordering::Relaxed);
-        let tail_idx = local_tail.load(Ordering::Relaxed);
-        
-        if head_idx == tail_idx {
-            return;
-        }
-        
-        // Optimization: Group requests by target segment to reduce lookups
-        let mut current_seg: *mut Segment<T> = ptr::null_mut();
-        let mut current_seg_id: u64 = u64::MAX;
-        
-        // Load producer's cached segment pointer
-        let producer_pseg = pseg_atomic.load(Ordering::Acquire);
-        
-        let mut current_idx = head_idx;
-        let mut dumped_count = 0;
-        let max_iters = L_LOCAL_BUFFER_CAPACITY + 5; // Prevent infinite loops
+        let mut current_local_h = local_head_atomic.load(Ordering::Relaxed);
+        if current_local_h == local_tail_val { return; }
+        let mut producer_cached_pseg = pseg_atomic.load(Ordering::Acquire);
         let mut iter_count = 0;
-        
-        while current_idx != tail_idx {
-            iter_count += 1;
-            if iter_count > max_iters {
-                break;
-            }
-            
-            // Get the request
-            let req_mu_ptr = (local_buf_ptr as *const MaybeUninit<Request<T>>).add(current_idx);
+        let max_local_iters = L_LOCAL_BUFFER_CAPACITY + 5;
+        while current_local_h != local_tail_val {
+            iter_count += 1; if iter_count > max_local_iters { break; } 
+            let req_mu_ptr = (local_buf_ptr as *const MaybeUninit<Request<T>>).add(current_local_h);
             let req_ptr = (*req_mu_ptr).as_ptr();
-            
             let cid = (*req_ptr).cid;
-            let val_clone = (*(*req_ptr).val.as_ptr()).clone();
-            
-            // Calculate target segment ID
             let target_seg_id = cid / N_SEGMENT_CAPACITY as u64;
-            
-            // Optimize segment lookup by reusing current segment when possible
-            if current_seg.is_null() || current_seg_id != target_seg_id {
-                // Need to lookup the segment
-                current_seg = self.find_segment(producer_pseg, cid);
-                
-                if current_seg.is_null() {
-                    break;
-                }
-                
-                current_seg_id = (*current_seg).id;
-                
-                // Update producer's segment cache
-                if producer_pseg != current_seg {
-                    pseg_atomic.store(current_seg, Ordering::Release);
-                }
+            let target_seg_ptr = if !producer_cached_pseg.is_null() && (*producer_cached_pseg).id == target_seg_id {
+                producer_cached_pseg
+            } else { self.find_segment(producer_cached_pseg, cid) };
+            if target_seg_ptr.is_null() { break; }
+            if producer_cached_pseg != target_seg_ptr {
+                pseg_atomic.store(target_seg_ptr, Ordering::Release);
+                producer_cached_pseg = target_seg_ptr; 
             }
-            
-            // Write value to cell
             let cell_idx = (cid % N_SEGMENT_CAPACITY as u64) as usize;
-            let cell_ptr = (*current_seg).cells.add(cell_idx);
-            ptr::write((*cell_ptr).get(), MaybeUninit::new(Some(val_clone)));
-            
-            // Increment local head
-            current_idx = Producer::<T>::local_next(current_idx);
-            local_head.store(current_idx, Ordering::Relaxed);
-            dumped_count += 1;
+            let cell_ptr = (*target_seg_ptr).cells.add(cell_idx);
+            let val_to_write = ptr::read(&(*req_ptr).val).assume_init(); 
+            ptr::write((*cell_ptr).get(), MaybeUninit::new(Some(val_to_write)));
+            current_local_h = Producer::<T>::local_next(current_local_h);
         }
-        
+        local_head_atomic.store(current_local_h, Ordering::Release); 
     }
 
     unsafe fn help_enqueue(&self) {
-    
         if self.num_producers == 0 { return; }
-    
         for i in 0..self.num_producers {
-            let p_struct_ptr  = self.producers_array.add(i);
-            let p_local_head  = &(*p_struct_ptr).local_head;          // <-- new
-            let p_local_tail  = &(*p_struct_ptr).local_tail;
-            let p_local_buf   = (*p_struct_ptr).local_buffer.get();
-            let producer_pseg = (*p_struct_ptr).pseg.load(Ordering::Acquire);
-    
-            let mut h = p_local_head.load(Ordering::Acquire);
-            let t      = p_local_tail.load(Ordering::Acquire);
-            if h == t { continue; }
-    
-            let mut cur_seg : *mut Segment<T> = ptr::null_mut();
-            let mut cur_seg_id : u64 = u64::MAX;
-    
-            let mut iter = 0;
-            while h != t {
-                if iter > L_LOCAL_BUFFER_CAPACITY + 5 {
-                    break;
-                }
-                iter += 1;
-    
-                let req_ptr = (*(p_local_buf as *const MaybeUninit<Request<T>>).add(h)).as_ptr();
-                let cid      = (*req_ptr).cid;
-                let val_clone= (*(*req_ptr).val.as_ptr()).clone();
-    
+            let p_struct_ptr = self.producers_array.add(i);
+            let local_head_atomic = &(*p_struct_ptr).local_head;
+            let local_tail_val = (*p_struct_ptr).local_tail.load(Ordering::Acquire); 
+            let local_buf_ptr = (*p_struct_ptr).local_buffer.get();
+            let pseg_atomic = &(*p_struct_ptr).pseg; 
+            let mut current_local_h = local_head_atomic.load(Ordering::Acquire); 
+            if current_local_h == local_tail_val { continue; }
+            let mut producer_cached_pseg_hint = pseg_atomic.load(Ordering::Acquire);
+            let mut iter_count = 0;
+            let max_local_iters = L_LOCAL_BUFFER_CAPACITY + 5;
+            while current_local_h != local_tail_val {
+                iter_count += 1; if iter_count > max_local_iters { break; }
+                let req_mu_ptr = (local_buf_ptr as *const MaybeUninit<Request<T>>).add(current_local_h);
+                let req_ptr = (*req_mu_ptr).as_ptr(); 
+                let cid = (*req_ptr).cid;
+                let val_clone = (*(*req_ptr).val.as_ptr()).clone(); 
                 let target_seg_id = cid / N_SEGMENT_CAPACITY as u64;
-                if cur_seg.is_null() || cur_seg_id != target_seg_id {
-                    cur_seg = self.find_segment(producer_pseg, cid);
-                    if cur_seg.is_null() { break; }
-                    cur_seg_id = (*cur_seg).id;
-                }
-    
+                let target_seg_ptr = if !producer_cached_pseg_hint.is_null() && (*producer_cached_pseg_hint).id == target_seg_id {
+                    producer_cached_pseg_hint
+                } else {
+                    let helper_hint = self.cseg.load(Ordering::Acquire);
+                    let hint_to_use = if !helper_hint.is_null() && (*helper_hint).id <= target_seg_id { helper_hint } else { producer_cached_pseg_hint };
+                    self.find_segment(hint_to_use, cid)
+                };
+                if target_seg_ptr.is_null() { break; }
+                producer_cached_pseg_hint = target_seg_ptr;
                 let cell_idx = (cid % N_SEGMENT_CAPACITY as u64) as usize;
-                let cell_ptr = (*cur_seg).cells.add(cell_idx);
-                let opt_ptr  = (*(*cell_ptr).get()).as_mut_ptr();
-                if (*opt_ptr).is_none() {
-                    ptr::write(opt_ptr, Some(val_clone));
+                let cell_ptr = (*target_seg_ptr).cells.add(cell_idx);
+                let option_ptr_in_cell = (*cell_ptr).get();
+                if (*option_ptr_in_cell).as_ptr().is_null() || (*option_ptr_in_cell).assume_init_ref().is_none() {
+                     ptr::write(option_ptr_in_cell, MaybeUninit::new(Some(val_clone)));
                 }
-    
-                h = Producer::<T>::local_next(h);
-                p_local_head.store(h, Ordering::Relaxed);            // <-- **advance**
+                current_local_h = Producer::<T>::local_next(current_local_h);
             }
         }
-    
     }
     
-    // Enqueue an item into the queue
     pub fn enqueue(&self, producer_idx: usize, item: T) -> Result<(), ()> {
-        if self.num_producers == 0 || producer_idx >= self.num_producers {
-            return Err(());
-        }
-        
+        if self.num_producers == 0 || producer_idx >= self.num_producers { return Err(()); }
         unsafe {
             let p_struct = self.producers_array.add(producer_idx);
             let local_head = &(*p_struct).local_head;
             let local_tail = &(*p_struct).local_tail;
             let local_buf_ptr = (*p_struct).local_buffer.get();
-            
-            // Check if buffer is full
-            let current_tail = local_tail.load(Ordering::Relaxed);
-            if Producer::<T>::local_next(current_tail) == local_head.load(Ordering::Acquire) {
+            let current_local_t_val = local_tail.load(Ordering::Relaxed);
+            if Producer::<T>::local_next(current_local_t_val) == local_head.load(Ordering::Acquire) {
                 self.dump_local_buffer(producer_idx);
-                
-                // If buffer is still full after dumping, we can't enqueue
                 if Producer::<T>::local_next(local_tail.load(Ordering::Relaxed)) == local_head.load(Ordering::Acquire) {
-                    return Err(());
+                    return Err(()); 
                 }
             }
-            
-            // Get a new cell ID from the global tail
-            let cid = self.q_tail.fetch_add(1, Ordering::AcqRel);
-            
-            // Store in local buffer
-            let tail_idx = local_tail.load(Ordering::Relaxed);
-            let req_slot_ptr = (local_buf_ptr as *mut MaybeUninit<Request<T>>).add(tail_idx);
-            
-            req_slot_ptr.write(MaybeUninit::new(Request {
-                val: MaybeUninit::new(item),
-                cid,
-            }));
-            
-            // Update the tail pointer
-            local_tail.store(Producer::<T>::local_next(tail_idx), Ordering::Release);
-            
+            let cid = self.q_tail.fetch_add(1, Ordering::AcqRel); 
+            let tail_idx_for_write = local_tail.load(Ordering::Relaxed); 
+            let req_slot_ptr = (local_buf_ptr as *mut MaybeUninit<Request<T>>).add(tail_idx_for_write);
+            ptr::write(req_slot_ptr, MaybeUninit::new(Request { val: MaybeUninit::new(item), cid, }));
+            local_tail.store(Producer::<T>::local_next(tail_idx_for_write), Ordering::Release);
         }
-        
         Ok(())
     }
 
-    // Dequeue an item from the queue
     pub fn dequeue(&self) -> Option<T> {
-
         unsafe {
             let head_val = self.q_head.load(Ordering::Acquire);
-            let seg_hint = self.cseg.load(Ordering::Acquire);
-            let seg = self.find_segment(seg_hint, head_val);
+            let mut q_tail_snapshot = self.q_tail.load(Ordering::Acquire);
+            if head_val >= q_tail_snapshot { 
+                 let mut producer_has_items = false;
+                 if self.num_producers > 0 {
+                     for i in 0..self.num_producers {
+                         let p_struct = self.producers_array.add(i);
+                         if (*p_struct).local_head.load(Ordering::Relaxed) != (*p_struct).local_tail.load(Ordering::Relaxed) {
+                             producer_has_items = true; break;
+                         }
+                     }
+                 }
+                 if !producer_has_items {
+                    q_tail_snapshot = self.q_tail.load(Ordering::Acquire);
+                    if head_val >= q_tail_snapshot { return None; }
+                 }
+            }
+            let consumer_cached_cseg = self.cseg.load(Ordering::Acquire);
+            let mut seg = self.find_segment(consumer_cached_cseg, head_val);
             if seg.is_null() {
-                return None;
+                self.help_enqueue(); 
+                q_tail_snapshot = self.q_tail.load(Ordering::Acquire);
+                let current_head_val_after_help = self.q_head.load(Ordering::Acquire);
+                if current_head_val_after_help >= q_tail_snapshot { return None; }
+                seg = self.find_segment(self.cseg.load(Ordering::Acquire), current_head_val_after_help);
+                if seg.is_null() { return None;}
+                
+                let cell_idx_retry = (current_head_val_after_help % N_SEGMENT_CAPACITY as u64) as usize;
+                let cell_ptr_retry = (*seg).cells.add(cell_idx_retry);
+                let item_mu_opt_ptr_retry = (*cell_ptr_retry).get();
+                let item_opt_retry = ptr::read(item_mu_opt_ptr_retry).assume_init();
+                
+                return match item_opt_retry {
+                    Some(item_val_retry) => {
+                        ptr::write(item_mu_opt_ptr_retry, MaybeUninit::new(None));
+                        self.q_head.store(current_head_val_after_help + 1, Ordering::Release);
+                        Some(item_val_retry)
+                    }
+                    None => { ptr::write(item_mu_opt_ptr_retry, MaybeUninit::new(None)); None }
+                };
             }
-            if seg != seg_hint {
-                self.cseg.store(seg, Ordering::Release);
-            }
-
+            if seg != consumer_cached_cseg { self.cseg.store(seg, Ordering::Release); }
             let cell_idx = (head_val % N_SEGMENT_CAPACITY as u64) as usize;
             let cell_ptr = (*seg).cells.add(cell_idx);
-
-            // ---------- FIX 1 --------------------------------------------------------
-            let item_opt: Option<T> = {
-                let opt_ref = (&*(*cell_ptr).get()).assume_init_ref();
-                opt_ref.clone()
-            };
-            // -------------------------------------------------------------------------
-
+            let item_mu_opt_ptr = (*cell_ptr).get();
+            let item_opt = ptr::read(item_mu_opt_ptr).assume_init();
             match item_opt {
-                Some(item) => {
-                    // Fast path
-                    ptr::write((*(*cell_ptr).get()).as_mut_ptr(), None);
-                    self.q_head.store(head_val + 1, Ordering::Release);
-                    return Some(item);
+                Some(item_val) => {
+                    ptr::write(item_mu_opt_ptr, MaybeUninit::new(None)); 
+                    self.q_head.store(head_val + 1, Ordering::Release); 
+                    Some(item_val)
                 }
                 None => {
+                    ptr::write(item_mu_opt_ptr, MaybeUninit::new(None));
                     let tail_now = self.q_tail.load(Ordering::Acquire);
-                    if head_val == tail_now {
-                        return None;
+                    if head_val >= tail_now { 
+                        let mut producer_has_items = false;
+                        if self.num_producers > 0 {
+                            for i in 0..self.num_producers {
+                                let p_struct = self.producers_array.add(i);
+                                if (*p_struct).local_head.load(Ordering::Relaxed) != (*p_struct).local_tail.load(Ordering::Relaxed) {
+                                    producer_has_items = true; break;
+                                }
+                            }
+                        }
+                        if !producer_has_items { return None; }
                     }
                     self.help_enqueue();
-
-                    // ---------- FIX 2 -------------------------------------------------
-                    let item_opt_after: Option<T> = {
-                        let opt_ref = (&*(*cell_ptr).get()).assume_init_ref();
-                        opt_ref.clone()
-                    };
-                    // ------------------------------------------------------------------
-
-                    if let Some(item) = item_opt_after {
-                        ptr::write((*(*cell_ptr).get()).as_mut_ptr(), None);
-                        self.q_head.store(head_val + 1, Ordering::Release);
-                        return Some(item);
+                    let item_after_help_mu_opt_ptr = (*(*seg).cells.add(cell_idx)).get(); 
+                    let item_opt_after_help = ptr::read(item_after_help_mu_opt_ptr).assume_init();
+                    match item_opt_after_help {
+                        Some(item_val_after_help) => {
+                            ptr::write(item_after_help_mu_opt_ptr, MaybeUninit::new(None));
+                            self.q_head.store(head_val + 1, Ordering::Release); 
+                            Some(item_val_after_help)
+                        }
+                        None => { ptr::write(item_after_help_mu_opt_ptr, MaybeUninit::new(None)); None }
                     }
-                    None
                 }
             }
         }
     }
 }
 
-// Implement the MpscQueue trait for DQueue
 impl<T: Send + Clone + 'static> MpscQueue<T> for DQueue<T> {
     type PushError = ();
     type PopError = ();
-    
     fn push(&self, _item: T) -> Result<(), Self::PushError> {
         panic!("DQueue::push on MpscQueue trait. Use DQueue::enqueue(producer_id, item) or BenchMpscQueue::bench_push.");
     }
-    
-    fn pop(&self) -> Result<T, Self::PopError> {
-        self.dequeue().ok_or(())
-    }
-    
+    fn pop(&self) -> Result<T, Self::PopError> { self.dequeue().ok_or(()) }
     fn is_empty(&self) -> bool {
         let head = self.q_head.load(Ordering::Acquire);
         let tail = self.q_tail.load(Ordering::Acquire);
-
-        if head < tail {
-            unsafe {
-                let seg_hint = self.cseg.load(Ordering::Acquire);
-                let seg = self.find_segment(seg_hint, head);
-                if seg.is_null() {
-                    return true;
-                }
-                let idx = (head % N_SEGMENT_CAPACITY as u64) as usize;
-                let cell_ptr = (*seg).cells.add(idx);
-
-                // ---------- FIX 3 -------------------------------------------------
-                let item_opt: Option<T> = {
-                    let opt_ref = (&*(*cell_ptr).get()).assume_init_ref();
-                    opt_ref.clone()
-                };
-                // ------------------------------------------------------------------
-
-                if item_opt.is_some() {
-                    return false;
-                }
-
-                // maybe producers still have it buffered
+        if head >= tail { 
+            if self.num_producers > 0 {
                 for i in 0..self.num_producers {
-                    let p = self.producers_array.add(i);
-                    if (*p).local_head.load(Ordering::Acquire)
-                        != (*p).local_tail.load(Ordering::Acquire)
-                    {
-                        return false;
+                    let p = unsafe { self.producers_array.add(i) };
+                    unsafe {
+                        if (*p).local_head.load(Ordering::Relaxed) != (*p).local_tail.load(Ordering::Relaxed) {
+                            return false; 
+                        }
                     }
                 }
-                true
             }
-        } else {
-            true
+            return true; 
         }
+        false 
     }
-    
-    fn is_full(&self) -> bool {
-        false // The queue is never considered full
-    }
+    fn is_full(&self) -> bool { false }
 }

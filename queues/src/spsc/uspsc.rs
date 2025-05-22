@@ -221,8 +221,7 @@ impl<T: Send + 'static> UnboundedQueue<T> {
                 (*slot_ptr).assume_init_ref()
             };
             
-            if slot_ref.initialized.load(Ordering::Acquire) && 
-               slot_ref.flag.load(Ordering::Acquire) == BOTH_READY {
+            if slot_ref.initialized.load(Ordering::Acquire) && slot_ref.flag.load(Ordering::Acquire) == BOTH_READY {
                 
                 // Try to claim this slot (only once)
                 if self.cache_head.compare_exchange(
@@ -428,8 +427,7 @@ impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
                     
                     // Attempt to push pending first, then current
                     if let Some(pending) = transition_ref.take() {
-                        if new_segment.tail.load(Ordering::Acquire) < 
-                           new_segment.head.load(Ordering::Acquire) + new_segment.mask {
+                        if new_segment.tail.load(Ordering::Acquire) < new_segment.head.load(Ordering::Acquire) + new_segment.mask {
                             // There's room for the pending item
                             let slot = new_segment.idx(new_segment.tail.load(Ordering::Relaxed));
                             *new_segment.buf[slot].get() = Some(pending);
@@ -449,8 +447,7 @@ impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
                         return Ok(());
                     } else {
                         // Try to push current item
-                        if new_segment.tail.load(Ordering::Acquire) < 
-                           new_segment.head.load(Ordering::Acquire) + new_segment.mask {
+                        if new_segment.tail.load(Ordering::Acquire) < new_segment.head.load(Ordering::Acquire) + new_segment.mask {
                             // There's room for the current item
                             let slot = new_segment.idx(new_segment.tail.load(Ordering::Relaxed));
                             *new_segment.buf[slot].get() = Some(item);
@@ -500,8 +497,7 @@ impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
                 let new_segment = &*new_segment;
                 
                 // Try to push current item
-                if new_segment.tail.load(Ordering::Acquire) < 
-                   new_segment.head.load(Ordering::Acquire) + new_segment.mask {
+                if new_segment.tail.load(Ordering::Acquire) < new_segment.head.load(Ordering::Acquire) + new_segment.mask {
                     // There's room for the current item
                     let slot = new_segment.idx(new_segment.tail.load(Ordering::Relaxed));
                     *new_segment.buf[slot].get() = Some(item);

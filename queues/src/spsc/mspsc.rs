@@ -199,8 +199,8 @@ impl<T: Send + 'static> SpscQueue<T> for MultiPushQueue<T> {
         // Fallback: local_buf full, AND flush failed (ring buffer also full for a batch).
         // Try a direct single push to the underlying ring.
         match self.ring_mut().push(item) {
-             Ok(_) => Ok(()),
-             Err(_) => Err(()),
+            Ok(_) => Ok(()),
+            Err(_) => Err(()),
         }
     }
 

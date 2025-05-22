@@ -89,9 +89,9 @@ impl<T: Send + Clone + 'static> ShmBumpPool<T> {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                     let allocated_node_ptr = alloc_ptr_usize as *mut SesdNode<(T, Timestamp)>;
-                     SesdNode::init_dummy(allocated_node_ptr); // Initialize new node
-                     return allocated_node_ptr;
+                    let allocated_node_ptr = alloc_ptr_usize as *mut SesdNode<(T, Timestamp)>;
+                    SesdNode::init_dummy(allocated_node_ptr); // Initialize new node
+                    return allocated_node_ptr;
                 }
                 Err(_) => { /* CAS failed on current, retry bump */ }
             }
@@ -395,26 +395,26 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
     }
 
     pub fn dequeue(&self) -> Option<T> {
-      unsafe {
-         if self.num_producers == 0 { return None; } 
-         let root_node = self.get_tree_node(0);
-         let min_info_at_root = root_node.read_min_info();
- 
-         if min_info_at_root.ts == INFINITY_TS {
-             return None; 
-         }
- 
-         let target_producer_id = min_info_at_root.leaf_idx;
-         if target_producer_id >= self.num_producers || target_producer_id == usize::MAX { 
-             self.refresh(0); 
-             let min_info_at_root_retry = root_node.read_min_info();
-             if min_info_at_root_retry.ts == INFINITY_TS || 
-                min_info_at_root_retry.leaf_idx >= self.num_producers ||
-                min_info_at_root_retry.leaf_idx == usize::MAX {
-                 return None; 
-             }
-             return self.dequeue();
-         }
+        unsafe {
+            if self.num_producers == 0 { return None; } 
+            let root_node = self.get_tree_node(0);
+            let min_info_at_root = root_node.read_min_info();
+    
+            if min_info_at_root.ts == INFINITY_TS {
+                return None; 
+            }
+    
+            let target_producer_id = min_info_at_root.leaf_idx;
+            if target_producer_id >= self.num_producers || target_producer_id == usize::MAX { 
+                self.refresh(0); 
+                let min_info_at_root_retry = root_node.read_min_info();
+                if min_info_at_root_retry.ts == INFINITY_TS || 
+                    min_info_at_root_retry.leaf_idx >= self.num_producers ||
+                    min_info_at_root_retry.leaf_idx == usize::MAX {
+                    return None; 
+                }
+                return self.dequeue();
+            }
 
             let local_q_to_dequeue = self.get_local_queue(target_producer_id);
             let mut dequeued_node_to_free = ptr::null_mut();

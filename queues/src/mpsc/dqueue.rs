@@ -279,7 +279,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
             let mut is_safe_to_reclaim = true;
     
             if current_seg_id < safe_seg_id {
-                 is_safe_to_reclaim = false;
+                is_safe_to_reclaim = false;
             } else {
                 for i in 0..self.num_producers {
                     let p_struct = self.producers_array.add(i);
@@ -385,7 +385,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
                 let cell_ptr = (*target_seg_ptr).cells.add(cell_idx);
                 let option_ptr_in_cell = (*cell_ptr).get();
                 if (*option_ptr_in_cell).as_ptr().is_null() || (*option_ptr_in_cell).assume_init_ref().is_none() {
-                     ptr::write(option_ptr_in_cell, MaybeUninit::new(Some(val_clone)));
+                    ptr::write(option_ptr_in_cell, MaybeUninit::new(Some(val_clone)));
                 }
                 current_local_h = Producer::<T>::local_next(current_local_h);
             }
@@ -420,19 +420,19 @@ impl<T: Send + Clone + 'static> DQueue<T> {
             let head_val = self.q_head.load(Ordering::Acquire);
             let mut q_tail_snapshot = self.q_tail.load(Ordering::Acquire);
             if head_val >= q_tail_snapshot { 
-                 let mut producer_has_items = false;
-                 if self.num_producers > 0 {
-                     for i in 0..self.num_producers {
-                         let p_struct = self.producers_array.add(i);
-                         if (*p_struct).local_head.load(Ordering::Relaxed) != (*p_struct).local_tail.load(Ordering::Relaxed) {
-                             producer_has_items = true; break;
-                         }
-                     }
-                 }
-                 if !producer_has_items {
-                    q_tail_snapshot = self.q_tail.load(Ordering::Acquire);
-                    if head_val >= q_tail_snapshot { return None; }
-                 }
+                let mut producer_has_items = false;
+                if self.num_producers > 0 {
+                    for i in 0..self.num_producers {
+                        let p_struct = self.producers_array.add(i);
+                        if (*p_struct).local_head.load(Ordering::Relaxed) != (*p_struct).local_tail.load(Ordering::Relaxed) {
+                            producer_has_items = true; break;
+                        }
+                    }
+                }
+                if !producer_has_items {
+                q_tail_snapshot = self.q_tail.load(Ordering::Acquire);
+                if head_val >= q_tail_snapshot { return None; }
+                }
             }
             let consumer_cached_cseg = self.cseg.load(Ordering::Acquire);
             let mut seg = self.find_segment(consumer_cached_cseg, head_val);

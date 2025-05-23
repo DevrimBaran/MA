@@ -24,8 +24,8 @@ use queues::spsc::llq::{LlqQueue, K_CACHE_LINE_SLOTS};
 use queues::spsc::blq::K_CACHE_LINE_SLOTS as BLQ_K_SLOTS;
 
 const PERFORMANCE_TEST: bool = false;
-const RING_CAP_GENERAL: usize = 65_536;
-const ITERS_GENERAL: usize = 40_000_000;
+const RING_CAP_GENERAL: usize = 65536;
+const ITERS_GENERAL: usize = 30_000_000;
 
 
 // Helper trait for benchmarking SPSC-like queues
@@ -500,19 +500,19 @@ where
 // Criterion setup
 fn custom_criterion() -> Criterion {
    Criterion::default()
-      .warm_up_time(Duration::from_secs(5))
-      .measurement_time(Duration::from_secs(300))
-      .sample_size(1000)
+      .warm_up_time(Duration::from_secs(2))
+      .measurement_time(Duration::from_secs(15))
+      .sample_size(10)
 }
 
 criterion_group!{
    name = benches;
    config = custom_criterion();
    targets =
-      bench_sesd_jp,
-      bench_lamport,
-      bench_bqueue,
-      bench_mp,
+      //bench_sesd_jp,
+      //bench_lamport,
+      //bench_bqueue,
+      //bench_mp,
       bench_unbounded,
       bench_dspsc,
       bench_dehnavi,

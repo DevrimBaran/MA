@@ -12,9 +12,9 @@ use std::{
 #[inline(always)]
 const fn null_node<T: Send>() -> *mut Node<T> { null_mut() }
 
-const PREALLOCATED_NODES: usize = 16384; 
-const NODE_CACHE_CAPACITY: usize = 32768; 
-const CACHE_LINE_SIZE: usize = 8192;
+const PREALLOCATED_NODES: usize = 32768; 
+const NODE_CACHE_CAPACITY: usize = 65536; 
+const CACHE_LINE_SIZE: usize = 16984;
 
 // strict alignment and adequate size for Node
 #[repr(C, align(128))]  // Increased alignment to cache line size

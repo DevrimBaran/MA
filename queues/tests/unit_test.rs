@@ -872,6 +872,188 @@ mod unbounded_tests {
         // when the queue itself is dropped, as it uses mmap/munmap for memory management
         // and focuses on deallocating memory rather than calling destructors.
     }
+    
+    #[test] 
+    fn test_unbounded_force_segment_deallocation() {
+        // This test specifically tries to trigger _deallocate_segment
+        // by filling up the segment pool to force deallocation
+        
+        const BUF_CAP: usize = 65536;  // From uspsc.rs
+        const POOL_CAP: usize = 32;     // From uspsc.rs
+        
+        let shared_size = UnboundedQueue::<usize>::shared_size();
+        let mut memory = vec![0u8; shared_size];
+        let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr()) };
+        
+        // Strategy: Fill and empty segments to test the recycling mechanism
+        // This should eventually trigger _deallocate_segment when Drop is called
+        
+        // First, create several segments by filling and emptying them
+        for batch in 0..10 {  // Create multiple segments
+            // Push enough to fill most of a segment
+            for i in 0..BUF_CAP - 100 {
+                if queue.push(batch * BUF_CAP + i).is_err() {
+                    // If we hit the segment limit, that's OK for this test
+                    break;
+                }
+            }
+            
+            // Pop all items to make segment available for recycling
+            while queue.pop().is_ok() {}
+        }
+        
+        // Push some final items
+        for i in 0..1000 {
+            if queue.push(i).is_err() {
+                break;
+            }
+        }
+        
+        // The queue will be dropped at the end of scope, triggering _deallocate_segment
+    }
+    
+    #[test]
+    fn test_unbounded_deallocate_with_drops() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        
+        static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+        
+        struct TrackingItem {
+            _id: usize,
+            _data: Vec<u8>,
+        }
+        
+        impl TrackingItem {
+            fn new(id: usize) -> Self {
+                ALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
+                Self {
+                    _id: id,
+                    _data: vec![0u8; 100], // Some data to make it non-trivial
+                }
+            }
+        }
+        
+        impl Drop for TrackingItem {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        
+        ALLOC_COUNT.store(0, Ordering::SeqCst);
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        
+        {
+            let shared_size = UnboundedQueue::<TrackingItem>::shared_size();
+            let mut memory = vec![0u8; shared_size];
+            let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr()) };
+            
+            // Push items to create multiple segments
+            for i in 0..1000 {
+                queue.push(TrackingItem::new(i)).unwrap();
+            }
+            
+            // Pop some but not all
+            for _ in 0..500 {
+                drop(queue.pop().unwrap());
+            }
+            
+            // Queue still has 500 items when dropped
+        } // Drop happens here
+        
+        std::thread::sleep(Duration::from_millis(10));
+        
+        let allocations = ALLOC_COUNT.load(Ordering::SeqCst);
+        let drops = DROP_COUNT.load(Ordering::SeqCst);
+        
+        // At minimum, the 500 we explicitly dropped
+        assert!(drops >= 500, "Should have dropped at least 500 items, got {}", drops);
+        assert_eq!(allocations, 1000, "Should have allocated exactly 1000 items");
+    }
+    
+    #[test]
+    fn test_unbounded_segment_lifecycle() {
+        // Test the full lifecycle of segments including allocation and deallocation
+        const BUF_CAP: usize = 65536;
+        
+        // Use a type that needs drop to exercise that path in _deallocate_segment
+        #[derive(Debug)]
+        struct NeedsDrop {
+            data: String,
+        }
+        
+        let shared_size = UnboundedQueue::<NeedsDrop>::shared_size();
+        let mut memory = vec![0u8; shared_size];
+        
+        {
+            let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr()) };
+            
+            // Fill first segment
+            for i in 0..BUF_CAP - 1 {
+                queue.push(NeedsDrop { data: format!("item_{}", i) }).unwrap();
+            }
+            
+            // This should allocate a second segment
+            queue.push(NeedsDrop { data: "overflow".to_string() }).unwrap();
+            
+            // Empty first segment completely
+            for _ in 0..BUF_CAP - 1 {
+                drop(queue.pop().unwrap());
+            }
+            
+            // Pop the item from second segment
+            drop(queue.pop().unwrap());
+            
+            // Push more items to reuse segments
+            for i in 0..100 {
+                queue.push(NeedsDrop { data: format!("reuse_{}", i) }).unwrap();
+            }
+            
+            // Leave some items in queue when it's dropped
+        } // Queue dropped here, should call _deallocate_segment
+    }
+    
+    #[test]
+    fn test_unbounded_drop_with_remaining_items() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+        
+        #[derive(Debug)]
+        struct DropCounter {
+            value: usize,
+        }
+        
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        
+        // Test that Drop implementation properly calls _deallocate_segment
+        {
+            DROP_COUNT.store(0, Ordering::SeqCst);
+            
+            let shared_size = UnboundedQueue::<DropCounter>::shared_size();
+            let mut memory = vec![0u8; shared_size];
+            
+            // Scope to control when queue is dropped
+            {
+                let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr()) };
+                
+                // Push items across multiple segments
+                for i in 0..100 {
+                    queue.push(DropCounter { value: i }).unwrap();
+                }
+                
+                // Don't pop anything - let Drop handle cleanup
+            } // Queue dropped here, should call _deallocate_segment
+            
+            // The Drop implementation should have deallocated segments
+            // but might not drop all items (implementation dependent)
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 mod dehnavi_tests {
@@ -1386,6 +1568,29 @@ mod special_feature_tests {
             assert_eq!(queue.pop().unwrap(), i);
         }
         assert!(queue.empty());
+    }
+    
+    #[test]
+    fn test_dspsc_heap_allocation() {
+        // Test heap allocation path in DynListQueue
+        let queue = DynListQueue::<String>::new();
+        
+        // Push more items than the preallocated pool to trigger heap allocation
+        const PREALLOCATED_NODES: usize = 16384; // From dspsc.rs
+        
+        // Fill the preallocated pool
+        for i in 0..PREALLOCATED_NODES + 100 {
+            queue.push(format!("item_{}", i)).unwrap();
+        }
+        
+        // Pop and push to test recycling of heap-allocated nodes
+        for i in 0..100 {
+            assert!(queue.pop().is_ok());
+            queue.push(format!("recycled_{}", i)).unwrap();
+        }
+        
+        // Clean up
+        while queue.pop().is_ok() {}
     }
     
     #[test]

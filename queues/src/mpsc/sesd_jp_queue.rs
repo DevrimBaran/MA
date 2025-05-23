@@ -17,7 +17,6 @@ impl<T: Send + Clone> Node<T> {
     }
 }
 
-/// Single Enqueuer, Single Dequeuer Queue from Figure 2
 #[repr(C)]
 pub struct SesdJpQueue<T: Send + Clone> {
     first: AtomicPtr<Node<T>>,      
@@ -207,7 +206,7 @@ impl<T: Send + Clone + 'static> SesdJpSpscBenchWrapper<T> {
         
         // Initialize the wrapper first with uninitialized queue
         ptr::write(self_ptr, Self {
-            queue: std::mem::MaybeUninit::uninit().assume_init(), // Will be overwritten
+            queue: std::mem::MaybeUninit::uninit().assume_init(),
             nodes_storage: nodes_storage_ptr,
             available_count: pool_capacity,
             capacity: pool_capacity,
@@ -216,8 +215,6 @@ impl<T: Send + Clone + 'static> SesdJpSpscBenchWrapper<T> {
             initial_dummy_addr,
             free_later_dummy_addr,
         });
-        
-        // Now initialize the queue in place
         SesdJpQueue::new_in_shm(
             ptr::addr_of_mut!((*self_ptr).queue),
             initial_dummy_addr,
@@ -230,8 +227,6 @@ impl<T: Send + Clone + 'static> SesdJpSpscBenchWrapper<T> {
 
     #[inline]
     fn alloc_node(&self) -> *mut Node<T> {
-        // Simple allocation from the pre-allocated array
-        // This is safe for SPSC because only producer calls this
         unsafe {
             let current_head = *self.free_head.get();
             
@@ -254,8 +249,6 @@ impl<T: Send + Clone + 'static> SesdJpSpscBenchWrapper<T> {
 
     #[inline]
     fn free_node(&self, node_ptr: *mut Node<T>) {
-        // Simple deallocation back to the array
-        // This is safe for SPSC because only consumer calls this
         if node_ptr.is_null() {
             return;
         }
@@ -264,12 +257,6 @@ impl<T: Send + Clone + 'static> SesdJpSpscBenchWrapper<T> {
         if node_ptr == self.initial_dummy_addr || node_ptr == self.free_later_dummy_addr {
             return;
         }
-        
-        // In this simple implementation, we don't actually reuse nodes
-        // We just let them be "freed" by doing nothing
-        // This is acceptable for benchmarking as long as pool is large enough
-        
-        // For a production implementation, you'd implement a proper free list here
     }
 }
 

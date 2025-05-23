@@ -226,7 +226,6 @@ impl<T: Send + 'static> Drop for FfqQueue<T> {
                for i in 0..self.capacity {
                   let slot = self.slot_ptr(i);
                   let maybe = ptr::read(slot).assume_init();
-                  drop(maybe); // Option's drop will handle Some(T)
                }
             }
             

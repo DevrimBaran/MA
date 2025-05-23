@@ -23,9 +23,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use queues::spsc::llq::{LlqQueue, K_CACHE_LINE_SLOTS};
 use queues::spsc::blq::K_CACHE_LINE_SLOTS as BLQ_K_SLOTS;
 
-const PERFORMANCE_TEST: bool = false; // Set to true for actual perf runs, false for quicker debug runs
-
-// General capacity for most queues, can be overridden for specific benches
+const PERFORMANCE_TEST: bool = false;
 const RING_CAP_GENERAL: usize = 65_536;
 const ITERS_GENERAL: usize = 40_000_000;
 
@@ -129,16 +127,16 @@ impl<T: Send + 'static> BenchSpscQueue<T> for BlqQueue<T> {
 }
 impl<T: Send + Clone + 'static> BenchSpscQueue<T> for SesdJpSpscBenchWrapper<T> {
    fn bench_push(&self, item: T) -> Result<(), ()> { 
-       SpscQueue::push(self, item).map_err(|_| ()) 
+      SpscQueue::push(self, item).map_err(|_| ()) 
    }
    fn bench_pop(&self) -> Result<T, ()> { 
-       SpscQueue::pop(self).map_err(|_| ()) 
+      SpscQueue::pop(self).map_err(|_| ()) 
    }
    fn bench_is_empty(&self) -> bool { 
-       SpscQueue::empty(self) 
+      SpscQueue::empty(self) 
    }
    fn bench_is_full(&self) -> bool { 
-       !SpscQueue::available(self) 
+      !SpscQueue::available(self) 
    }
 }
 
@@ -336,19 +334,19 @@ fn bench_blq(c: &mut Criterion) {
 
 fn bench_sesd_jp(c: &mut Criterion) {
    c.bench_function("SesdJpSPSC", |b| {
-       b.iter_custom(|_iters_arg_ignored| {
-           let pool_capacity = ITERS_GENERAL + 1000; // Extra buffer for safety
+         b.iter_custom(|_iters_arg_ignored| {
+            let pool_capacity = ITERS_GENERAL + 1000; // Extra buffer for safety
 
-           let bytes = SesdJpSpscBenchWrapper::<usize>::shared_size(pool_capacity);
-           let shm_ptr = unsafe { map_shared(bytes) };
-           let q_shared: &'static SesdJpSpscBenchWrapper<usize> = 
-               unsafe { SesdJpSpscBenchWrapper::init_in_shared(shm_ptr, pool_capacity) };
+            let bytes = SesdJpSpscBenchWrapper::<usize>::shared_size(pool_capacity);
+            let shm_ptr = unsafe { map_shared(bytes) };
+            let q_shared: &'static SesdJpSpscBenchWrapper<usize> = 
+                  unsafe { SesdJpSpscBenchWrapper::init_in_shared(shm_ptr, pool_capacity) };
 
-           let dur = fork_and_run(q_shared, ITERS_GENERAL);
+            let dur = fork_and_run(q_shared, ITERS_GENERAL);
 
-           unsafe { unmap_shared(shm_ptr, bytes); }
-           dur
-       })
+            unsafe { unmap_shared(shm_ptr, bytes); }
+            dur
+         })
    });
 }
 
@@ -502,21 +500,21 @@ where
 // Criterion setup
 fn custom_criterion() -> Criterion {
    Criterion::default()
-      .warm_up_time(Duration::from_secs(2))
-      .measurement_time(Duration::from_secs(15))
-      .sample_size(10)
+      .warm_up_time(Duration::from_secs(5))
+      .measurement_time(Duration::from_secs(300))
+      .sample_size(1000)
 }
 
 criterion_group!{
    name = benches;
    config = custom_criterion();
    targets =
-      //bench_sesd_jp,
-      //bench_lamport,
+      bench_sesd_jp,
+      bench_lamport,
       bench_bqueue,
-      //bench_mp,
-      //bench_unbounded,
-      //bench_dspsc,
+      bench_mp,
+      bench_unbounded,
+      bench_dspsc,
       bench_dehnavi,
       bench_iffq,
       bench_biffq,

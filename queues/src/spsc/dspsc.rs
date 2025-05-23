@@ -1,6 +1,5 @@
 // dspsc by torquati
 // works almost 6 times slower then uspsc like torquati says in the paper (cache locality is bad)
-// looses items in around 1% of iterations
 use crate::spsc::lamport::LamportQueue;
 use crate::SpscQueue;
 use std::{
@@ -16,8 +15,6 @@ const fn null_node<T: Send>() -> *mut Node<T> { null_mut() }
 const PREALLOCATED_NODES: usize = 16384; 
 const NODE_CACHE_CAPACITY: usize = 32768; 
 const CACHE_LINE_SIZE: usize = 8192;
-
-// node
 
 // strict alignment and adequate size for Node
 #[repr(C, align(128))]  // Increased alignment to cache line size
@@ -35,8 +32,6 @@ struct NodePtr<U: Send + 'static>(*mut Node<U>);
 
 unsafe impl<U: Send + 'static> Send for NodePtr<U> {}
 unsafe impl<U: Send + 'static> Sync for NodePtr<U> {}
-
-// queue
 
 #[repr(C, align(128))]
 pub struct DynListQueue<T: Send + 'static> {
@@ -57,7 +52,6 @@ pub struct DynListQueue<T: Send + 'static> {
     pool_capacity: usize,      
     owns_all: bool,    
     
-    // Debug counters
     heap_allocs: AtomicUsize,
     heap_frees: AtomicUsize,
 }
@@ -88,8 +82,7 @@ impl<T: Send + 'static> DynListQueue<T> {
 impl<T: Send + 'static> DynListQueue<T> {
     pub fn new() -> Self {
         
-        // Create dummy node - this is the first node in the queue
-        // and doesn't hold a value, just points to the next node
+        // Create dummy node - this is the first node in the queue and doesn't hold a value, just points to the next node
         let dummy = Box::into_raw(Box::new(Node { 
             val: None, 
             next: AtomicPtr::new(null_node()),
@@ -232,8 +225,6 @@ impl<T: Send + 'static> DynListQueue<T> {
             }
             return node;
         }
-
-        // Last resort: allocate from heap
         
         // Allocate with alignment
         let layout = Layout::from_size_align(std::mem::size_of::<Node<T>>(), 128).unwrap();
@@ -284,14 +275,9 @@ impl<T: Send + 'static> DynListQueue<T> {
             }
             (*node_to_recycle).next.store(null_node(), Ordering::SeqCst);
         }
-
-        // Simplify the recycling path to avoid issues
         if self.is_pool_node(node_to_recycle) {
-            // Basic approach: try once to cache, if it fails that's OK
             let _ = self.node_cache.push(NodePtr(node_to_recycle));
-            // No retry loops that could cause issues
         } else {
-            // For heap nodes, always deallocate
             
             unsafe {
                 let layout = Layout::from_size_align(std::mem::size_of::<Node<T>>(), 128).unwrap();
@@ -318,7 +304,6 @@ impl<T: Send + 'static> SpscQueue<T> for DynListQueue<T> {
         
         // Validate tail pointer before using it
         if current_tail_ptr.is_null() {
-            // This shouldn't happen, but guard against it
             return Err(());
         }
         
@@ -369,7 +354,6 @@ impl<T: Send + 'static> SpscQueue<T> for DynListQueue<T> {
             if let Some(value) = ptr::replace(&mut (*item_node_ptr).val, None) {
                 value
             } else {
-                // No value found (shouldn't happen, but be defensive)
                 return Err(());
             }
         };
@@ -383,7 +367,7 @@ impl<T: Send + 'static> SpscQueue<T> for DynListQueue<T> {
         // Memory barrier before recycling
         fence(Ordering::SeqCst);
         
-        // Recycle the old dummy node
+        // Recycle old dummy node
         self.recycle_node(current_dummy_ptr);
         
         Ok(value)
@@ -401,7 +385,6 @@ impl<T: Send + 'static> SpscQueue<T> for DynListQueue<T> {
         let h = self.head.load(Ordering::SeqCst); 
         
         if h.is_null() {
-            // This shouldn't happen, but be defensive
             return true;
         }
         
@@ -411,7 +394,6 @@ impl<T: Send + 'static> SpscQueue<T> for DynListQueue<T> {
 
 impl<T: Send + 'static> Drop for DynListQueue<T> {
     fn drop(&mut self) {
-        // Print diagnostics
         
         if self.owns_all {
             // Drain the queue

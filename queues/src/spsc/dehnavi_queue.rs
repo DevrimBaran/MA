@@ -1,5 +1,4 @@
 // Dehnavi 2021
-// Wait-free FIFO implementation following the paper's algorithms exactly
 use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;

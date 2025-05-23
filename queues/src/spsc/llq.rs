@@ -1,5 +1,3 @@
-// queues/src/spsc/llq.rs
-
 use crate::SpscQueue;
 use std::cell::UnsafeCell;
 use std::fmt;
@@ -14,10 +12,9 @@ pub const K_CACHE_LINE_SLOTS: usize = 8;
     any(target_arch = "x86_64", target_arch = "aarch64"),
     repr(align(64))
 )]
-// MODIFIED: Changed to pub
 pub struct SharedIndices { 
-    pub write: AtomicUsize, // MODIFIED: Changed to pub
-    pub read: AtomicUsize,  // MODIFIED: Changed to pub
+    pub write: AtomicUsize,
+    pub read: AtomicUsize,
 }
 
 #[repr(C)]
@@ -40,14 +37,11 @@ struct ConsumerPrivate {
 
 #[repr(C)]
 pub struct LlqQueue<T: Send + 'static> {
-    // MODIFIED: Changed to pub
     pub shared_indices: SharedIndices, 
     prod_private: UnsafeCell<ProducerPrivate>,
     cons_private: UnsafeCell<ConsumerPrivate>,
     capacity: usize,
-    // MODIFIED: Changed to pub
-    pub mask: usize, 
-    // MODIFIED: Changed to pub
+    pub mask: usize,
     pub buffer: ManuallyDrop<Box<[UnsafeCell<MaybeUninit<T>>]>>,
 }
 

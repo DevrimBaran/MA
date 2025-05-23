@@ -1,5 +1,3 @@
-// src/mpsc/drescher_queue.rs
-
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering, AtomicUsize};
 use std::mem::{self, MaybeUninit};
@@ -36,13 +34,11 @@ impl<T> Node<T> {
 pub struct DrescherQueue<T: Send + 'static> {
     head: AtomicPtr<Node<T>>,
     tail: AtomicPtr<Node<T>>,
-    dummy_node_offset: usize, // Offset from base for dummy node
-    
-    // For shared memory compatibility
-    free_list: AtomicPtr<Node<T>>, // Free list for recycling nodes
-    allocation_base: *mut u8,       // Base of shared memory region
-    allocation_size: usize,         // Total size of shared memory
-    allocation_offset: AtomicUsize, // Current allocation offset
+    dummy_node_offset: usize,
+    free_list: AtomicPtr<Node<T>>,
+    allocation_base: *mut u8,
+    allocation_size: usize,
+    allocation_offset: AtomicUsize,
 }
 
 unsafe impl<T: Send + 'static> Sync for DrescherQueue<T> {}
@@ -153,8 +149,7 @@ impl<T: Send + 'static> DrescherQueue<T> {
         }
     }
 
-    // Enqueue (Push) - For Multiple Producers
-    // Based on Fig 4(b) from the paper
+    // Enqueue (Push) Based on Fig 4(b) from the paper
     pub fn push(&self, item_val: T) -> Result<(), T> {
         unsafe {
             let new_node_ptr = match self.alloc_node() {
@@ -175,8 +170,7 @@ impl<T: Send + 'static> DrescherQueue<T> {
         }
     }
 
-    // Dequeue (Pop) - For Single Consumer
-    // Based on Fig 4(c) from the paper
+    // Dequeue (Pop) Based on Fig 4(c) from the paper
     pub fn pop(&self) -> Option<T> {
         unsafe {
             let current_head_node_ptr = self.head.load(Ordering::Relaxed);
@@ -220,9 +214,6 @@ impl<T: Send + 'static> DrescherQueue<T> {
             }
         }
     }
-
-    // Check if the queue is empty of actual items.
-    // Based on Fig 4(d) from the paper
     pub fn is_empty(&self) -> bool {
         unsafe {
             let head_ptr = self.head.load(Ordering::Acquire);
@@ -232,27 +223,22 @@ impl<T: Send + 'static> DrescherQueue<T> {
 }
 
 impl<T: Send + 'static> MpscQueue<T> for DrescherQueue<T> {
-    type PushError = T; // DrescherQueue's push returns Result<(), T>
-    type PopError = ();   // DrescherQueue's pop returns Option<T>, maps to Result<T, ()>
+    type PushError = T;
+    type PopError = ();
 
     fn push(&self, item: T) -> Result<(), Self::PushError> {
-        // This calls the inherent method `push` you've already defined
         self.push(item)
     }
 
     fn pop(&self) -> Result<T, Self::PopError> {
-        // This calls the inherent method `pop`
-        self.pop().ok_or(()) // Convert Option<T> to Result<T, ()>
+        self.pop().ok_or(())
     }
 
     fn is_empty(&self) -> bool {
-        // This calls the inherent method `is_empty`
         self.is_empty()
     }
 
     fn is_full(&self) -> bool {
-        // Check if we can allocate more nodes
-        // This is a best-effort check as allocation might still fail due to races
         let current_offset = self.allocation_offset.load(Ordering::Relaxed);
         let node_size = std::mem::size_of::<Node<T>>();
         let node_align = std::mem::align_of::<Node<T>>();

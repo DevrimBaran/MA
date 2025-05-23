@@ -1,5 +1,3 @@
-// queues/src/spsc/blq.rs
-
 use crate::SpscQueue;
 use std::cell::UnsafeCell;
 use std::fmt;
@@ -63,12 +61,6 @@ pub struct BlqQueue<T: Send + 'static> {
    owns_buffer: bool, // Flag to indicate if this instance owns the buffer (for Drop)
 }
 
-// Safety: BlqQueue is Send and Sync if T is Send.
-// The UnsafeCell fields are accessed in a way that upholds SPSC invariants:
-// - prod_private is only accessed by the producer.
-// - cons_private is only accessed by the consumer.
-// - Shared shared_indices are atomic.
-// - Buffer access is coordinated by these indices.
 unsafe impl<T: Send> Send for BlqQueue<T> {}
 unsafe impl<T: Send> Sync for BlqQueue<T> {}
 
@@ -79,8 +71,6 @@ pub struct BlqPushError<T>(pub T);
 pub struct BlqPopError;
 
 impl<T: Send + 'static> BlqQueue<T> {
-   /// Creates a new BlqQueue with the given capacity.
-   /// Capacity must be a power of two and greater than K_CACHE_LINE_SLOTS.
    pub fn with_capacity(capacity: usize) -> Self {
       assert!(
          capacity.is_power_of_two(),
@@ -115,8 +105,6 @@ impl<T: Send + 'static> BlqQueue<T> {
          owns_buffer: true,
       }
    }
-
-   /// Calculates the total shared memory size required for the queue.
    pub fn shared_size(capacity: usize) -> usize {
       assert!(
          capacity.is_power_of_two(),
@@ -136,11 +124,6 @@ impl<T: Send + 'static> BlqQueue<T> {
          layout_header.extend(layout_buffer_elements).unwrap();
       combined_layout.pad_to_align().size()
    }
-
-   /// Initializes the queue in a given shared memory region.
-   /// # Safety
-   /// The caller must ensure that `mem` points to a valid shared memory region
-   /// of at least `shared_size(capacity)` bytes, and that it remains valid for 'static.
    pub unsafe fn init_in_shared(mem: *mut u8, capacity: usize) -> &'static mut Self {
       assert!(
          capacity.is_power_of_two(),
@@ -164,11 +147,6 @@ impl<T: Send + 'static> BlqQueue<T> {
       let buffer_data_start_ptr = mem.add(offset_of_buffer) 
          as *mut UnsafeCell<MaybeUninit<T>>;
 
-      // Initialize buffer elements to uninitialized (they will hold Option<T>, initially None conceptually)
-      // For MaybeUninit<T> in UnsafeCell, we just need to ensure the memory is there.
-      // The Option<T> itself will be handled by push/pop logic.
-      // Here, we are creating a slice from raw parts, so the memory must be valid.
-      // The actual UnsafeCell<MaybeUninit<T>> will be constructed by ptr::write for Self.
       let buffer_slice = std::slice::from_raw_parts_mut(buffer_data_start_ptr, capacity);
       let boxed_buffer = Box::from_raw(buffer_slice);
 
@@ -197,9 +175,6 @@ impl<T: Send + 'static> BlqQueue<T> {
       &mut *queue_struct_ptr
    }
 
-   /// Producer: Checks how many items can be enqueued.
-   /// `needed`: The number of items the producer hopes to enqueue.
-   /// Returns the actual number of free slots available.
    #[inline]
    pub fn blq_enq_space(&self, needed: usize) -> usize {
       let prod_priv = unsafe { &mut *self.prod_private.get() };
@@ -218,16 +193,11 @@ impl<T: Send + 'static> BlqQueue<T> {
       free_slots
    }
 
-   /// Producer: Enqueues an item locally without publishing.
-   /// Assumes `blq_enq_space` was called and confirmed space.
    #[inline]
    pub fn blq_enq_local(&self, item: T) -> Result<(), BlqPushError<T>> {
       let prod_priv = unsafe { &mut *self.prod_private.get() };
       let current_write_priv = prod_priv.write_priv;
 
-      // This check should ideally be guaranteed by pre-calling blq_enq_space.
-      // If we strictly follow paper's API, this check is redundant here,
-      // but it's good for safety if used as a standalone SPSC push part.
       let num_filled = current_write_priv.wrapping_sub(prod_priv.read_shadow);
       if num_filled >= self.capacity - K_CACHE_LINE_SLOTS {
             // Refresh read_shadow as a last attempt before failing
@@ -248,20 +218,15 @@ impl<T: Send + 'static> BlqQueue<T> {
       Ok(())
    }
 
-   /// Producer: Publishes all locally enqueued items.
    #[inline]
    pub fn blq_enq_publish(&self) {
       let prod_priv = unsafe { &*self.prod_private.get() };
-      // Memory fence (Release) to ensure all previous writes to the buffer
-      // are visible before the `write` index is updated.
+      // Memory fence (Release) to ensure all previous writes to the buffer are visible before the `write` index is updated.
       self.shared_indices
          .write
          .store(prod_priv.write_priv, Ordering::Release);
    }
 
-   /// Consumer: Checks how many items are available to dequeue.
-   /// `needed`: The number of items the consumer hopes to dequeue.
-   /// Returns the actual number of items available.
    #[inline]
    pub fn blq_deq_space(&self, needed: usize) -> usize {
       let cons_priv = unsafe { &mut *self.cons_private.get() };
@@ -276,14 +241,11 @@ impl<T: Send + 'static> BlqQueue<T> {
       available_items
    }
 
-   /// Consumer: Dequeues an item locally without publishing the free slot.
-   /// Assumes `blq_deq_space` was called and confirmed items are available.
    #[inline]
    pub fn blq_deq_local(&self) -> Result<T, BlqPopError> {
       let cons_priv = unsafe { &mut *self.cons_private.get() };
       let current_read_priv = cons_priv.read_priv;
 
-      // This check should ideally be guaranteed by pre-calling blq_deq_space.
       if current_read_priv == cons_priv.write_shadow {
          // Refresh write_shadow as a last attempt
          cons_priv.write_shadow = self.shared_indices.write.load(Ordering::Acquire);
@@ -300,12 +262,10 @@ impl<T: Send + 'static> BlqQueue<T> {
       Ok(item)
    }
 
-   /// Consumer: Publishes all locally dequeued (now free) slots.
    #[inline]
    pub fn blq_deq_publish(&self) {
       let cons_priv = unsafe { &*self.cons_private.get() };
-      // Memory fence (Release) to ensure that the consumer is done reading
-      // the items before making the slots available to the producer.
+      // Memory fence (Release) to ensure that the consumer is done reading the items before making the slots available to the producer.
       self.shared_indices
          .read
          .store(cons_priv.read_priv, Ordering::Release);
@@ -321,8 +281,7 @@ impl<T: Send + 'static> SpscQueue<T> for BlqQueue<T> {
       if self.blq_enq_space(1) == 0 {
          return Err(BlqPushError(item));
       }
-      // blq_enq_local should not fail if space was confirmed.
-      self.blq_enq_local(item)?; // Propagate error just in case, though unlikely.
+      self.blq_enq_local(item)?;
       self.blq_enq_publish();
       Ok(())
    }
@@ -332,8 +291,7 @@ impl<T: Send + 'static> SpscQueue<T> for BlqQueue<T> {
       if self.blq_deq_space(1) == 0 {
          return Err(BlqPopError);
       }
-      // blq_deq_local should not fail if items were confirmed.
-      let item = self.blq_deq_local()?; // Propagate error.
+      let item = self.blq_deq_local()?;
       self.blq_deq_publish();
       Ok(item)
    }
@@ -358,11 +316,6 @@ impl<T: Send + 'static> Drop for BlqQueue<T> {
                // Get mutable references to private fields for drop
                let prod_priv = unsafe { &*self.prod_private.get() };
                let cons_priv = unsafe { &mut *self.cons_private.get() };
-
-               // Items potentially in flight (written by producer but not yet published)
-               // or items in buffer that were published but not yet consumed.
-               // The shared indices reflect the state visible to the other party.
-               // Private indices reflect local operations.
                
                // Drain based on private consumer index up to private write shadow
                let mut current_read = cons_priv.read_priv;

@@ -1,5 +1,3 @@
-// lamports buffer ring
-
 use crate::SpscQueue;
 use std::{
    cell::UnsafeCell,
@@ -47,14 +45,10 @@ impl<T: Send> LamportQueue<T> {
 
 // shared-memory in-place constructor
 impl<T: Send> LamportQueue<T> {
-   /// Bytes required for header + `cap` elements.
    pub const fn shared_size(cap: usize) -> usize {
       std::mem::size_of::<Self>()
       + cap * std::mem::size_of::<UnsafeCell<Option<T>>>()
    }
-
-   // Safety: `mem` must point to a writable, process-shared mapping of at least
-   // `shared_size(cap)` bytes which lives for `'static`.
    pub unsafe fn init_in_shared(mem: *mut u8, cap: usize) -> &'static mut Self {
       assert!(cap.is_power_of_two());
 
@@ -122,7 +116,6 @@ impl<T: Send + 'static> SpscQueue<T> for LamportQueue<T> {
       }
 
       // Store the item at the current tail position
-      // one producer ⇒ this is safe
       let slot = self.idx(tail);
       unsafe { *self.buf[slot].get() = Some(item) };
       
@@ -134,7 +127,6 @@ impl<T: Send + 'static> SpscQueue<T> for LamportQueue<T> {
 
    #[inline]
    fn pop(&self) -> Result<T, ()> {
-      // CHANGES: Process-safer implementation with strong memory orderings
       
       // Check if the queue is empty
       let head = self.head.load(Ordering::Acquire);
@@ -158,17 +150,15 @@ impl<T: Send + 'static> SpscQueue<T> for LamportQueue<T> {
       // Process the result
       match val {
          Some(v) => {
-            // Increment the head position with a release memory ordering
             self.head.store(head + 1, Ordering::Release);
             Ok(v)
          }
-         None => Err(()) // Either a double-pop or uninitialized (shouldn't happen)
+         None => Err(())
       }
    }
 
    #[inline]
    fn available(&self) -> bool {
-      // Use consistent memory ordering
       let tail = self.tail.load(Ordering::Acquire);
       let head = self.head.load(Ordering::Acquire);
       tail.wrapping_sub(head) < self.mask
@@ -176,7 +166,6 @@ impl<T: Send + 'static> SpscQueue<T> for LamportQueue<T> {
 
    #[inline]
    fn empty(&self) -> bool {
-      // Use consistent memory ordering for both loads
       let head = self.head.load(Ordering::Acquire);
       let tail = self.tail.load(Ordering::Acquire);
       head == tail

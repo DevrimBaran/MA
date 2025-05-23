@@ -630,9 +630,8 @@ impl<T: Send + 'static> JiffyQueue<T> {
             }
             
             let n_idx_in_buffer = current_bl.consumer_head_idx;
-            // Redundant checks based on loop condition above, but defensive:
             if n_idx_in_buffer >= current_bl.capacity { continue 'retry_dequeue; } 
-            if current_bl.curr_buffer.is_null() { continue 'retry_dequeue; } // Should be caught by is_array_reclaimed too
+            if current_bl.curr_buffer.is_null() { continue 'retry_dequeue; }
 
             let n_node_ptr = unsafe { current_bl.curr_buffer.add(n_idx_in_buffer) };
             let n_node_ref = unsafe { &*n_node_ptr }; 
@@ -758,9 +757,6 @@ impl<T: Send + 'static> JiffyQueue<T> {
                         if is_fully_handled {
                             let (_next_after_fold, folded) = unsafe { self.attempt_fold_buffer(buffer_just_scanned_ptr) };
                             if folded {
-                                // After folding, the 'next_bl_for_scan' might have changed relative to original scan context.
-                                // It's safest to restart the 'find_initial_temp_n' scan or at least re-evaluate 'next_bl_for_scan'.
-                                // For simplicity and robustness, we can restart the outer dequeue loop.
                                 continue 'retry_dequeue; 
                             }
                         }
@@ -827,8 +823,7 @@ impl<T: Send + 'static> MpscQueue<T> for JiffyQueue<T> {
             let tail_loc = self.global_tail_location.load(Ordering::Acquire);
             let current_item_global_loc = head_bl.position_in_queue * (self.buffer_capacity() as u64) + (temp_head_idx as u64);
             
-            if current_item_global_loc >= tail_loc { // Consumer is at or ahead of producer's announced tail
-                 // If this is also the very last buffer segment the producers see, then it's truly empty.
+            if current_item_global_loc >= tail_loc {
                 if head_bl.next.load(Ordering::Acquire).is_null() && head_bl_ptr == self.tail_of_queue.load(Ordering::Acquire) {
                     return true;
                 }

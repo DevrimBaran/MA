@@ -1,5 +1,4 @@
 // B-Queue from Wang et al. 2013
-// Efficient and Practical Queuing for Fast Core-to-Core Communication
 
 use crate::SpscQueue;
 use std::cell::Cell;
@@ -9,7 +8,7 @@ use std::ptr;
 #[repr(C)]
 pub struct BQueue<T: Send + 'static> {
     // The buffer stores both data and a validity flag
-    // Paper uses NULL detection - we use a separate valid array
+    // Paper uses NULL detection, here a separate valid array since null detection from paper not possible in rust
     buf: *mut MaybeUninit<T>,
     valid: *mut bool,  // Tracks if slot contains valid data (non-NULL in paper)
     cap: usize,

@@ -1,4 +1,3 @@
-// queues/src/spsc/uspsc.rs
 use crate::spsc::LamportQueue;
 use crate::SpscQueue;
 use nix::libc;
@@ -10,20 +9,10 @@ use std::{
 };
 
 // Constants - match the paper
-const BUF_CAP: usize = 65536;   // Size of each buffer (match RING_CAP in benchmark)
-const POOL_CAP: usize = 32;     // Number of buffers in pool
-const BOTH_READY: u32 = 2;      // Flag value for ready buffer
-const MAX_SEGMENTS: usize = 64; // Maximum number of segments that can be allocated
-
-// Debug flag - set to true for debugging, false for performance
-const DEBUG: bool = false;
-
-#[inline]
-fn debug_print(msg: &str) {
-    if DEBUG {
-        eprintln!("[uSPSC] {}", msg);
-    }
-}
+const BUF_CAP: usize = 65536;
+const POOL_CAP: usize = 32;
+const BOTH_READY: u32 = 2;
+const MAX_SEGMENTS: usize = 64;
 
 // RingSlot - metadata for cached ring buffers
 #[repr(C, align(128))]
@@ -70,21 +59,18 @@ unsafe impl<T: Send + 'static> Sync for UnboundedQueue<T> {}
 impl<T: Send + 'static> UnboundedQueue<T> {
     // Allocate a new segment
     unsafe fn _allocate_segment(&self) -> Option<*mut LamportQueue<T>> {
-        if DEBUG { debug_print("Allocating new segment"); }
         
         // Check if we've hit the segment limit
         let current_count = self.segment_count.fetch_add(1, Ordering::Relaxed);
         if current_count >= MAX_SEGMENTS {
             // Rollback increment and return None
             self.segment_count.fetch_sub(1, Ordering::Relaxed);
-            if DEBUG { debug_print(&format!("Segment limit reached: {}/{}", current_count, MAX_SEGMENTS)); }
             return None;
         }
         
         let size_to_mmap = LamportQueue::<T>::shared_size(BUF_CAP);
         if size_to_mmap == 0 { 
             self.segment_count.fetch_sub(1, Ordering::Relaxed);
-            if DEBUG { debug_print("Error: mmap size is 0"); }
             return None; 
         }
 
@@ -107,7 +93,6 @@ impl<T: Send + 'static> UnboundedQueue<T> {
         self.segment_mmap_size.store(size_to_mmap, Ordering::Release);
         
         let queue_ptr = LamportQueue::init_in_shared(ptr as *mut u8, BUF_CAP);
-        if DEBUG { debug_print(&format!("Allocated new segment at {:p}", queue_ptr)); }
         
         // Create and add new segment node to our linked list
         let node_ptr = Box::into_raw(Box::new(SegmentNode {
@@ -131,11 +116,8 @@ impl<T: Send + 'static> UnboundedQueue<T> {
     // Deallocate a segment
     unsafe fn _deallocate_segment(&self, segment_ptr: *mut LamportQueue<T>) {
         if segment_ptr.is_null() { 
-            if DEBUG { debug_print("Warning: Attempting to deallocate null segment"); }
             return; 
         }
-        
-        if DEBUG { debug_print(&format!("Deallocating segment at {:p}", segment_ptr)); }
         
         let size_to_munmap = self.segment_mmap_size.load(Ordering::Acquire);
         if size_to_munmap == 0 { 
@@ -146,7 +128,6 @@ impl<T: Send + 'static> UnboundedQueue<T> {
         // Clean up items if type needs drop
         let segment = &mut *segment_ptr;
         if mem::needs_drop::<T>() {
-            if DEBUG { debug_print("Type needs drop, cleaning up items"); }
             
             let head_idx = segment.head.load(Ordering::Acquire);
             let tail_idx = segment.tail.load(Ordering::Acquire);
@@ -186,8 +167,7 @@ impl<T: Send + 'static> UnboundedQueue<T> {
     // Check if the queue is properly initialized
     #[inline]
     fn ensure_initialized(&self) -> bool {
-        if !self.initialized.load(Ordering::Acquire) { 
-            if DEBUG { debug_print("Queue not initialized"); }
+        if !self.initialized.load(Ordering::Acquire) {
             return false; 
         }
         
@@ -195,8 +175,7 @@ impl<T: Send + 'static> UnboundedQueue<T> {
             let write_ptr = *self.write_segment.get();
             let read_ptr = *self.read_segment.get();
             
-            if write_ptr.is_null() || read_ptr.is_null() { 
-                if DEBUG { debug_print("Write or read segment is null"); }
+            if write_ptr.is_null() || read_ptr.is_null() {
                 return false; 
             }
         }
@@ -206,7 +185,6 @@ impl<T: Send + 'static> UnboundedQueue<T> {
     
     // Get a ring buffer from the pool or allocate a new one
     fn get_new_ring_from_pool_or_alloc(&self) -> Option<*mut LamportQueue<T>> {
-        if DEBUG { debug_print("Attempting to get ring from pool"); }
         
         // Try once from cache with optimistic approach
         let cache_h = self.cache_head.load(Ordering::Acquire);
@@ -245,8 +223,6 @@ impl<T: Send + 'static> UnboundedQueue<T> {
                             segment.head.store(0, Ordering::Release);
                             segment.tail.store(0, Ordering::Release);
                         }
-                        
-                        if DEBUG { debug_print(&format!("Got segment from cache: {:p}", segment_ptr)); }
                         return Some(segment_ptr);
                     }
                 }
@@ -254,7 +230,6 @@ impl<T: Send + 'static> UnboundedQueue<T> {
         }
         
         // If we couldn't get from cache, allocate new
-        if DEBUG { debug_print("Allocating new segment directly"); }
         unsafe { self._allocate_segment() }
     }
 
@@ -266,13 +241,11 @@ impl<T: Send + 'static> UnboundedQueue<T> {
         
         // Validation
         if producer_segment.is_null() {
-            if DEBUG { debug_print("Producer segment is null in get_next_segment"); }
             return Err(());
         }
         
         // If producer and consumer on same segment, no next segment
         if consumer_segment == producer_segment {
-            if DEBUG { debug_print("Consumer caught up with producer, no next segment"); }
             return Err(());
         }
         
@@ -301,12 +274,9 @@ impl<T: Send + 'static> UnboundedQueue<T> {
 
     // Recycle a ring buffer back to the pool or deallocate it
     fn recycle_ring_to_pool_or_dealloc(&self, segment_to_recycle: *mut LamportQueue<T>) {
-        if segment_to_recycle.is_null() { 
-            if DEBUG { debug_print("Cannot recycle null segment"); }
+        if segment_to_recycle.is_null() {
             return; 
         }
-
-        if DEBUG { debug_print(&format!("Recycling segment {:p}", segment_to_recycle)); }
         
         // Reset the segment for reuse
         unsafe {
@@ -339,11 +309,8 @@ impl<T: Send + 'static> UnboundedQueue<T> {
             // Mark as initialized and update tail
             slot_ref.initialized.store(true, Ordering::Release);
             self.cache_tail.store(cache_t.wrapping_add(1), Ordering::Release);
-            
-            if DEBUG { debug_print(&format!("Recycled segment to cache slot {}", slot_idx)); }
         } else {
             // Pool is full, deallocate
-            if DEBUG { debug_print("Cache full, deallocating segment"); }
             
             // We don't immediately deallocate - we need to check it's not in use
             // For now, we'll just add it to the cache by forcing it
@@ -377,14 +344,12 @@ impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
 
     fn push(&self, item: T) -> Result<(), Self::PushError> {
         if !self.ensure_initialized() { 
-            if DEBUG { debug_print("Queue not initialized in push"); }
             return Err(()); 
         }
         
         // Get current producer segment
         let current_producer_segment = unsafe { *self.write_segment.get() };
-        if current_producer_segment.is_null() { 
-            if DEBUG { debug_print("Producer segment is null"); }
+        if current_producer_segment.is_null() {
             return Err(());
         }
         
@@ -403,7 +368,6 @@ impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
                 
                 if next == head + segment.mask + 1 {
                     // Queue is full, get a new segment
-                    if DEBUG { debug_print("Current segment full for pending item, getting new one"); }
                     
                     // Put pending item back
                     *transition_ref = Some(pending);
@@ -477,7 +441,6 @@ impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
             
             if next == head + segment.mask + 1 {
                 // Queue is full, get a new segment
-                if DEBUG { debug_print("Current segment full, getting new one"); }
                 
                 // Get a new segment
                 let new_segment = match self.get_new_ring_from_pool_or_alloc() {
@@ -519,15 +482,13 @@ impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
     }
     
     fn pop(&self) -> Result<T, Self::PopError> {
-        if !self.ensure_initialized() { 
-            if DEBUG { debug_print("Queue not initialized in pop"); }
+        if !self.ensure_initialized() {
             return Err(()); 
         }
 
         // Get current consumer segment
         let current_consumer_segment = unsafe { *self.read_segment.get() };
-        if current_consumer_segment.is_null() { 
-            if DEBUG { debug_print("Consumer segment is null"); }
+        if current_consumer_segment.is_null() {
             return Err(()); 
         }
     
@@ -536,32 +497,21 @@ impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
             Ok(item) => return Ok(item),
             Err(_) => {
                 // Segment might be empty, but check if we're done
-                if DEBUG { debug_print(&format!("Pop failed from segment {:p}", current_consumer_segment)); }
                 
                 // Ensure we see latest producer segment
                 std::sync::atomic::fence(Ordering::Acquire);
                 
                 // Get current producer segment
                 let current_producer_segment = unsafe { *self.write_segment.get() };
-
-                if DEBUG { 
-                    debug_print(&format!(
-                        "Consumer segment: {:p}, Producer segment: {:p}", 
-                        current_consumer_segment, 
-                        current_producer_segment
-                    )); 
-                }
                 
                 // If producer and consumer on same segment, queue is empty
                 if current_consumer_segment == current_producer_segment {
-                    if DEBUG { debug_print("Queue empty (same segment)"); }
                     return Err(());
                 }
                 
                 // Check if current segment is empty
                 let is_empty = unsafe { (*current_consumer_segment).empty() };
-                if is_empty { 
-                    if DEBUG { debug_print("Current segment empty, moving to next"); }
+                if is_empty {
                     
                     // Save old segment for recycling
                     let segment_to_recycle = current_consumer_segment;
@@ -570,7 +520,6 @@ impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
                     match self.get_next_segment() {
                         Ok(next_segment) => {
                             if next_segment.is_null() {
-                                if DEBUG { debug_print("Next segment is null"); }
                                 return Err(());
                             }
                             
@@ -580,8 +529,6 @@ impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
                             // Ensure update is visible
                             std::sync::atomic::fence(Ordering::Release);
                             
-                            if DEBUG { debug_print(&format!("Moved to next segment: {:p}", next_segment)); }
-                            
                             // Recycle old segment - this is now safer
                             self.recycle_ring_to_pool_or_dealloc(segment_to_recycle);
                             
@@ -589,12 +536,10 @@ impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
                             unsafe { (*next_segment).pop() }
                         },
                         Err(_) => {
-                            if DEBUG { debug_print("No next segment available"); }
                             Err(())
                         }
                     }
                 } else {
-                    if DEBUG { debug_print("Current segment not empty, retrying pop"); }
                     // If segment not empty but pop failed first time, retry
                     unsafe { (*current_consumer_segment).pop() }
                 }
@@ -647,7 +592,6 @@ impl<T: Send + 'static> UnboundedQueue<T> {
     }
 
     pub unsafe fn init_in_shared(mem_ptr: *mut u8) -> &'static mut Self {
-        if DEBUG { debug_print("Initializing UnboundedQueue in shared memory"); }
         
         let self_ptr = mem_ptr as *mut Self;
 
@@ -710,8 +654,6 @@ impl<T: Send + 'static> UnboundedQueue<T> {
                     slot_ref.segment_len.store(me.segment_mmap_size.load(Ordering::Relaxed), Ordering::Relaxed);
                     slot_ref.flag.store(BOTH_READY, Ordering::Relaxed);
                     slot_ref.initialized.store(true, Ordering::Release);
-                    
-                    if DEBUG { debug_print(&format!("Pre-allocated segment to cache slot {}", i)); }
                 }
             }
             
@@ -720,8 +662,6 @@ impl<T: Send + 'static> UnboundedQueue<T> {
         
         // Mark as initialized
         me.initialized.store(true, Ordering::Release);
-        
-        if DEBUG { debug_print("UnboundedQueue initialization complete"); }
         me
     }
 }
@@ -733,10 +673,8 @@ impl<T: Send + 'static> Drop for UnboundedQueue<T> {
                 drop(item);
             }
         }
-        if DEBUG { debug_print("Dropping UnboundedQueue"); }
     
         if !self.initialized.load(Ordering::Acquire) {
-            if DEBUG { debug_print("Queue not initialized, skipping cleanup"); }
             return;
         }
         
@@ -818,8 +756,6 @@ impl<T: Send + 'static> Drop for UnboundedQueue<T> {
         for seg_ptr in segments_to_dealloc {
             unsafe { self._deallocate_segment(seg_ptr); }
         }
-        
-        if DEBUG { debug_print("UnboundedQueue drop complete"); }
         self.initialized.store(false, Ordering::Release);
     }
 }

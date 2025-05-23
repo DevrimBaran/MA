@@ -1,11 +1,8 @@
-// queues/src/spsc/mspsc.rs
-// multipush spsc by Torquati (TR-10-20)
-
 use crate::spsc::LamportQueue;
 use crate::SpscQueue;
 use core::{cell::UnsafeCell, fmt, mem::MaybeUninit, ptr};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::alloc::Layout; // Import Layout
+use std::alloc::Layout;
 
 // compile-time size of the producer’s scratch buffer (paper uses 16)
 const LOCAL_BUF: usize = 16;

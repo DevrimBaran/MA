@@ -5,27 +5,23 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use crate::MpscQueue;
 
-// Constants from the paper - these can be tuned
-pub const L_LOCAL_BUFFER_CAPACITY: usize = 131072; // 128K as in the paper
-pub const N_SEGMENT_CAPACITY: usize = 262144;      // 256K as in the paper
+pub const L_LOCAL_BUFFER_CAPACITY: usize = 131072;
+pub const N_SEGMENT_CAPACITY: usize = 262144;
 
-/// Segment structure as described in the paper
 #[repr(C, align(64))]
 struct Segment<T> {
     id: u64,
     cells: *mut UnsafeCell<MaybeUninit<Option<T>>>,
     next: AtomicPtr<Segment<T>>,
-    next_free: AtomicPtr<Segment<T>>, // For intrusive free list
+    next_free: AtomicPtr<Segment<T>>,
 }
 
-/// Request structure for local buffers
 #[repr(C)]
 struct Request<T> {
     val: MaybeUninit<T>,
     cid: u64,
 }
 
-/// Producer structure with local buffer
 #[repr(C, align(64))]
 pub struct Producer<T> {
     local_buffer: UnsafeCell<[MaybeUninit<Request<T>>; L_LOCAL_BUFFER_CAPACITY]>,
@@ -52,7 +48,6 @@ impl<T> Producer<T> {
     fn local_next(i: usize) -> usize { Self::local_wrap(i + 1) }
 }
 
-/// The DQueue structure
 #[repr(C, align(64))]
 pub struct DQueue<T: Send + Clone + 'static> {
     q_head: AtomicU64,

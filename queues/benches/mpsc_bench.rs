@@ -16,17 +16,15 @@ use nix::{
     sys::wait::waitpid,
     unistd::{fork, ForkResult},
 };
-// N_SEGMENT_CAPACITY is used in bench_d_queue_mpsc
 use queues::mpsc::dqueue::{N_SEGMENT_CAPACITY};
 
 
-const PERFORMANCE_TEST: bool = true; // Set to true to suppress warnings for performance runs
+const PERFORMANCE_TEST: bool = true;
 const ITEMS_PER_PRODUCER_TARGET: usize = 3_000_000;
 const JIFFY_NODES_PER_BUFFER_BENCH: usize = 8192;
 const PRODUCER_COUNTS_TO_TEST: &[usize] = &[1, 2, 4, 8, 14];
 
 
-// BenchMpscQueue trait defined locally in the benchmark crate
 trait BenchMpscQueue<T: Send>: Send + Sync + 'static {
     fn bench_push(&self, item: T, producer_id: usize) -> Result<(), ()>;
     fn bench_pop(&self) -> Result<T, ()>;
@@ -212,16 +210,16 @@ where
                     // try one last pop. If it fails and queue is empty, then break.
                     if consumed_count < total_items_to_produce {
                         if q.bench_pop().is_err() && q.bench_is_empty() {
-                            break; // Exit main consumption loop
-                        } else if q.bench_pop().is_ok() { // Check if previous pop was successful after all
-                           consumed_count +=1; // if so, increment count
+                            break;
+                        } else if q.bench_pop().is_ok() {
+                            consumed_count +=1;
                         }
                     }
                 }
-                std::thread::yield_now(); // If producers not done, or initial pop failed, yield
+                std::thread::yield_now();
             }
             if consumed_count >= total_items_to_produce {
-                break; // Exit main consumption loop
+                break;
             }
         }
     }
@@ -248,7 +246,7 @@ where
 
 
 
-// --- Benchmark Functions ---
+// Benchmark Functions
 fn bench_drescher_mpsc(c: &mut Criterion) {
     let mut group = c.benchmark_group("DrescherMPSC");
     for &num_prods_current_run in PRODUCER_COUNTS_TO_TEST.iter().filter(|&&p| p > 0) {
@@ -343,7 +341,7 @@ fn bench_d_queue_mpsc(c: &mut Criterion) {
         let n_segment_capacity = N_SEGMENT_CAPACITY;
 
         let dqueue_segment_pool_cap = if total_items_run > 0 && n_segment_capacity > 0 {
-             (total_items_run / n_segment_capacity) + num_prods_current_run + 50
+            (total_items_run / n_segment_capacity) + num_prods_current_run + 50
         } else {
             num_prods_current_run + 50
         }.max(1);

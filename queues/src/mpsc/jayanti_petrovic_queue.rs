@@ -1,6 +1,3 @@
-// File: queues/src/mpsc/jayanti_petrovic_queue.rs
-#![allow(dead_code)] // Remove this once integrated
-
 use std::ptr;
 use std::mem::{self, MaybeUninit};
 use std::sync::atomic::{AtomicU64, AtomicPtr, Ordering, fence};
@@ -85,15 +82,15 @@ impl<T: Send + Clone + 'static> ShmBumpPool<T> {
             match self.current.compare_exchange(
                 current_ptr_val,
                 next_ptr_val_after_alloc as *mut u8,
-                Ordering::Relaxed, // Can be Relaxed for bump allocator
+                Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
                     let allocated_node_ptr = alloc_ptr_usize as *mut SesdNode<(T, Timestamp)>;
-                    SesdNode::init_dummy(allocated_node_ptr); // Initialize new node
+                    SesdNode::init_dummy(allocated_node_ptr);
                     return allocated_node_ptr;
                 }
-                Err(_) => { /* CAS failed on current, retry bump */ }
+                Err(_) => {}
             }
         }
     }
@@ -103,8 +100,8 @@ impl<T: Send + Clone + 'static> ShmBumpPool<T> {
 // Timestamp and MinInfo 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timestamp {
-    val: u64, // From the shared counter
-    pid: usize, // Producer ID to break ties
+    val: u64,
+    pid: usize,
 }
 
 impl PartialOrd for Timestamp {
@@ -126,7 +123,7 @@ pub const INFINITY_TS: Timestamp = Timestamp { val: u64::MAX, pid: usize::MAX };
 #[repr(C)]
 struct MinInfo {
     ts: Timestamp,
-    leaf_idx: usize, // Producer ID (index into QUEUES array)
+    leaf_idx: usize,
 }
 
 impl MinInfo {
@@ -138,7 +135,7 @@ impl MinInfo {
     }
 }
 
-// --- Tree Node Structure ---
+// Tree Node Structure
 #[repr(C)]
 struct TreeNode {
     min_info_ptr: AtomicPtr<MinInfo>,
@@ -166,7 +163,7 @@ impl TreeNode {
     }
 }
 
-// --- Main MPSC Queue ---
+// Main MPSC Queue
 #[repr(C)]
 pub struct JayantiPetrovicMpscQueue<T: Send + Clone + 'static> {
     counter: AtomicU64, 
@@ -177,7 +174,7 @@ pub struct JayantiPetrovicMpscQueue<T: Send + Clone + 'static> {
     sesd_initial_dummies_base: *mut SesdNode<(T, Timestamp)>,
     sesd_help_slots_base: *mut MaybeUninit<(T, Timestamp)>,
     sesd_free_later_dummies_base: *mut SesdNode<(T, Timestamp)>,
-    sesd_node_pool: ShmBumpPool<T>, // Parameterized ShmBumpPool
+    sesd_node_pool: ShmBumpPool<T>,
 }
 
 unsafe impl<T: Send + Clone + 'static> Send for JayantiPetrovicMpscQueue<T> {}
@@ -195,7 +192,6 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
         let sesd_initial_dummies_size = num_producers * mem::size_of::<SesdNode<(T, Timestamp)>>();
         let sesd_help_slots_size = num_producers * mem::size_of::<MaybeUninit<(T, Timestamp)>>();
         let sesd_free_later_dummies_size = num_producers * mem::size_of::<SesdNode<(T, Timestamp)>>();
-        // For ShmBumpPool itself, its size is constant. The pool memory it manages is separate.
         let sesd_node_pool_managed_bytes = sesd_node_pool_capacity * mem::size_of::<SesdNode<(T, Timestamp)>>();
 
         let align_offset = |offset: usize, alignment: usize| (offset + alignment - 1) & !(alignment - 1);
@@ -256,7 +252,6 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
         current_offset = align_offset(current_offset, mem::align_of::<u8>()); 
         let sesd_node_pool_start_ptr = mem_ptr.add(current_offset) as *mut u8;
         let sesd_node_pool_managed_bytes = sesd_node_pool_capacity * mem::size_of::<SesdNode<(T, Timestamp)>>();
-        // current_offset += sesd_node_pool_managed_bytes; // This offset is for the managed memory, not the struct ShmBumpPool
 
         ptr::write(self_ptr, Self {
             counter: AtomicU64::new(0),

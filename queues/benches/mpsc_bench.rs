@@ -1,18 +1,16 @@
-// benches/mpsc_bench.rs
-
+// spinloops are just there so that producer and consumer can start at the same time and handling temporary empty/full queues
+// Since the algorithms are wait-free, the spinloops will not affect the wait-free synchronization between producer and consumer
 #![allow(clippy::cast_possible_truncation)]
 
 use criterion::{criterion_group, criterion_main, Criterion, Bencher};
-// Import DQueue from the library crate
 use queues::mpsc::{DrescherQueue, JayantiPetrovicMpscQueue, JiffyQueue, DQueue};
-use queues::MpscQueue; // This is the trait from your library
+use queues::MpscQueue;
 
 use core::fmt;
 use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 use std::time::Duration;
 use std::ptr;
 
-// Updated imports, maintaining original organization
 use nix::{
     libc,
     sys::wait::waitpid,

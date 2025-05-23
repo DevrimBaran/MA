@@ -32,19 +32,20 @@ struct SegmentNode<T: Send + 'static> {
 }
 
 // Main queue structure - follow Torquati's design with additional safeguards
+// made some definitions pub so they can be unit tested
 #[repr(C, align(128))]
 pub struct UnboundedQueue<T: Send + 'static> {
-    write_segment: UnsafeCell<*mut LamportQueue<T>>, 
+    pub write_segment: UnsafeCell<*mut LamportQueue<T>>, 
     _padding1: [u8; 64],  // Padding between write and read pointers
     
-    read_segment: UnsafeCell<*mut LamportQueue<T>>, 
+    pub read_segment: UnsafeCell<*mut LamportQueue<T>>, 
     _padding2: [u8; 64],  // More padding
     
     // Add explicit linked list to track segments
     segments_head: AtomicPtr<SegmentNode<T>>,
     segments_tail: UnsafeCell<*mut SegmentNode<T>>,
     
-    segment_mmap_size: AtomicUsize, 
+    pub segment_mmap_size: AtomicUsize, 
     ring_slot_cache: UnsafeCell<[MaybeUninit<RingSlot<T>>; POOL_CAP]>,
     cache_head: AtomicUsize, 
     cache_tail: AtomicUsize,
@@ -57,8 +58,8 @@ unsafe impl<T: Send + 'static> Send for UnboundedQueue<T> {}
 unsafe impl<T: Send + 'static> Sync for UnboundedQueue<T> {}
 
 impl<T: Send + 'static> UnboundedQueue<T> {
-    // Allocate a new segment
-    unsafe fn _allocate_segment(&self) -> Option<*mut LamportQueue<T>> {
+    // Allocate a new segment - pub so it can be used in tests
+    pub unsafe fn _allocate_segment(&self) -> Option<*mut LamportQueue<T>> {
         
         // Check if we've hit the segment limit
         let current_count = self.segment_count.fetch_add(1, Ordering::Relaxed);
@@ -113,8 +114,8 @@ impl<T: Send + 'static> UnboundedQueue<T> {
         Some(queue_ptr)
     }
 
-    // Deallocate a segment
-    unsafe fn _deallocate_segment(&self, segment_ptr: *mut LamportQueue<T>) {
+    // Deallocate a segment - pub so it can be used in tests
+    pub unsafe fn _deallocate_segment(&self, segment_ptr: *mut LamportQueue<T>) {
         if segment_ptr.is_null() { 
             return; 
         }

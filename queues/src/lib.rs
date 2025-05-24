@@ -50,3 +50,12 @@ pub trait BenchMpscQueue<T: Send>: Send + Sync + 'static {
     fn bench_is_empty(&self) -> bool;
     fn bench_is_full(&self) -> bool;
 }
+
+pub trait MpmcQueue<T: Send>: Send + Sync + 'static {
+    type PushError;
+    type PopError;
+    fn push(&self, item: T, thread_id: usize) -> Result<(), Self::PushError>;
+    fn pop(&self, thread_id: usize) -> Result<T, Self::PopError>;
+    fn is_empty(&self) -> bool;
+    fn is_full(&self) -> bool;
+}

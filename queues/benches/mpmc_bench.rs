@@ -11,12 +11,11 @@ use nix::{
 };
 
 const PERFORMANCE_TEST: bool = true;
-const ITEMS_PER_THREAD_TARGET: usize = 1_000_000;
+const ITEMS_PER_THREAD_TARGET: usize = 200_000;
 const THREAD_COUNTS_TO_TEST: &[(usize, usize)] = &[
    (1, 1),    // 1 producer, 1 consumer
    (2, 2),    // 2 producers, 2 consumers
    (4, 4),    // 4 producers, 4 consumers
-   (8, 8),    // 8 producers, 8 consumers
    (7, 7),    // 7 producers, 7 consumers (14 threads total)
 ];
 

@@ -1,25 +1,15 @@
-// FastForward from Moseley et al. 2008
 use crate::SpscQueue;
 use core::{cell::UnsafeCell, fmt, mem::MaybeUninit, ptr};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-// An empty slot is represented by `None`; a full one by `Some(T)`.
 type Slot<T> = Option<T>;
 
 #[repr(C, align(64))]
 pub struct FfqQueue<T: Send + 'static> {
-   // Producer-local write cursor.
    head: UnsafeCell<usize>,
-   
-   // Padding to prevent false sharing
    _pad1: [u8; 64 - std::mem::size_of::<UnsafeCell<usize>>()],
-   
-   // Consumer-local read cursor.
    tail: UnsafeCell<usize>,
-   
-   // Padding to prevent false sharing
    _pad2: [u8; 64 - std::mem::size_of::<UnsafeCell<usize>>()],
-
    capacity: usize,
    mask: usize,
    buffer: *mut UnsafeCell<MaybeUninit<Slot<T>>>,
@@ -36,12 +26,12 @@ pub struct FfqPushError<T>(pub T);
 pub struct FfqPopError;
 
 impl<T: Send + 'static> FfqQueue<T> {
-   // Build a new queue in process-local memory.
-   // The capacity must be a power of two.
+   
+   
    pub fn with_capacity(capacity: usize) -> Self {
       assert!(capacity.is_power_of_two() && capacity > 0);
 
-      // Allocate buffer aligned to cache line
+      
       let layout = std::alloc::Layout::array::<UnsafeCell<MaybeUninit<Slot<T>>>>(capacity)
          .unwrap()
          .align_to(64)
@@ -52,8 +42,7 @@ impl<T: Send + 'static> FfqQueue<T> {
       if ptr.is_null() {
          panic!("Failed to allocate buffer");
       }
-
-      // Initialize all slots to None
+      
       unsafe {
          for i in 0..capacity {
             ptr::write(ptr.add(i), UnsafeCell::new(MaybeUninit::new(None)));
@@ -73,7 +62,7 @@ impl<T: Send + 'static> FfqQueue<T> {
       }
    }
 
-   // Bytes required to place this queue in shared memory.
+   
    pub fn shared_size(capacity: usize) -> usize {
       assert!(capacity.is_power_of_two() && capacity > 0);
       let self_layout = core::alloc::Layout::new::<Self>();
@@ -83,25 +72,25 @@ impl<T: Send + 'static> FfqQueue<T> {
       layout.size()
    }
 
-   // Construct in user-provided shared memory region (e.g. `mmap`).
-   // The caller must guarantee the memory lives for `'static`.
+   
+   
    pub unsafe fn init_in_shared(mem: *mut u8, capacity: usize) -> &'static mut Self {
       assert!(capacity.is_power_of_two() && capacity > 0);
       assert!(!mem.is_null());
 
-      // Clear the memory first
+      
       ptr::write_bytes(mem, 0, Self::shared_size(capacity));
 
       let queue_ptr = mem as *mut Self;
       let buf_ptr = mem.add(std::mem::size_of::<Self>())
          as *mut UnsafeCell<MaybeUninit<Slot<T>>>;
 
-      // Initialize buffer slots
+      
       for i in 0..capacity {
          ptr::write(buf_ptr.add(i), UnsafeCell::new(MaybeUninit::new(None)));
       }
 
-      // Initialize the queue structure
+      
       ptr::write(
          queue_ptr,
          Self {
@@ -119,7 +108,7 @@ impl<T: Send + 'static> FfqQueue<T> {
       
       let queue_ref = &mut *queue_ptr;
       
-      // Ensure initialization is visible
+      
       queue_ref.initialized.store(true, Ordering::Release);
       
       queue_ref
@@ -130,7 +119,7 @@ impl<T: Send + 'static> FfqQueue<T> {
       unsafe { (*self.buffer.add(index & self.mask)).get() }
    }
    
-   // Helper to check if initialized
+   
    #[inline]
    fn ensure_initialized(&self) {
       assert!(self.initialized.load(Ordering::Acquire), "Queue not initialized");
@@ -147,18 +136,17 @@ impl<T: Send + 'static> SpscQueue<T> for FfqQueue<T> {
       
       let head = unsafe { *self.head.get() };
       let slot = self.slot_ptr(head);
-
-      // Check if slot is empty (None)
+      
       unsafe {
          let slot_ref = &*slot;
          if slot_ref.assume_init_ref().is_some() {
-            return Err(FfqPushError(item)); // queue full
+            return Err(FfqPushError(item)); 
          }
          
-         // Write the new value
+         
          ptr::write(slot, MaybeUninit::new(Some(item)));
          
-         // Update head
+         
          *self.head.get() = head.wrapping_add(1);
       }
       
@@ -176,13 +164,13 @@ impl<T: Send + 'static> SpscQueue<T> for FfqQueue<T> {
          let slot_ref = &*slot;
          match slot_ref.assume_init_ref() {
             Some(_) => {
-               // Read and take ownership of the value
+               
                let val = ptr::read(slot).assume_init().unwrap();
                
-               // Write None to mark slot as empty
+               
                ptr::write(slot, MaybeUninit::new(None));
                
-               // Update tail
+               
                *self.tail.get() = tail.wrapping_add(1);
                
                Ok(val)
@@ -221,7 +209,7 @@ impl<T: Send + 'static> Drop for FfqQueue<T> {
    fn drop(&mut self) {
       if self.owns_buffer && !self.buffer.is_null() {
          unsafe {
-            // Drop any remaining items
+            
             if core::mem::needs_drop::<T>() {
                for i in 0..self.capacity {
                   let slot = self.slot_ptr(i);
@@ -229,7 +217,7 @@ impl<T: Send + 'static> Drop for FfqQueue<T> {
                }
             }
             
-            // Deallocate buffer
+            
             let layout = std::alloc::Layout::array::<UnsafeCell<MaybeUninit<Slot<T>>>>(self.capacity)
                .unwrap()
                .align_to(64)
@@ -252,16 +240,13 @@ impl<T: fmt::Debug + Send + 'static> fmt::Debug for FfqQueue<T> {
    }
 }
 
-// Temporal Slipping Support Methods
-// These are provided for stages to manage slip as described in Section 3.4.1
-// Will not be used in benchmark since this is an overhead for the benchmark and slipping is for when processes actually do other work too instead of just pushing and popping items. 
-// And additionally this slipping technique is not wait-free but added for completeness eventhough not used. Was tested, works.
+
 impl<T: Send + 'static> FfqQueue<T> {
-   // Constants from paper Section 3.4.1
-   pub const DANGER_THRESHOLD: usize = 16;  // 2 cachelines - when slip is likely to be lost
-   pub const GOOD_THRESHOLD: usize = 48;    // 6 cachelines - appropriate amount of slip
    
-   // Calculate distance between producer and consumer
+   pub const DANGER_THRESHOLD: usize = 16;  
+   pub const GOOD_THRESHOLD: usize = 48;    
+   
+   
    #[inline]
    pub fn distance(&self) -> usize {
       let head = unsafe { *self.head.get() };
@@ -269,7 +254,7 @@ impl<T: Send + 'static> FfqQueue<T> {
       head.wrapping_sub(tail)
    }
    
-   // Based on Figure 6 from the paper - to be called by consumer stage
+   
    pub fn adjust_slip(&self, avg_stage_time_ns: u64) {
       let mut dist = self.distance();
       if dist < Self::DANGER_THRESHOLD {
@@ -277,10 +262,10 @@ impl<T: Send + 'static> FfqQueue<T> {
          loop {
             dist_old = dist;
             
-            // Calculate spin time based on distance from GOOD threshold
+            
             let spin_time = avg_stage_time_ns * ((Self::GOOD_THRESHOLD + 1) - dist) as u64;
             
-            // Spin wait as shown in paper
+            
             let start = std::time::Instant::now();
             while start.elapsed().as_nanos() < spin_time as u128 {
                std::hint::spin_loop();
@@ -288,7 +273,7 @@ impl<T: Send + 'static> FfqQueue<T> {
             
             dist = self.distance();
             
-            // Exit conditions from paper: reached GOOD or no progress
+            
             if dist >= Self::GOOD_THRESHOLD || dist <= dist_old {
                break;
             }

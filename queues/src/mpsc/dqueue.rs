@@ -246,7 +246,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         
         let safe_seg_id = min_producer_referenced_seg_id;
     
-        // Phase 1: Try to advance qseg
+        
         loop {
             let current_q_seg_val = self.qseg.load(Ordering::Acquire);
             if current_q_seg_val.is_null() || (*current_q_seg_val).id >= safe_seg_id || current_q_seg_val == consumer_cached_cseg_ptr {
@@ -264,7 +264,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
             } else { break; }
         }
     
-        // Phase 2: Reclaim segments in [current qseg (after phase 1), consumer_cached_cseg_ptr->id)
+        
         let mut prev_seg_ptr = self.qseg.load(Ordering::Acquire); 
         if prev_seg_ptr.is_null() { return; }
         let mut current_seg_to_check_ptr = (*prev_seg_ptr).next.load(Ordering::Acquire);

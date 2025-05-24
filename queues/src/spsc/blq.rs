@@ -5,20 +5,16 @@ use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-// K_CACHE_LINE_SLOTS: Number of items that fit in a cache line.
-// The paper suggests leaving K entries unused to improve cache behavior
-// when the queue is full (Section 3.2, applied to LLQ and by extension to BLQ).
-// Assuming items are 8 bytes and cache lines are 64 bytes, K = 8.
 pub const K_CACHE_LINE_SLOTS: usize = 8;
 
 #[repr(C)]
 #[cfg_attr(
    any(target_arch = "x86_64", target_arch = "aarch64"),
-   repr(align(64)) // Align to cache line size
+   repr(align(64)) 
 )]
 pub struct SharedIndices {
-   pub write: AtomicUsize, // Next slot for producer to write to
-   pub read: AtomicUsize,  // Next slot for consumer to read from
+   pub write: AtomicUsize, 
+   pub read: AtomicUsize,  
 }
 
 #[repr(C)]
@@ -27,10 +23,10 @@ pub struct SharedIndices {
    repr(align(64))
 )]
 struct ProducerPrivate {
-   // Shadow copy of the consumer's 'read' index.
-   // Used to check for available space without frequently reading the shared 'read' index.
+   
+   
    read_shadow: usize,
-   // Producer's private write index. Items are written here before being published.
+   
    write_priv: usize,
 }
 
@@ -40,25 +36,25 @@ struct ProducerPrivate {
    repr(align(64))
 )]
 struct ConsumerPrivate {
-   // Shadow copy of the producer's 'write' index.
-   // Used to check for available items without frequently reading the shared 'write' index.
+   
+   
    write_shadow: usize,
-   // Consumer's private read index. Items are read from here before their slots are published as free.
+   
    read_priv: usize,
 }
 
 #[repr(C)]
 pub struct BlqQueue<T: Send + 'static> {
    shared_indices: SharedIndices,
-   // Producer-private fields, should not cause false sharing with consumer fields
-   // or shared_indices if BlqQueue itself is aligned and fields are laid out properly.
+   
+   
    prod_private: UnsafeCell<ProducerPrivate>,
-   // Consumer-private fields
+   
    cons_private: UnsafeCell<ConsumerPrivate>,
-   capacity: usize, // Total number of slots in the buffer
-   mask: usize,     // Bitmask for ring buffer index calculation (capacity - 1)
-   buffer: ManuallyDrop<Box<[UnsafeCell<MaybeUninit<T>>]>>, // The ring buffer
-   owns_buffer: bool, // Flag to indicate if this instance owns the buffer (for Drop)
+   capacity: usize, 
+   mask: usize,     
+   buffer: ManuallyDrop<Box<[UnsafeCell<MaybeUninit<T>>]>>, 
+   owns_buffer: bool, 
 }
 
 unsafe impl<T: Send> Send for BlqQueue<T> {}
@@ -119,7 +115,7 @@ impl<T: Send + 'static> BlqQueue<T> {
       let layout_buffer_elements =
          std::alloc::Layout::array::<UnsafeCell<MaybeUninit<T>>>(capacity).unwrap();
       
-      // The buffer elements follow the header in memory.
+      
       let (combined_layout, _offset_of_buffer) =
          layout_header.extend(layout_buffer_elements).unwrap();
       combined_layout.pad_to_align().size()
@@ -136,7 +132,7 @@ impl<T: Send + 'static> BlqQueue<T> {
 
       let queue_struct_ptr = mem as *mut Self;
 
-      // Calculate the offset to the buffer data, which directly follows the Self struct.
+      
       let layout_header = std::alloc::Layout::new::<Self>();
       let layout_buffer_elements =
          std::alloc::Layout::array::<UnsafeCell<MaybeUninit<T>>>(capacity).unwrap();
@@ -168,7 +164,7 @@ impl<T: Send + 'static> BlqQueue<T> {
                capacity,
                mask: capacity - 1,
                buffer: ManuallyDrop::new(boxed_buffer),
-               owns_buffer: false, // This instance does not own the buffer when init_in_shared
+               owns_buffer: false, 
          },
       );
 
@@ -178,14 +174,14 @@ impl<T: Send + 'static> BlqQueue<T> {
    #[inline]
    pub fn blq_enq_space(&self, needed: usize) -> usize {
       let prod_priv = unsafe { &mut *self.prod_private.get() };
-      // Available space calculation: (N - K) - (write_priv - read_shadow)
-      // N is capacity. write_priv and read_shadow are absolute counts.
+      
+      
       let mut free_slots = (self.capacity - K_CACHE_LINE_SLOTS)
          .wrapping_sub(prod_priv.write_priv.wrapping_sub(prod_priv.read_shadow));
 
       if free_slots < needed {
-         // Not enough space based on shadow, refresh read_shadow from shared read index.
-         // This is a potentially costly read of a shared cache line.
+         
+         
          prod_priv.read_shadow = self.shared_indices.read.load(Ordering::Acquire);
          free_slots = (self.capacity - K_CACHE_LINE_SLOTS)
                .wrapping_sub(prod_priv.write_priv.wrapping_sub(prod_priv.read_shadow));
@@ -200,7 +196,7 @@ impl<T: Send + 'static> BlqQueue<T> {
 
       let num_filled = current_write_priv.wrapping_sub(prod_priv.read_shadow);
       if num_filled >= self.capacity - K_CACHE_LINE_SLOTS {
-            // Refresh read_shadow as a last attempt before failing
+            
          prod_priv.read_shadow = self.shared_indices.read.load(Ordering::Acquire);
          if current_write_priv.wrapping_sub(prod_priv.read_shadow) >= self.capacity - K_CACHE_LINE_SLOTS {
                return Err(BlqPushError(item));
@@ -221,7 +217,7 @@ impl<T: Send + 'static> BlqQueue<T> {
    #[inline]
    pub fn blq_enq_publish(&self) {
       let prod_priv = unsafe { &*self.prod_private.get() };
-      // Memory fence (Release) to ensure all previous writes to the buffer are visible before the `write` index is updated.
+      
       self.shared_indices
          .write
          .store(prod_priv.write_priv, Ordering::Release);
@@ -230,11 +226,11 @@ impl<T: Send + 'static> BlqQueue<T> {
    #[inline]
    pub fn blq_deq_space(&self, needed: usize) -> usize {
       let cons_priv = unsafe { &mut *self.cons_private.get() };
-      // Available items: write_shadow - read_priv
+      
       let mut available_items = cons_priv.write_shadow.wrapping_sub(cons_priv.read_priv);
 
       if available_items < needed {
-         // Not enough items based on shadow, refresh write_shadow from shared write index.
+         
          cons_priv.write_shadow = self.shared_indices.write.load(Ordering::Acquire);
          available_items = cons_priv.write_shadow.wrapping_sub(cons_priv.read_priv);
       }
@@ -247,7 +243,7 @@ impl<T: Send + 'static> BlqQueue<T> {
       let current_read_priv = cons_priv.read_priv;
 
       if current_read_priv == cons_priv.write_shadow {
-         // Refresh write_shadow as a last attempt
+         
          cons_priv.write_shadow = self.shared_indices.write.load(Ordering::Acquire);
          if current_read_priv == cons_priv.write_shadow {
                return Err(BlqPopError);
@@ -265,7 +261,7 @@ impl<T: Send + 'static> BlqQueue<T> {
    #[inline]
    pub fn blq_deq_publish(&self) {
       let cons_priv = unsafe { &*self.cons_private.get() };
-      // Memory fence (Release) to ensure that the consumer is done reading the items before making the slots available to the producer.
+      
       self.shared_indices
          .read
          .store(cons_priv.read_priv, Ordering::Release);
@@ -298,13 +294,13 @@ impl<T: Send + 'static> SpscQueue<T> for BlqQueue<T> {
 
    #[inline]
    fn available(&self) -> bool {
-      // Check if at least 1 slot is available.
+      
       self.blq_enq_space(1) > 0
    }
 
    #[inline]
    fn empty(&self) -> bool {
-      // Check if 0 items are available to dequeue.
+      
       self.blq_deq_space(1) == 0
    }
 }
@@ -313,11 +309,11 @@ impl<T: Send + 'static> Drop for BlqQueue<T> {
    fn drop(&mut self) {
       if self.owns_buffer {
          if std::mem::needs_drop::<T>() {
-               // Get mutable references to private fields for drop
+               
                let prod_priv = unsafe { &*self.prod_private.get() };
                let cons_priv = unsafe { &mut *self.cons_private.get() };
                
-               // Drain based on private consumer index up to private write shadow
+               
                let mut current_read = cons_priv.read_priv;
                let write_shadow = cons_priv.write_shadow; 
 
@@ -331,7 +327,7 @@ impl<T: Send + 'static> Drop for BlqQueue<T> {
                   current_read = current_read.wrapping_add(1);
                }
          }
-         // Deallocate the buffer
+         
          unsafe {
                ManuallyDrop::drop(&mut self.buffer);
          }

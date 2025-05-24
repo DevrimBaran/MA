@@ -13,13 +13,13 @@ use nix::{
 const PERFORMANCE_TEST: bool = true;
 const ITEMS_PER_THREAD_TARGET: usize = 200_000;
 const THREAD_COUNTS_TO_TEST: &[(usize, usize)] = &[
-   (1, 1),    // 1 producer, 1 consumer
-   (2, 2),    // 2 producers, 2 consumers
-   (4, 4),    // 4 producers, 4 consumers
-   (7, 7),    // 7 producers, 7 consumers (14 threads total)
+   (1, 1),    
+   (2, 2),    
+   (4, 4),    
+   (7, 7),    
 ];
 
-// Trait for benchmarking MPMC queues
+
 trait BenchMpmcQueue<T: Send + Clone>: Send + Sync + 'static {
    fn bench_push(&self, item: T, thread_id: usize) -> Result<(), ()>;
    fn bench_pop(&self, thread_id: usize) -> Result<T, ()>;
@@ -27,7 +27,7 @@ trait BenchMpmcQueue<T: Send + Clone>: Send + Sync + 'static {
    fn bench_is_full(&self) -> bool;
 }
 
-// Memory mapping helpers
+
 unsafe fn map_shared(bytes: usize) -> *mut u8 {
    let ptr = libc::mmap(
       ptr::null_mut(),
@@ -49,7 +49,7 @@ unsafe fn unmap_shared(ptr: *mut u8, len: usize) {
    }
 }
 
-// Implement BenchMpmcQueue for YangCrummeyQueue
+
 impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for YangCrummeyQueue<T> {
    fn bench_push(&self, item: T, thread_id: usize) -> Result<(), ()> {
       self.enqueue(thread_id, item)
@@ -64,11 +64,11 @@ impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for YangCrummeyQueue<T> {
    }
    
    fn bench_is_full(&self) -> bool {
-      false // Always false for unbounded queue
+      false 
    }
 }
 
-// Synchronization structures
+
 #[repr(C)]
 struct MpmcStartupSync {
    producers_ready: AtomicU32,
@@ -117,7 +117,7 @@ impl MpmcDoneSync {
    }
 }
 
-// Main benchmark function
+
 fn fork_and_run_mpmc<Q, F>(
    queue_init_fn: F,
    num_producers: usize,
@@ -134,10 +134,10 @@ where
    
    let total_items = num_producers * items_per_thread;
    
-   // Initialize queue
+   
    let (q, q_shm_ptr, q_shm_size) = queue_init_fn();
    
-   // Create synchronization structures
+   
    let startup_sync_size = MpmcStartupSync::shared_size();
    let startup_sync_shm_ptr = unsafe { map_shared(startup_sync_size) };
    let startup_sync = MpmcStartupSync::new_in_shm(startup_sync_shm_ptr);
@@ -149,19 +149,19 @@ where
    let mut producer_pids = Vec::with_capacity(num_producers);
    let mut consumer_pids = Vec::with_capacity(num_consumers);
    
-   // Fork producers
+   
    for producer_id in 0..num_producers {
       match unsafe { fork() } {
          Ok(ForkResult::Child) => {
-               // Producer process
+               
                startup_sync.producers_ready.fetch_add(1, Ordering::AcqRel);
                
-               // Wait for all threads to be ready
+               
                while !startup_sync.go_signal.load(Ordering::Acquire) {
                   std::hint::spin_loop();
                }
                
-               // Produce items
+               
                for i in 0..items_per_thread {
                   let item_value = producer_id * items_per_thread + i;
                   while q.bench_push(item_value, producer_id).is_err() {
@@ -176,7 +176,7 @@ where
                producer_pids.push(child);
          }
          Err(e) => {
-               // Clean up before panicking
+               
                unsafe {
                   if !q_shm_ptr.is_null() { unmap_shared(q_shm_ptr, q_shm_size); }
                   unmap_shared(startup_sync_shm_ptr, startup_sync_size);
@@ -187,14 +187,14 @@ where
       }
    }
    
-   // Fork consumers
+   
    for consumer_id in 0..num_consumers {
       match unsafe { fork() } {
          Ok(ForkResult::Child) => {
-               // Consumer process
+               
                startup_sync.consumers_ready.fetch_add(1, Ordering::AcqRel);
                
-               // Wait for all threads to be ready
+               
                while !startup_sync.go_signal.load(Ordering::Acquire) {
                   std::hint::spin_loop();
                }
@@ -204,16 +204,16 @@ where
                let extra_items = if consumer_id < (total_items % num_consumers) { 1 } else { 0 };
                let my_target = target_items + extra_items;
                
-               // Consume items
+               
                while consumed_count < my_target {
                   match q.bench_pop(num_producers + consumer_id) {
                      Ok(_item) => {
                            consumed_count += 1;
                      }
                      Err(_) => {
-                           // Check if all producers are done
+                           
                            if done_sync.producers_done.load(Ordering::Acquire) == num_producers as u32 {
-                              // Try a few more times
+                              
                               let mut retries = 0;
                               while retries < 1000 && consumed_count < my_target {
                                  if q.bench_pop(num_producers + consumer_id).is_ok() {
@@ -249,7 +249,7 @@ where
                consumer_pids.push(child);
          }
          Err(e) => {
-               // Clean up before panicking
+               
                unsafe {
                   if !q_shm_ptr.is_null() { unmap_shared(q_shm_ptr, q_shm_size); }
                   unmap_shared(startup_sync_shm_ptr, startup_sync_size);
@@ -260,17 +260,17 @@ where
       }
    }
    
-   // Wait for all threads to be ready
+   
    while startup_sync.producers_ready.load(Ordering::Acquire) < num_producers as u32 ||
          startup_sync.consumers_ready.load(Ordering::Acquire) < num_consumers as u32 {
       std::hint::spin_loop();
    }
    
-   // Start timing and signal go
+   
    let start_time = std::time::Instant::now();
    startup_sync.go_signal.store(true, Ordering::Release);
    
-   // Wait for all producers and consumers to complete
+   
    for pid in producer_pids {
       waitpid(pid, None).expect("waitpid for producer failed");
    }
@@ -281,7 +281,7 @@ where
    
    let duration = start_time.elapsed();
    
-   // Cleanup
+   
    unsafe {
       if !q_shm_ptr.is_null() { unmap_shared(q_shm_ptr, q_shm_size); }
       unmap_shared(startup_sync_shm_ptr, startup_sync_size);
@@ -291,7 +291,7 @@ where
    duration
 }
 
-// Benchmark Yang-Crummey MPMC queue
+
 fn bench_yang_crummey(c: &mut Criterion) {
    let mut group = c.benchmark_group("YangCrummeyMPMC");
    

@@ -4,7 +4,6 @@ use core::{cell::UnsafeCell, fmt, mem::MaybeUninit, ptr};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::alloc::Layout;
 
-// compile-time size of the producer’s scratch buffer (paper uses 16)
 const LOCAL_BUF: usize = 16;
 
 pub struct MultiPushQueue<T: Send + 'static> {
@@ -89,27 +88,27 @@ impl<T: Send + 'static> MultiPushQueue<T> {
         free_total.min(room_till_wrap)
     }
 
-    /// Flushes the producer's local buffer to the main ring buffer.
-    /// Returns `true` if the flush was successful or if there was nothing to flush.
-    /// Returns `false` if the flush was attempted but failed (e.g., ring buffer full).
+    
+    
+    
     pub fn flush(&self) -> bool {
         let count_to_push = self.local_count.load(Ordering::Relaxed);
         if count_to_push == 0 {
-            return true; // Nothing to flush
+            return true; 
         }
 
-        // Directly use self.inner assuming LamportQueue fields are pub(crate) or pub
+        
         let ring_instance = unsafe { &*self.inner };
 
         if self.contiguous_free_in_ring() < count_to_push {
-            return false; // Not enough contiguous space in the ring
+            return false; 
         }
 
         let local_buf_array_ptr = self.local_buf.get();
         
-        let ring_buffer_raw = ring_instance.buf.as_ptr() as *mut UnsafeCell<Option<T>>; // Access pub(crate) buf
-        let ring_mask = ring_instance.mask; // Access pub(crate) mask
-        let ring_tail_atomic_ptr = &ring_instance.tail; // Access pub(crate) tail
+        let ring_buffer_raw = ring_instance.buf.as_ptr() as *mut UnsafeCell<Option<T>>; 
+        let ring_mask = ring_instance.mask; 
+        let ring_tail_atomic_ptr = &ring_instance.tail; 
 
         let current_ring_tail_val = ring_tail_atomic_ptr.load(Ordering::Relaxed);
 
@@ -137,13 +136,13 @@ impl<T: Send + 'static> MultiPushQueue<T> {
 
 impl<T: Send + 'static> Drop for MultiPushQueue<T> {
     fn drop(&mut self) {
-        // Attempt to flush any remaining items.
-        // This is best-effort as the ring might be full or other issues could prevent flushing.
+        
+        
         if self.local_count.load(Ordering::Relaxed) > 0 {
             self.flush(); 
         }
 
-        // Drop any items that might still be in local_buf if flush failed or wasn't complete
+        
         let final_local_count = self.local_count.load(Ordering::Relaxed);
         if final_local_count > 0 {
             let local_b_mut_ptr = self.local_buf.get();
@@ -181,20 +180,20 @@ impl<T: Send + 'static> SpscQueue<T> for MultiPushQueue<T> {
             self.local_count.store(current_local_idx + 1, Ordering::Relaxed); 
 
             if current_local_idx + 1 == LOCAL_BUF {
-                self.flush(); // Attempt to flush, ignore failure for now (item is in local_buf)
+                self.flush(); 
             }
             return Ok(());
         }
 
-        // local_buf is full, try to flush
+        
         if self.flush() {
-            // Flush succeeded (or buffer was empty after all), local_buf is now empty.
-            // Recursively call push; this is safe as local_count is now 0.
+            
+            
             return self.push(item);
         }
 
-        // Fallback: local_buf full, AND flush failed (ring buffer also full for a batch).
-        // Try a direct single push to the underlying ring.
+        
+        
         match self.ring_mut().push(item) {
             Ok(_) => Ok(()),
             Err(_) => Err(()),

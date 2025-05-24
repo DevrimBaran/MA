@@ -76,7 +76,7 @@ impl<T: Send + Clone + 'static> ShmBumpPool<T> {
             let next_ptr_val_after_alloc = alloc_ptr_usize + size;
 
             if next_ptr_val_after_alloc > self.end as usize {
-                return ptr::null_mut(); // Pool exhausted
+                return ptr::null_mut(); 
             }
 
             match self.current.compare_exchange(
@@ -97,7 +97,7 @@ impl<T: Send + Clone + 'static> ShmBumpPool<T> {
 }
 
 
-// Timestamp and MinInfo 
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timestamp {
     val: u64,
@@ -135,7 +135,7 @@ impl MinInfo {
     }
 }
 
-// Tree Node Structure
+
 #[repr(C)]
 struct TreeNode {
     min_info_ptr: AtomicPtr<MinInfo>,
@@ -163,7 +163,7 @@ impl TreeNode {
     }
 }
 
-// Main MPSC Queue
+
 #[repr(C)]
 pub struct JayantiPetrovicMpscQueue<T: Send + Clone + 'static> {
     counter: AtomicU64, 
@@ -365,7 +365,7 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
     }
     
     unsafe fn alloc_sesd_node_from_pool(&self) -> *mut SesdNode<(T, Timestamp)> {
-        let node_ptr = self.sesd_node_pool.alloc_sesd_node(); // Changed to specific alloc
+        let node_ptr = self.sesd_node_pool.alloc_sesd_node(); 
         if node_ptr.is_null() {
             panic!("JayantiPetrovicMpscQueue: SESD node pool exhausted!");
         }
@@ -416,7 +416,7 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
             let item_tuple_opt = local_q_to_dequeue.dequeue2(&mut dequeued_node_to_free);
             
             if !dequeued_node_to_free.is_null() {
-                // Check if the node to free is one of the special initial/free_later dummies for this specific local queue
+                
                 let initial_dummy_for_this_q = self.sesd_initial_dummies_base.add(target_producer_id);
                 let free_later_dummy_for_this_q = self.sesd_free_later_dummies_base.add(target_producer_id);
 

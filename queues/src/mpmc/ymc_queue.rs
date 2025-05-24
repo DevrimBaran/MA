@@ -6,23 +6,23 @@ use std::cell::UnsafeCell;
 
 use crate::MpmcQueue;
 
-// Constants
-const SEGMENT_SIZE: usize = 1024; // Back to original size
-const PATIENCE: usize = 3; // Reduced from 10 for faster slow-path transition
+
+const SEGMENT_SIZE: usize = 1024; 
+const PATIENCE: usize = 3; 
 const CACHE_LINE_SIZE: usize = 64;
 
-// Special values - adjusted for usize storage
+
 const BOTTOM: usize = 0;
 const TOP: usize = usize::MAX;
-const EMPTY_ENQ: *mut EnqReq = 1 as *mut EnqReq; // Marker for ⊥e
-const TOP_ENQ: *mut EnqReq = 2 as *mut EnqReq;   // Marker for >e
-const TOP_DEQ: *mut DeqReq = 2 as *mut DeqReq;   // Marker for >d
+const EMPTY_ENQ: *mut EnqReq = 1 as *mut EnqReq; 
+const TOP_ENQ: *mut EnqReq = 2 as *mut EnqReq;   
+const TOP_DEQ: *mut DeqReq = 2 as *mut DeqReq;   
 
-// Enqueue request state
+
 #[repr(C)]
 struct EnqReq {
-    val: AtomicUsize,  // Store the actual value, not a pointer
-    state: AtomicU64,  // (pending: 1 bit, id: 63 bits)
+    val: AtomicUsize,  
+    state: AtomicU64,  
 }
 
 impl EnqReq {
@@ -52,11 +52,11 @@ impl EnqReq {
     }
 }
 
-// Dequeue request state
+
 #[repr(C)]
 struct DeqReq {
     id: AtomicU64,
-    state: AtomicU64, // (pending: 1 bit, idx: 63 bits)
+    state: AtomicU64, 
 }
 
 impl DeqReq {
@@ -80,7 +80,7 @@ impl DeqReq {
     }
 }
 
-// Cell structure
+
 #[repr(C, align(64))]
 struct Cell {
     val: AtomicUsize,
@@ -100,7 +100,7 @@ impl Cell {
     }
 }
 
-// Segment structure
+
 #[repr(C)]
 struct Segment {
     id: usize,
@@ -119,7 +119,7 @@ impl Segment {
         (*ptr).id = id;
         (*ptr).next = AtomicPtr::new(null_mut());
         
-        // Initialize cells properly
+        
         let cells_ptr = (*ptr).cells.as_mut_ptr() as *mut Cell;
         for i in 0..SEGMENT_SIZE {
             ptr::write(cells_ptr.add(i), Cell::new());
@@ -137,7 +137,7 @@ impl Segment {
     }
 }
 
-// Thread handle
+
 #[repr(C, align(128))]
 pub struct Handle {
     tail: AtomicPtr<Segment>,
@@ -169,7 +169,7 @@ impl Handle {
     }
 }
 
-// Main queue structure
+
 #[repr(C)]
 pub struct YangCrummeyQueue<T: Send + Clone + 'static> {
     q: AtomicPtr<Segment>,
@@ -187,10 +187,10 @@ unsafe impl<T: Send + Clone> Sync for YangCrummeyQueue<T> {}
 impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
     pub fn new(num_threads: usize) -> Self {
         unsafe {
-            // Create initial segment
+            
             let seg0 = Segment::new(0);
             
-            // Create and link handles
+            
             let mut handles = Vec::with_capacity(num_threads);
             for _ in 0..num_threads {
                 let handle = Box::into_raw(Box::new(Handle::new()));
@@ -199,7 +199,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
                 handles.push(handle);
             }
             
-            // Link handles in a ring
+            
             for i in 0..num_threads {
                 let curr = handles[i];
                 let next = handles[(i + 1) % num_threads];
@@ -223,19 +223,19 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
     pub unsafe fn init_in_shared(mem: *mut u8, num_threads: usize) -> &'static mut Self {
         let queue_ptr = mem as *mut Self;
         
-        // Calculate segments needed more reasonably
-        // With 100K items per thread, we need fewer segments
-        let items_per_thread = 100_000; // From your benchmark
-        let max_items = items_per_thread * num_threads * 3; // 3x buffer for FAA overhead
+        
+        
+        let items_per_thread = 100_000; 
+        let max_items = items_per_thread * num_threads * 3; 
         let num_segments = std::cmp::min((max_items + SEGMENT_SIZE - 1) / SEGMENT_SIZE, 8192);
         
-        // Calculate offsets - ensure proper alignment
+        
         let queue_size = mem::size_of::<Self>();
         let handles_offset = (queue_size + 127) & !127;
         let segment_offset = handles_offset + num_threads * mem::size_of::<Handle>();
-        let segment_offset = (segment_offset + 63) & !63; // Align to 64 bytes
+        let segment_offset = (segment_offset + 63) & !63; 
         
-        // Create all segments in shared memory
+        
         let mut prev_seg: *mut Segment = null_mut();
         let mut first_seg: *mut Segment = null_mut();
         
@@ -247,7 +247,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
                 cells: MaybeUninit::uninit(),
             });
             
-            // Initialize cells properly
+            
             let cells_ptr = (*seg_ptr).cells.as_mut_ptr() as *mut Cell;
             for i in 0..SEGMENT_SIZE {
                 ptr::write(cells_ptr.add(i), Cell::new());
@@ -261,7 +261,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
             prev_seg = seg_ptr;
         }
         
-        // Create handles in shared memory
+        
         let mut handles = Vec::with_capacity(num_threads);
         let handles_base = mem.add(handles_offset) as *mut Handle;
         
@@ -273,7 +273,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
             handles.push(handle_ptr);
         }
         
-        // Link handles
+        
         for i in 0..num_threads {
             let curr = handles[i];
             let next = handles[(i + 1) % num_threads];
@@ -282,7 +282,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
             (*curr).deq_peer.store(next, Ordering::Relaxed);
         }
         
-        // Initialize queue
+        
         ptr::write(queue_ptr, Self {
             q: AtomicPtr::new(first_seg),
             t: AtomicU64::new(0),
@@ -297,7 +297,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
     }
     
     pub fn shared_size(num_threads: usize) -> usize {
-        // Calculate based on actual needs
+        
         let items_per_thread = 100_000;
         let max_items = items_per_thread * num_threads * 3;
         let num_segments = std::cmp::min((max_items + SEGMENT_SIZE - 1) / SEGMENT_SIZE, 8192);
@@ -307,33 +307,33 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
         let segments_size = num_segments * mem::size_of::<Segment>();
         
         let total = queue_size + handles_size + segments_size + 8192;
-        (total + 4095) & !4095 // Page align
+        (total + 4095) & !4095 
     }
 
-    // Find cell helper
+    
     unsafe fn find_cell(&self, sp: &mut *mut Segment, cell_id: u64) -> *mut Cell {
         let seg_id = (cell_id / SEGMENT_SIZE as u64) as usize;
         let cell_idx = (cell_id % SEGMENT_SIZE as u64) as usize;
         
         let mut s = *sp;
         
-        // Traverse to target segment
+        
         while (*s).id < seg_id {
             let next = (*s).next.load(Ordering::Acquire);
             if next.is_null() {
-                // In shared memory mode, all segments should be pre-allocated
+                
                 if self.is_shared_memory {
                     panic!("Segment {} not found in pre-allocated segments!", seg_id);
                 }
                 
-                // Non-shared memory: allocate new segment
+                
                 let new_seg = Segment::new((*s).id + 1);
                 match (*s).next.compare_exchange(null_mut(), new_seg, Ordering::AcqRel, Ordering::Acquire) {
                     Ok(_) => {
                         s = new_seg;
                     }
                     Err(_) => {
-                        // Someone else added it
+                        
                         alloc::dealloc(new_seg as *mut u8, Layout::new::<Segment>());
                         s = (*s).next.load(Ordering::Acquire);
                     }
@@ -359,7 +359,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
         }
     }
 
-    // Fast path enqueue
+    
     unsafe fn enq_fast(&self, handle: *mut Handle, v: usize, cid: &mut u64) -> bool {
         let i = self.t.fetch_add(1, Ordering::AcqRel);
         let c = self.find_cell(&mut (*handle).tail.load(Ordering::Acquire), i);
@@ -373,9 +373,9 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
         }
     }
 
-    // Slow path enqueue  
+    
     unsafe fn enq_slow(&self, handle: *mut Handle, v: usize, cell_id: u64) {
-        // Publish request
+        
         let r = &(*handle).enq_req;
         r.val.store(v, Ordering::Release);
         r.set_state(true, cell_id);
@@ -383,11 +383,11 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
         let mut tmp_tail = (*handle).tail.load(Ordering::Acquire);
         
         loop {
-            // Get new cell
+            
             let i = self.t.fetch_add(1, Ordering::AcqRel);
             let c = self.find_cell(&mut tmp_tail, i);
             
-            // Try to reserve cell
+            
             let enq_ptr = (*c).enq.compare_exchange(
                 null_mut(),
                 r as *const EnqReq as *mut EnqReq,
@@ -406,7 +406,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
             }
         }
         
-        // Commit the value
+        
         let (_, id) = r.get_state();
         let c = self.find_cell(&mut (*handle).tail.load(Ordering::Acquire), id);
         self.enq_commit(c, v, id);
@@ -417,19 +417,19 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
         (*c).val.store(v, Ordering::Release);
     }
 
-    // Help enqueue
+    
     unsafe fn help_enq(&self, handle: *mut Handle, c: *mut Cell, i: u64) -> Result<usize, ()> {
         let val = (*c).val.load(Ordering::Acquire);
         if val != BOTTOM && val != TOP {
             return Ok(val);
         }
         
-        // Try to mark cell as TOP
+        
         match (*c).val.compare_exchange(BOTTOM, TOP, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => {
-                // Cell was empty, help enqueuers
+                
                 if (*c).enq.load(Ordering::Acquire).is_null() {
-                    // Find a peer to help
+                    
                     let mut iterations = 0;
                     loop {
                         iterations += 1;
@@ -448,7 +448,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
                         if (*handle).enq_id.load(Ordering::Acquire) == 0 || 
                            (*handle).enq_id.load(Ordering::Acquire) == id {
                             if pending && id <= i {
-                                // Try to help
+                                
                                 match (*c).enq.compare_exchange(
                                     null_mut(),
                                     peer_req as *const EnqReq as *mut EnqReq,
@@ -473,22 +473,22 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
                         }
                     }
                     
-                    // If no request to help, mark as TOP_ENQ
+                    
                     if (*c).enq.load(Ordering::Acquire).is_null() {
                         (*c).enq.store(TOP_ENQ, Ordering::Release);
                     }
                 }
                 
-                // Check if we can return EMPTY
+                
                 let enq_ptr = (*c).enq.load(Ordering::Acquire);
                 if enq_ptr == TOP_ENQ {
                     if self.t.load(Ordering::Acquire) <= i {
-                        return Err(()); // EMPTY
+                        return Err(()); 
                     }
                     return Ok(TOP);
                 }
                 
-                // Help complete the enqueue if there's a request
+                
                 if !enq_ptr.is_null() && enq_ptr != TOP_ENQ && enq_ptr != EMPTY_ENQ {
                     let req = &*enq_ptr;
                     let (pending, req_id) = req.get_state();
@@ -497,7 +497,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
                     if req_id > i {
                         if (*c).val.load(Ordering::Acquire) == TOP && 
                            self.t.load(Ordering::Acquire) <= i {
-                            return Err(()); // EMPTY
+                            return Err(()); 
                         }
                     } else if req.try_claim(req_id, i) || 
                              (!pending && req_id == i && (*c).val.load(Ordering::Acquire) == TOP) {
@@ -505,7 +505,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
                     }
                 }
                 
-                // Return the value in the cell
+                
                 match (*c).val.load(Ordering::Acquire) {
                     TOP => Ok(TOP),
                     v => Ok(v),
@@ -516,7 +516,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
         }
     }
 
-    // Dequeue operations
+    
     unsafe fn deq_fast(&self, handle: *mut Handle, id: &mut u64) -> Result<usize, ()> {
         let i = self.h.fetch_add(1, Ordering::AcqRel);
         let c = self.find_cell(&mut (*handle).head.load(Ordering::Acquire), i);
@@ -527,7 +527,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
                 Ok(TOP)
             }
             v => {
-                // Try to claim the value
+                
                 let deq_ptr = (*c).deq.compare_exchange(
                     null_mut(),
                     TOP_DEQ,
@@ -546,15 +546,15 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
     }
 
     unsafe fn deq_slow(&self, handle: *mut Handle, cid: u64) -> Result<usize, ()> {
-        // Publish dequeue request
+        
         let r = &(*handle).deq_req;
         r.id.store(cid, Ordering::Release);
         r.set_state(true, cid);
         
-        // Help complete the request
+        
         self.help_deq(handle, handle);
         
-        // Get result
+        
         let (_, idx) = r.get_state();
         let c = self.find_cell(&mut (*handle).head.load(Ordering::Acquire), idx);
         let v = (*c).val.load(Ordering::Acquire);
@@ -586,7 +586,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
         let mut cand = 0;
         
         loop {
-            // Find candidate
+            
             let mut hc = ha;
             while cand == 0 {
                 let (p, curr_idx) = r.get_state();
@@ -599,7 +599,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
                 let c = self.find_cell(&mut hc, i);
                 
                 match self.help_enq(handle, c, i) {
-                    Err(_) => cand = i, // EMPTY
+                    Err(_) => cand = i, 
                     Ok(v) if v != TOP && (*c).deq.load(Ordering::Acquire).is_null() => {
                         cand = i;
                     }
@@ -607,7 +607,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
                 }
             }
             
-            // Try to announce candidate
+            
             if cand != 0 {
                 let old_state = (1u64 << 63) | prior;
                 let new_state = (1u64 << 63) | cand;
@@ -616,14 +616,14 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
                 prior = new_idx;
             }
             
-            // Check if request complete
+            
             let (pending, _) = r.get_state();
             if !pending || r.id.load(Ordering::Acquire) != id {
                 (*handle).hazard.store(null_mut(), Ordering::Release);
                 return;
             }
             
-            // Try to claim announced cell
+            
             let c = self.find_cell(&mut ha, prior);
             let val = (*c).val.load(Ordering::Acquire);
             
@@ -631,7 +631,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
                (*c).deq.compare_exchange(null_mut(), r as *const DeqReq as *mut DeqReq, 
                                         Ordering::AcqRel, Ordering::Acquire).is_ok() ||
                (*c).deq.load(Ordering::Acquire) == r as *const DeqReq as *mut DeqReq {
-                // Complete the request
+                
                 let old_state = (1u64 << 63) | prior;
                 let new_state = prior;
                 r.state.compare_exchange(old_state, new_state, Ordering::AcqRel, Ordering::Acquire).ok();
@@ -639,7 +639,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
                 return;
             }
             
-            // Prepare for next iteration
+            
             if prior >= i {
                 cand = 0;
                 i = prior;
@@ -647,15 +647,15 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
         }
     }
 
-    // Memory reclamation - simplified for shared memory
+    
     unsafe fn cleanup(&self, _handle: *mut Handle) {
-        // In shared memory mode, we don't reclaim segments
+        
         if self.is_shared_memory {
             return;
         }
         
-        // For non-shared memory, implement cleanup if needed
-        // For now, we'll skip cleanup to avoid complexity
+        
+        
     }
 
     pub fn enqueue(&self, thread_id: usize, item: T) -> Result<(), ()> {
@@ -668,12 +668,12 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
             let handle = handles[thread_id];
             (*handle).hazard.store((*handle).tail.load(Ordering::Acquire), Ordering::Release);
             
-            // For benchmarking with usize values, just use the value directly
-            // In a real implementation, you'd need to handle T properly
-            let v = std::mem::transmute_copy::<T, usize>(&item);
-            std::mem::forget(item); // Prevent double-drop
             
-            // Try fast path
+            
+            let v = std::mem::transmute_copy::<T, usize>(&item);
+            std::mem::forget(item); 
+            
+            
             let mut cell_id = 0;
             for _ in 0..PATIENCE {
                 if self.enq_fast(handle, v, &mut cell_id) {
@@ -682,7 +682,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
                 }
             }
             
-            // Use slow path
+            
             self.enq_slow(handle, v, cell_id);
             (*handle).hazard.store(null_mut(), Ordering::Release);
             Ok(())
@@ -699,7 +699,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
             let handle = handles[thread_id];
             (*handle).hazard.store((*handle).head.load(Ordering::Acquire), Ordering::Release);
             
-            // Try fast path
+            
             let mut v = TOP;
             let mut cell_id = 0;
             
@@ -712,13 +712,13 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
                     Err(_) => {
                         (*handle).hazard.store(null_mut(), Ordering::Release);
                         self.cleanup(handle);
-                        return Err(()); // EMPTY
+                        return Err(()); 
                     }
                     _ => {}
                 }
             }
             
-            // Use slow path if needed
+            
             if v == TOP || v == BOTTOM {
                 match self.deq_slow(handle, cell_id) {
                     Ok(val) if val != TOP && val != BOTTOM => v = val,
@@ -730,7 +730,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
                 }
             }
             
-            // Help peer before returning
+            
             let peer = (*handle).deq_peer.load(Ordering::Acquire);
             if !peer.is_null() {
                 self.help_deq(handle, peer);
@@ -740,7 +740,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
             (*handle).hazard.store(null_mut(), Ordering::Release);
             self.cleanup(handle);
             
-            // Convert back from usize to T
+            
             Ok(std::mem::transmute_copy::<usize, T>(&v))
         }
     }
@@ -750,11 +750,11 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
     }
 
     pub fn is_full(&self) -> bool {
-        false // Unbounded queue
+        false 
     }
 }
 
-// Implement MpmcQueue trait
+
 impl<T: Send + Clone + 'static> MpmcQueue<T> for YangCrummeyQueue<T> {
     type PushError = ();
     type PopError = ();
@@ -783,12 +783,12 @@ impl<T: Send + Clone> Drop for YangCrummeyQueue<T> {
         }
         
         unsafe {
-            // Clean up segments
+            
             let mut current = self.q.load(Ordering::Relaxed);
             while !current.is_null() {
                 let next = (*current).next.load(Ordering::Relaxed);
                 
-                // Drop any remaining values in cells
+                
                 let cells = (*current).cells();
                 for i in 0..SEGMENT_SIZE {
                     let val = cells[i].val.load(Ordering::Relaxed);
@@ -801,7 +801,7 @@ impl<T: Send + Clone> Drop for YangCrummeyQueue<T> {
                 current = next;
             }
             
-            // Clean up handles
+            
             let handles = &*self.handles.get();
             for &handle in handles.iter() {
                 if !handle.is_null() {

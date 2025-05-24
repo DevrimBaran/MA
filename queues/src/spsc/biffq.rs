@@ -1,4 +1,3 @@
-// biffq from mafione et al. 2018
 use crate::SpscQueue;
 use std::cell::UnsafeCell;
 use std::fmt;

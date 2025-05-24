@@ -1,4 +1,3 @@
-// Dehnavi 2021
 use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
@@ -8,11 +7,11 @@ use crate::SpscQueue;
 #[derive(Debug)]
 pub struct DehnaviQueue<T: Send + 'static> { 
    pub(crate) buffer: Box<[UnsafeCell<MaybeUninit<T>>]>,
-   pub capacity: usize, // k in the paper
-   pub wc: AtomicUsize, // write counter
-   pub rc: AtomicUsize, // read counter
-   pub(crate) pclaim: AtomicBool, // producer claim
-   pub(crate) cclaim: AtomicBool, // consumer claim
+   pub capacity: usize,
+   pub wc: AtomicUsize,
+   pub rc: AtomicUsize,
+   pub(crate) pclaim: AtomicBool,
+   pub(crate) cclaim: AtomicBool,
 }
 
 #[derive(Debug, PartialEq, Eq)]

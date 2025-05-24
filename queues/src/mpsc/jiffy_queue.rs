@@ -5,7 +5,7 @@ use std::fmt;
 
 use crate::MpscQueue;
 
-// log_jiffy! macro definition removed
+
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(usize)]
@@ -106,7 +106,7 @@ impl<T: Send + 'static> SharedPools<T> {
     unsafe fn new_in_place(
         mem_ptr: *mut u8,
         mut current_offset: usize,
-        max_buffers_meta: usize, // Renamed for clarity from input `max_buffers`
+        max_buffers_meta: usize, 
         nodes_per_buffer: usize,
         total_node_capacity_for_pool: usize,
     ) -> (*mut Self, usize) {
@@ -262,10 +262,10 @@ unsafe impl<T: Send + 'static> Sync for JiffyQueue<T> {}
 impl<T: Send + 'static> JiffyQueue<T> {
     pub fn shared_size(
         buffer_capacity_per_array: usize,
-        max_buffers_in_pool: usize // This parameter is for bl_meta_pool_capacity
+        max_buffers_in_pool: usize 
     ) -> usize {
-        // Ensure a minimum number of buffers for node array pool calculation if max_buffers_in_pool is small
-        let num_buffer_slots_for_node_arrays = max_buffers_in_pool.max(10); // Ensure pool can hold at least 10 arrays worth of nodes.
+        
+        let num_buffer_slots_for_node_arrays = max_buffers_in_pool.max(10); 
         let total_node_capacity_for_pool = num_buffer_slots_for_node_arrays * buffer_capacity_per_array;
         let mut current_offset = 0;
 
@@ -279,7 +279,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
 
         let bl_meta_align = align_of::<BufferList<T>>();
         current_offset = (current_offset + bl_meta_align - 1) & !(bl_meta_align - 1);
-        current_offset += max_buffers_in_pool * size_of::<BufferList<T>>(); // Use actual for metadata
+        current_offset += max_buffers_in_pool * size_of::<BufferList<T>>(); 
 
         let node_align = align_of::<Node<T>>();
         current_offset = (current_offset + node_align - 1) & !(node_align - 1);
@@ -291,7 +291,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
     pub unsafe fn init_in_shared(
         mem_ptr: *mut u8,
         buffer_capacity_per_array: usize,
-        max_buffers_in_pool: usize // This parameter is for bl_meta_pool_capacity
+        max_buffers_in_pool: usize 
     ) -> &'static mut Self {
         let num_buffer_slots_for_node_arrays = max_buffers_in_pool.max(10);
         let total_node_capacity_for_pool = num_buffer_slots_for_node_arrays * buffer_capacity_per_array;
@@ -543,7 +543,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                     self.pools().dealloc_bl_meta_to_pool(current_garbage_item_ptr);
                 }
             } else {
-                // Prepend to still_deferred_list
+                
                 unsafe { (*current_garbage_item_ptr).next_in_garbage.store(still_deferred_list_head, Ordering::Relaxed); }
                 still_deferred_list_head = current_garbage_item_ptr;
                 if still_deferred_list_tail.is_null() { 
@@ -555,7 +555,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
         if !still_deferred_list_head.is_null() {
             if still_deferred_list_tail.is_null() { 
                 still_deferred_list_tail = still_deferred_list_head;
-                unsafe { // Find the actual tail if it wasn't the first item
+                unsafe { 
                     while !(*still_deferred_list_tail).next_in_garbage.load(Ordering::Relaxed).is_null() {
                         still_deferred_list_tail = (*still_deferred_list_tail).next_in_garbage.load(Ordering::Relaxed);
                     }
@@ -570,7 +570,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                     current_global_garbage_head, 
                     still_deferred_list_head,    
                     Ordering::AcqRel,
-                    Ordering::Acquire, // Stronger on failure for read
+                    Ordering::Acquire, 
                 ) {
                     Ok(_) => break, 
                     Err(new_global_head) => current_global_garbage_head = new_global_head, 
@@ -795,16 +795,16 @@ impl<T: Send + 'static> MpscQueue<T> for JiffyQueue<T> {
     
         let mut temp_head_idx = head_bl.consumer_head_idx; 
         
-        // Temporarily advance past any handled items at the current consumer_head_idx for emptiness check
+        
         while temp_head_idx < head_bl.capacity {
-            if head_bl.curr_buffer.is_null() || head_bl.is_array_reclaimed.load(Ordering::Relaxed) { // Should not happen if outer check passed
+            if head_bl.curr_buffer.is_null() || head_bl.is_array_reclaimed.load(Ordering::Relaxed) { 
                 return head_bl.next.load(Ordering::Acquire).is_null() && head_bl_ptr == self.tail_of_queue.load(Ordering::Acquire);
             }
             let node_state = unsafe { (*head_bl.curr_buffer.add(temp_head_idx)).is_set.load(Ordering::Acquire) };
             if node_state == NodeState::Handled as usize {
                 temp_head_idx += 1;
             } else {
-                break; // Found non-handled (Set or Empty)
+                break; 
             }
         }
 

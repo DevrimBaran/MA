@@ -1,4 +1,3 @@
-// iffq from mafione et al. 2018
 use crate::SpscQueue;
 use std::cell::UnsafeCell;
 use std::fmt;
@@ -6,27 +5,23 @@ use std::mem::{self, MaybeUninit};
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-// H_PARTITION_SIZE: As described in the paper (Section 4.2), H is a small multiple of K.
-// K is the number of items per cache line. For 8-byte items and 64-byte cache lines, K=8.
-// The paper's experiments use H = 4K = 32.
-// H must be a power of two if the mask `H-1` is used as in Figure 11's next_clear calculation.
 const H_PARTITION_SIZE: usize = 32; 
 
 type Slot<T> = Option<T>;
 
-#[repr(C, align(64))] // Used literal 64 for alignment
+#[repr(C, align(64))] 
 struct ProducerFields {
    write: AtomicUsize, 
    limit: AtomicUsize, 
 }
 
-#[repr(C, align(64))] // Used literal 64 for alignment
+#[repr(C, align(64))] 
 struct ConsumerFields {
    read: AtomicUsize,  
    clear: AtomicUsize, 
 }
 
-#[repr(C, align(64))] // Used literal 64 for alignment
+#[repr(C, align(64))] 
 pub struct IffqQueue<T: Send + 'static> {
    prod: ProducerFields,
    cons: ConsumerFields,

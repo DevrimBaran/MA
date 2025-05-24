@@ -1,5 +1,6 @@
 pub mod spsc;
 pub mod mpsc;
+pub mod mpmc;
 
 pub use spsc::LamportQueue;
 pub use spsc::DynListQueue;
@@ -19,6 +20,8 @@ pub use mpsc::DrescherQueue;
 pub use mpsc::JayantiPetrovicMpscQueue;
 pub use mpsc::JiffyQueue;
 pub use mpsc::DQueue;
+
+pub use mpmc::YangCrummeyQueue;
 
 // Common interface for all spsc queues.
 pub trait SpscQueue<T: Send>: Send + 'static {

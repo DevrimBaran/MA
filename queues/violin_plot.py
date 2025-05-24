@@ -18,7 +18,9 @@ BENCHMARK_FUNCTION_IDS = [
    "Iffq",
    "Biffq",
    "FFq",
-   "JiffySPSC"
+   "Llq",
+   "Blq",
+   "SesdJpSPSC"
 ]
 
 OUTPUT_PLOT_FILE = 'spsc_queue_performance_violin_test.png'

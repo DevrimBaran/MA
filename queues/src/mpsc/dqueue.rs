@@ -72,17 +72,28 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         let producers_align = mem::align_of::<Producer<T>>();
         let segment_meta_align = mem::align_of::<Segment<T>>();
         let cell_align = mem::align_of::<UnsafeCell<MaybeUninit<Option<T>>>>();
+        
         let mut total_size = 0;
+        
+        // Align for Self
         total_size = (total_size + self_align - 1) & !(self_align - 1);
         total_size += mem::size_of::<Self>();
+        
+        // Align for producers array
         if num_producers > 0 {
             total_size = (total_size + producers_align - 1) & !(producers_align - 1);
             total_size += num_producers * mem::size_of::<Producer<T>>();
         }
+        
+        // Align for segment metadata array
         total_size = (total_size + segment_meta_align - 1) & !(segment_meta_align - 1);
         total_size += segment_pool_capacity * mem::size_of::<Segment<T>>();
+        
+        // Align for cells array
         total_size = (total_size + cell_align - 1) & !(cell_align - 1);
         total_size += segment_pool_capacity * N_SEGMENT_CAPACITY * mem::size_of::<UnsafeCell<MaybeUninit<Option<T>>>>();
+        
+        // Ensure overall alignment to cache line
         (total_size + 63) & !63
     }
 
@@ -90,14 +101,23 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         mem_ptr: *mut u8, num_producers: usize, segment_pool_capacity: usize
     ) -> &'static mut Self {
         let mut current_offset = 0usize;
+        
         let align_and_advance = |co: &mut usize, size: usize, align: usize| -> *mut u8 {
             *co = (*co + align - 1) & !(align - 1);
-            let ptr = mem_ptr.add(*co); *co += size; ptr
+            let ptr = mem_ptr.add(*co); 
+            *co += size; 
+            ptr
         };
-        let q_ptr = align_and_advance(&mut current_offset, mem::size_of::<Self>(), mem::align_of::<Self>()) as *mut Self;
+        
+        // Ensure Self is aligned to 64 bytes
+        let q_ptr = align_and_advance(&mut current_offset, mem::size_of::<Self>(), 64) as *mut Self;
+        
+        // Ensure Producer array is aligned to 64 bytes (since Producer is repr(C, align(64)))
         let p_arr_ptr = if num_producers > 0 {
-            align_and_advance(&mut current_offset, num_producers * mem::size_of::<Producer<T>>(), mem::align_of::<Producer<T>>()) as *mut Producer<T>
-        } else { ptr::null_mut() };
+            align_and_advance(&mut current_offset, num_producers * mem::size_of::<Producer<T>>(), 64) as *mut Producer<T>
+        } else { 
+            ptr::null_mut() 
+        };
         let seg_pool_meta_ptr = align_and_advance(&mut current_offset, segment_pool_capacity * mem::size_of::<Segment<T>>(), mem::align_of::<Segment<T>>()) as *mut Segment<T>;
         let seg_cells_pool_ptr = align_and_advance(&mut current_offset, segment_pool_capacity * N_SEGMENT_CAPACITY * mem::size_of::<UnsafeCell<MaybeUninit<Option<T>>>>(), mem::align_of::<UnsafeCell<MaybeUninit<Option<T>>>>()) as *mut UnsafeCell<MaybeUninit<Option<T>>>;
         

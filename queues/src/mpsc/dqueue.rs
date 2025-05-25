@@ -332,7 +332,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         }
     }
 
-    unsafe fn dump_local_buffer(&self, producer_idx: usize) {
+    pub unsafe fn dump_local_buffer(&self, producer_idx: usize) {
         if self.num_producers == 0 || producer_idx >= self.num_producers { return; }
         let p_struct_ptr = self.producers_array.add(producer_idx);
         let local_head_atomic = &(*p_struct_ptr).local_head;

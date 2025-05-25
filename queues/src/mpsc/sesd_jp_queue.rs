@@ -1,12 +1,12 @@
 use crate::SpscQueue;
+use std::cell::UnsafeCell;
 use std::mem::{self, MaybeUninit};
 use std::ptr;
-use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 #[repr(C)]
 pub struct Node<T: Send + Clone> {
-    pub item: MaybeUninit<T>, 
+    pub item: MaybeUninit<T>,
     pub next: AtomicPtr<Node<T>>,
 }
 
@@ -19,11 +19,11 @@ impl<T: Send + Clone> Node<T> {
 
 #[repr(C)]
 pub struct SesdJpQueue<T: Send + Clone> {
-    first: AtomicPtr<Node<T>>,      
-    last: AtomicPtr<Node<T>>,       
-    announce: AtomicPtr<Node<T>>,   
-    free_later: AtomicPtr<Node<T>>, 
-    help: *mut MaybeUninit<T>,      
+    first: AtomicPtr<Node<T>>,
+    last: AtomicPtr<Node<T>>,
+    announce: AtomicPtr<Node<T>>,
+    free_later: AtomicPtr<Node<T>>,
+    help: *mut MaybeUninit<T>,
 }
 
 impl<T: Send + Clone> SesdJpQueue<T> {
@@ -37,13 +37,16 @@ impl<T: Send + Clone> SesdJpQueue<T> {
         Node::init_dummy(shm_ptr_free_later_dummy);
         shm_ptr_help_slot.write(MaybeUninit::uninit());
 
-        ptr::write(shm_ptr_self, SesdJpQueue {
-            first: AtomicPtr::new(shm_ptr_initial_dummy_node),
-            last: AtomicPtr::new(shm_ptr_initial_dummy_node),
-            announce: AtomicPtr::new(ptr::null_mut()),
-            free_later: AtomicPtr::new(shm_ptr_free_later_dummy),
-            help: shm_ptr_help_slot,
-        });
+        ptr::write(
+            shm_ptr_self,
+            SesdJpQueue {
+                first: AtomicPtr::new(shm_ptr_initial_dummy_node),
+                last: AtomicPtr::new(shm_ptr_initial_dummy_node),
+                announce: AtomicPtr::new(ptr::null_mut()),
+                free_later: AtomicPtr::new(shm_ptr_free_later_dummy),
+                help: shm_ptr_help_slot,
+            },
+        );
         &mut *shm_ptr_self
     }
 
@@ -81,25 +84,25 @@ impl<T: Send + Clone> SesdJpQueue<T> {
                 *node_to_free_pool = ptr::null_mut();
                 return None;
             }
-            
+
             let retval = (*(*tmp).item.as_ptr()).clone();
             self.help.write(MaybeUninit::new(retval.clone()));
             let next_ptr = (*tmp).next.load(Ordering::Acquire);
-            
+
             if next_ptr.is_null() {
                 *node_to_free_pool = ptr::null_mut();
                 return None;
             }
-            
+
             self.first.store(next_ptr, Ordering::Release);
-            
+
             if tmp == self.announce.load(Ordering::Acquire) {
                 let tmp_prime = self.free_later.swap(tmp, Ordering::AcqRel);
                 *node_to_free_pool = tmp_prime;
             } else {
                 *node_to_free_pool = tmp;
             }
-            
+
             Some(retval)
         }
     }
@@ -117,182 +120,8 @@ impl<T: Send + Clone> SesdJpQueue<T> {
     }
 }
 
-
 #[derive(Debug, PartialEq, Eq)]
 pub struct SesdPushError;
 
-#[derive(Debug, PartialEq, Eq)]  
+#[derive(Debug, PartialEq, Eq)]
 pub struct SesdPopError;
-
-#[repr(C)]
-pub struct SesdJpSpscBenchWrapper<T: Send + Clone + 'static> {
-    
-    queue: SesdJpQueue<T>,
-    
-    
-    nodes_storage: *mut UnsafeCell<Node<T>>,
-    available_count: usize,
-    capacity: usize,
-    
-    
-    free_head: UnsafeCell<usize>,
-    free_tail: usize,
-    
-    
-    initial_dummy_addr: *mut Node<T>,
-    free_later_dummy_addr: *mut Node<T>,
-}
-
-unsafe impl<T: Send + Clone + 'static> Send for SesdJpSpscBenchWrapper<T> {}
-unsafe impl<T: Send + Clone + 'static> Sync for SesdJpSpscBenchWrapper<T> {}
-
-impl<T: Send + Clone + 'static> SesdJpSpscBenchWrapper<T> {
-    pub fn shared_size(pool_capacity: usize) -> usize {
-        let mut size = 0;
-        
-        
-        size += mem::size_of::<Self>();
-        
-        
-        size = (size + mem::align_of::<Node<T>>() - 1) & !(mem::align_of::<Node<T>>() - 1);
-        
-        
-        let total_nodes = pool_capacity + 10; 
-        size += total_nodes * mem::size_of::<UnsafeCell<Node<T>>>();
-        
-        
-        size = (size + mem::align_of::<MaybeUninit<T>>() - 1) & !(mem::align_of::<MaybeUninit<T>>() - 1);
-        size += mem::size_of::<MaybeUninit<T>>();
-        
-        size
-    }
-
-    pub unsafe fn init_in_shared(shm_ptr: *mut u8, pool_capacity: usize) -> &'static Self {
-        if pool_capacity == 0 {
-            panic!("Pool capacity cannot be 0");
-        }
-        
-        let mut offset = 0;
-        
-        
-        let self_ptr = shm_ptr as *mut Self;
-        offset += mem::size_of::<Self>();
-        
-        
-        offset = (offset + mem::align_of::<Node<T>>() - 1) & !(mem::align_of::<Node<T>>() - 1);
-        
-        
-        let total_nodes = pool_capacity + 10;
-        let nodes_storage_ptr = shm_ptr.add(offset) as *mut UnsafeCell<Node<T>>;
-        offset += total_nodes * mem::size_of::<UnsafeCell<Node<T>>>();
-        
-        
-        offset = (offset + mem::align_of::<MaybeUninit<T>>() - 1) & !(mem::align_of::<MaybeUninit<T>>() - 1);
-        let help_slot_ptr = shm_ptr.add(offset) as *mut MaybeUninit<T>;
-        
-        
-        for i in 0..total_nodes {
-            let node_cell_ptr = nodes_storage_ptr.add(i);
-            let node_ptr = (*node_cell_ptr).get();
-            Node::init_dummy(node_ptr);
-        }
-        
-        
-        let initial_dummy_addr = (*nodes_storage_ptr.add(0)).get();
-        let free_later_dummy_addr = (*nodes_storage_ptr.add(1)).get();
-        
-        
-        help_slot_ptr.write(MaybeUninit::uninit());
-        
-        
-        ptr::write(self_ptr, Self {
-            queue: std::mem::MaybeUninit::uninit().assume_init(),
-            nodes_storage: nodes_storage_ptr,
-            available_count: pool_capacity,
-            capacity: pool_capacity,
-            free_head: UnsafeCell::new(2), 
-            free_tail: total_nodes,
-            initial_dummy_addr,
-            free_later_dummy_addr,
-        });
-        SesdJpQueue::new_in_shm(
-            ptr::addr_of_mut!((*self_ptr).queue),
-            initial_dummy_addr,
-            help_slot_ptr,
-            free_later_dummy_addr,
-        );
-        
-        &*self_ptr
-    }
-
-    #[inline]
-    fn alloc_node(&self) -> *mut Node<T> {
-        unsafe {
-            let current_head = *self.free_head.get();
-            
-            if current_head >= self.free_tail {
-                return ptr::null_mut(); 
-            }
-            
-            
-            *self.free_head.get() = current_head + 1;
-            
-            let node_cell_ptr = self.nodes_storage.add(current_head);
-            let node_ptr = (*node_cell_ptr).get();
-            
-            
-            Node::init_dummy(node_ptr);
-            
-            node_ptr
-        }
-    }
-
-    #[inline]
-    fn free_node(&self, node_ptr: *mut Node<T>) {
-        if node_ptr.is_null() {
-            return;
-        }
-        
-        
-        if node_ptr == self.initial_dummy_addr || node_ptr == self.free_later_dummy_addr {
-            return;
-        }
-    }
-}
-
-impl<T: Send + Clone + 'static> SpscQueue<T> for SesdJpSpscBenchWrapper<T> {
-    type PushError = SesdPushError;
-    type PopError = SesdPopError;
-
-    fn push(&self, item: T) -> Result<(), Self::PushError> {
-        let new_node = self.alloc_node();
-        if new_node.is_null() {
-            return Err(SesdPushError);
-        }
-        
-        self.queue.enqueue2(item, new_node);
-        Ok(())
-    }
-
-    fn pop(&self) -> Result<T, Self::PopError> {
-        let mut node_to_free: *mut Node<T> = ptr::null_mut();
-        match self.queue.dequeue2(&mut node_to_free) {
-            Some(item) => {
-                self.free_node(node_to_free);
-                Ok(item)
-            }
-            None => Err(SesdPopError)
-        }
-    }
-
-    fn available(&self) -> bool {
-        
-        let can_alloc = unsafe { *self.free_head.get() < self.free_tail };
-        let queue_available = self.queue.read_frontd().is_some();
-        can_alloc || queue_available
-    }
-
-    fn empty(&self) -> bool {
-        self.queue.read_frontd().is_none()
-    }
-}

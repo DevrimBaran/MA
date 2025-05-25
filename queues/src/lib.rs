@@ -1,25 +1,25 @@
-pub mod spsc;
-pub mod mpsc;
 pub mod mpmc;
+pub mod mpsc;
+pub mod spsc;
 
-pub use spsc::LamportQueue;
-pub use spsc::DynListQueue;
-pub use spsc::UnboundedQueue;
-pub use spsc::MultiPushQueue;
 pub use spsc::BQueue;
-pub use spsc::DehnaviQueue;
-pub use spsc::PopError;
-pub use spsc::IffqQueue;
 pub use spsc::BiffqQueue;
-pub use spsc::FfqQueue;
-pub use spsc::LlqQueue;
 pub use spsc::BlqQueue;
+pub use spsc::DehnaviQueue;
+pub use spsc::DynListQueue;
+pub use spsc::FfqQueue;
+pub use spsc::IffqQueue;
+pub use spsc::LamportQueue;
+pub use spsc::LlqQueue;
+pub use spsc::MultiPushQueue;
+pub use spsc::PopError;
 pub use spsc::SesdJpSpscBenchWrapper;
+pub use spsc::UnboundedQueue;
 
+pub use mpsc::DQueue;
 pub use mpsc::DrescherQueue;
 pub use mpsc::JayantiPetrovicMpscQueue;
 pub use mpsc::JiffyQueue;
-pub use mpsc::DQueue;
 
 pub use mpmc::YangCrummeyQueue;
 

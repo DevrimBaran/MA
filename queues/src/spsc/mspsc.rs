@@ -1,7 +1,7 @@
 use crate::spsc::LamportQueue;
 use crate::SpscQueue;
-use core::{cell::UnsafeCell, fmt, mem::MaybeUninit, ptr};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::{cell::UnsafeCell, fmt, mem::MaybeUninit, ptr};
 use std::alloc::Layout;
 
 const LOCAL_BUF: usize = 16;
@@ -24,19 +24,21 @@ impl<T: Send + 'static> MultiPushQueue<T> {
 
     pub unsafe fn init_in_shared(mem: *mut u8, capacity: usize) -> &'static mut Self {
         let self_ptr = mem as *mut MaybeUninit<Self>;
-        
+
         let self_layout = Layout::new::<Self>();
         let lamport_layout = Layout::from_size_align(
             LamportQueue::<T>::shared_size(capacity),
-            core::mem::align_of::<LamportQueue<T>>()
-        ).expect("Failed to create layout for LamportQueue in init_in_shared");
+            core::mem::align_of::<LamportQueue<T>>(),
+        )
+        .expect("Failed to create layout for LamportQueue in init_in_shared");
 
-        let (_combined_layout, lamport_offset) = self_layout.extend(lamport_layout)
+        let (_combined_layout, lamport_offset) = self_layout
+            .extend(lamport_layout)
             .expect("Failed to extend layout for MultiPushQueue in init_in_shared");
 
         let lamport_q_ptr_raw = mem.add(lamport_offset);
         let lamport_q_instance = LamportQueue::init_in_shared(lamport_q_ptr_raw, capacity);
-        
+
         let initial_value = Self::from_raw(lamport_q_instance as *mut _, true);
         ptr::write(self_ptr, MaybeUninit::new(initial_value));
         &mut *(*self_ptr).as_mut_ptr()
@@ -46,12 +48,14 @@ impl<T: Send + 'static> MultiPushQueue<T> {
         let self_layout = Layout::new::<Self>();
         let lamport_layout = Layout::from_size_align(
             LamportQueue::<T>::shared_size(capacity),
-            core::mem::align_of::<LamportQueue<T>>()
-        ).expect("Failed to create layout for LamportQueue in shared_size");
+            core::mem::align_of::<LamportQueue<T>>(),
+        )
+        .expect("Failed to create layout for LamportQueue in shared_size");
 
-        let (combined_layout, _offset_lamport) = self_layout.extend(lamport_layout)
+        let (combined_layout, _offset_lamport) = self_layout
+            .extend(lamport_layout)
             .expect("Failed to extend layout for MultiPushQueue in shared_size");
-        
+
         combined_layout.pad_to_align().size()
     }
 
@@ -79,36 +83,32 @@ impl<T: Send + 'static> MultiPushQueue<T> {
     fn contiguous_free_in_ring(&self) -> usize {
         let ring_ref = self.ring();
         let cap = ring_ref.capacity();
-        let prod_idx = ring_ref.tail.load(Ordering::Relaxed); 
+        let prod_idx = ring_ref.tail.load(Ordering::Relaxed);
         let cons_idx = ring_ref.head.load(Ordering::Acquire);
-        
+
         let used_slots = prod_idx.wrapping_sub(cons_idx) & (cap - 1);
         let free_total = cap.wrapping_sub(used_slots).wrapping_sub(1);
         let room_till_wrap = cap - (prod_idx & (cap - 1));
         free_total.min(room_till_wrap)
     }
 
-    
-    
-    
     pub fn flush(&self) -> bool {
         let count_to_push = self.local_count.load(Ordering::Relaxed);
         if count_to_push == 0 {
-            return true; 
+            return true;
         }
 
-        
         let ring_instance = unsafe { &*self.inner };
 
         if self.contiguous_free_in_ring() < count_to_push {
-            return false; 
+            return false;
         }
 
         let local_buf_array_ptr = self.local_buf.get();
-        
-        let ring_buffer_raw = ring_instance.buf.as_ptr() as *mut UnsafeCell<Option<T>>; 
-        let ring_mask = ring_instance.mask; 
-        let ring_tail_atomic_ptr = &ring_instance.tail; 
+
+        let ring_buffer_raw = ring_instance.buf.as_ptr() as *mut UnsafeCell<Option<T>>;
+        let ring_mask = ring_instance.mask;
+        let ring_tail_atomic_ptr = &ring_instance.tail;
 
         let current_ring_tail_val = ring_tail_atomic_ptr.load(Ordering::Relaxed);
 
@@ -118,15 +118,15 @@ impl<T: Send + 'static> MultiPushQueue<T> {
             for i in (0..count_to_push).rev() {
                 let item_from_local_buf = ptr::read(local_buf_slice[i].as_ptr());
                 let target_slot_in_ring = (current_ring_tail_val.wrapping_add(i)) & ring_mask;
-                
+
                 let slot_cell_ptr = ring_buffer_raw.add(target_slot_in_ring);
                 (*(*slot_cell_ptr).get()) = Some(item_from_local_buf);
             }
         }
-        
+
         ring_tail_atomic_ptr.store(
             current_ring_tail_val.wrapping_add(count_to_push),
-            Ordering::Release
+            Ordering::Release,
         );
 
         self.local_count.store(0, Ordering::Relaxed);
@@ -136,13 +136,10 @@ impl<T: Send + 'static> MultiPushQueue<T> {
 
 impl<T: Send + 'static> Drop for MultiPushQueue<T> {
     fn drop(&mut self) {
-        
-        
         if self.local_count.load(Ordering::Relaxed) > 0 {
-            self.flush(); 
+            self.flush();
         }
 
-        
         let final_local_count = self.local_count.load(Ordering::Relaxed);
         if final_local_count > 0 {
             let local_b_mut_ptr = self.local_buf.get();
@@ -166,7 +163,7 @@ impl<T: Send + 'static> Drop for MultiPushQueue<T> {
 
 impl<T: Send + 'static> SpscQueue<T> for MultiPushQueue<T> {
     type PushError = ();
-    type PopError  = <LamportQueue<T> as SpscQueue<T>>::PopError;
+    type PopError = <LamportQueue<T> as SpscQueue<T>>::PopError;
 
     #[inline]
     fn push(&self, item: T) -> Result<(), Self::PushError> {
@@ -177,23 +174,19 @@ impl<T: Send + 'static> SpscQueue<T> for MultiPushQueue<T> {
                 let slot_ptr = (*self.local_buf.get()).as_mut_ptr().add(current_local_idx);
                 slot_ptr.write(MaybeUninit::new(item));
             }
-            self.local_count.store(current_local_idx + 1, Ordering::Relaxed); 
+            self.local_count
+                .store(current_local_idx + 1, Ordering::Relaxed);
 
             if current_local_idx + 1 == LOCAL_BUF {
-                self.flush(); 
+                self.flush();
             }
             return Ok(());
         }
 
-        
         if self.flush() {
-            
-            
             return self.push(item);
         }
 
-        
-        
         match self.ring_mut().push(item) {
             Ok(_) => Ok(()),
             Err(_) => Err(()),

@@ -8,36 +8,27 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub const K_CACHE_LINE_SLOTS: usize = 8;
 
 #[repr(C)]
-#[cfg_attr(
-    any(target_arch = "x86_64", target_arch = "aarch64"),
-    repr(align(64))
-)]
-pub struct SharedIndices { 
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), repr(align(64)))]
+pub struct SharedIndices {
     pub write: AtomicUsize,
     pub read: AtomicUsize,
 }
 
 #[repr(C)]
-#[cfg_attr(
-    any(target_arch = "x86_64", target_arch = "aarch64"),
-    repr(align(64))
-)]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), repr(align(64)))]
 struct ProducerPrivate {
     read_shadow: usize,
 }
 
 #[repr(C)]
-#[cfg_attr(
-    any(target_arch = "x86_64", target_arch = "aarch64"),
-    repr(align(64))
-)]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), repr(align(64)))]
 struct ConsumerPrivate {
     write_shadow: usize,
 }
 
 #[repr(C)]
 pub struct LlqQueue<T: Send + 'static> {
-    pub shared_indices: SharedIndices, 
+    pub shared_indices: SharedIndices,
     prod_private: UnsafeCell<ProducerPrivate>,
     cons_private: UnsafeCell<ConsumerPrivate>,
     capacity: usize,
@@ -68,7 +59,7 @@ impl<T: Send + 'static> LlqQueue<T> {
         let layout_header = std::alloc::Layout::new::<Self>();
         let layout_buffer_elements =
             std::alloc::Layout::array::<UnsafeCell<MaybeUninit<T>>>(capacity).unwrap();
-        
+
         let (combined_layout, _offset_of_buffer) =
             layout_header.extend(layout_buffer_elements).unwrap();
         combined_layout.pad_to_align().size()
@@ -89,12 +80,11 @@ impl<T: Send + 'static> LlqQueue<T> {
         let layout_header = std::alloc::Layout::new::<Self>();
         let layout_buffer_elements =
             std::alloc::Layout::array::<UnsafeCell<MaybeUninit<T>>>(capacity).unwrap();
-        
+
         let (_combined_layout, offset_of_buffer) =
             layout_header.extend(layout_buffer_elements).unwrap();
 
-        let buffer_data_start_ptr = mem.add(offset_of_buffer) 
-            as *mut UnsafeCell<MaybeUninit<T>>;
+        let buffer_data_start_ptr = mem.add(offset_of_buffer) as *mut UnsafeCell<MaybeUninit<T>>;
 
         let buffer_slice = std::slice::from_raw_parts_mut(buffer_data_start_ptr, capacity);
         let boxed_buffer = Box::from_raw(buffer_slice);
@@ -116,7 +106,7 @@ impl<T: Send + 'static> LlqQueue<T> {
 
         &mut *queue_struct_ptr
     }
-    
+
     pub fn with_capacity(capacity: usize) -> Self {
         assert!(
             capacity.is_power_of_two(),
@@ -149,8 +139,7 @@ impl<T: Send + 'static> LlqQueue<T> {
         let prod_priv = unsafe { &mut *self.prod_private.get() };
         let current_write = self.shared_indices.write.load(Ordering::Relaxed);
 
-        if current_write.wrapping_sub(prod_priv.read_shadow) == self.capacity - K_CACHE_LINE_SLOTS
-        {
+        if current_write.wrapping_sub(prod_priv.read_shadow) == self.capacity - K_CACHE_LINE_SLOTS {
             prod_priv.read_shadow = self.shared_indices.read.load(Ordering::Acquire);
             if current_write.wrapping_sub(prod_priv.read_shadow)
                 == self.capacity - K_CACHE_LINE_SLOTS
@@ -185,10 +174,8 @@ impl<T: Send + 'static> LlqQueue<T> {
         }
 
         let slot_idx = current_read & self.mask;
-        let item = unsafe {
-            ptr::read((*self.buffer.get_unchecked(slot_idx)).get()).assume_init()
-        };
-        
+        let item = unsafe { ptr::read((*self.buffer.get_unchecked(slot_idx)).get()).assume_init() };
+
         self.shared_indices
             .read
             .store(current_read.wrapping_add(1), Ordering::Release);
@@ -233,7 +220,9 @@ impl<T: Send + 'static> Drop for LlqQueue<T> {
             while read_idx != write_idx {
                 let slot_idx = read_idx & self.mask;
                 unsafe {
-                    (*self.buffer.get_unchecked_mut(slot_idx)).get_mut().assume_init_drop();
+                    (*self.buffer.get_unchecked_mut(slot_idx))
+                        .get_mut()
+                        .assume_init_drop();
                 }
                 read_idx = read_idx.wrapping_add(1);
             }

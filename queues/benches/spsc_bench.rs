@@ -23,7 +23,7 @@ use queues::spsc::blq::K_CACHE_LINE_SLOTS as BLQ_K_SLOTS;
 use queues::spsc::llq::K_CACHE_LINE_SLOTS as LLQ_K_SLOTS;
 
 const PERFORMANCE_TEST: bool = true;
-const RING_CAP: usize = 8192;
+const RING_CAP: usize = 16_384;
 const ITERS: usize = 1_000_000;
 
 // Helper trait for benchmarking for SpscQueue error types
@@ -232,9 +232,9 @@ fn bench_mp(c: &mut Criterion) {
 fn bench_dspsc(c: &mut Criterion) {
     c.bench_function("dSPSC", |b| {
         b.iter(|| {
-            let bytes = DynListQueue::<usize>::shared_size();
+            let bytes = DynListQueue::<usize>::shared_size(RING_CAP);
             let shm_ptr = unsafe { map_shared(bytes) };
-            let q = unsafe { DynListQueue::init_in_shared(shm_ptr) };
+            let q = unsafe { DynListQueue::init_in_shared(shm_ptr, RING_CAP) };
 
             let dur = fork_and_run(q);
 
@@ -574,6 +574,9 @@ criterion_group! {
     name = benches;
     config = custom_criterion();
     targets =
+        bench_sesd_jp,
+        bench_lamport,
+        bench_bqueue,
         bench_mp,
         bench_unbounded,
         bench_dspsc,

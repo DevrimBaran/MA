@@ -25,7 +25,7 @@ use queues::spsc::llq::{LlqQueue, K_CACHE_LINE_SLOTS};
 
 const PERFORMANCE_TEST: bool = false;
 const RING_CAP_GENERAL: usize = 65536;
-const ITERS_GENERAL: usize = 30_000_000;
+const ITERS_GENERAL: usize = 40_000_000;
 
 // Helper trait for benchmarking SPSC-like queues
 trait BenchSpscQueue<T: Send>: Send + Sync + 'static {
@@ -294,9 +294,9 @@ fn bench_mp(c: &mut Criterion) {
 fn bench_dspsc(c: &mut Criterion) {
     c.bench_function("dSPSC", |b| {
         b.iter_custom(|_iters| {
-            let bytes = DynListQueue::<usize>::shared_size();
+            let bytes = DynListQueue::<usize>::shared_size(RING_CAP_GENERAL);
             let shm_ptr = unsafe { map_shared(bytes) };
-            let q = unsafe { DynListQueue::init_in_shared(shm_ptr) };
+            let q = unsafe { DynListQueue::init_in_shared(shm_ptr, RING_CAP_GENERAL) };
             let dur = fork_and_run(q, ITERS_GENERAL);
             unsafe {
                 unmap_shared(shm_ptr, bytes);
@@ -628,20 +628,20 @@ fn custom_criterion() -> Criterion {
 }
 
 criterion_group! {
-   name = benches;
-   config = custom_criterion();
-   targets =
-      bench_sesd_jp,
-      bench_lamport,
-      bench_bqueue,
-      bench_mp,
-      bench_unbounded,
-      bench_dspsc,
-      bench_dehnavi,
-      bench_iffq,
-      bench_biffq,
-      bench_ffq,
-      bench_llq,
-      bench_blq,
+    name = benches;
+    config = custom_criterion();
+    targets =
+        bench_sesd_jp,
+        bench_lamport,
+        bench_bqueue,
+        bench_mp,
+        bench_unbounded,
+        bench_dspsc,
+        bench_dehnavi,
+        bench_iffq,
+        bench_biffq,
+        bench_ffq,
+        bench_llq,
+        bench_blq,
 }
 criterion_main!(benches);

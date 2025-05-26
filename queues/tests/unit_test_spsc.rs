@@ -1626,10 +1626,10 @@ mod shared_memory_tests {
 
     #[test]
     fn test_dspsc_shared() {
-        let shared_size = DynListQueue::<usize>::shared_size();
+        let shared_size = DynListQueue::<usize>::shared_size(8192);
         let mut memory = vec![0u8; shared_size];
 
-        let queue = unsafe { DynListQueue::<usize>::init_in_shared(memory.as_mut_ptr()) };
+        let queue = unsafe { DynListQueue::<usize>::init_in_shared(memory.as_mut_ptr(), 8192) };
 
         queue.push(123).unwrap();
         assert_eq!(queue.pop().unwrap(), 123);
@@ -1784,7 +1784,7 @@ mod special_feature_tests {
 
     #[test]
     fn test_dspsc_dynamic_allocation() {
-        let queue = DynListQueue::<usize>::new();
+        let queue = DynListQueue::<usize>::with_capacity(8192);
 
         for i in 0..1000 {
             queue.push(i).unwrap();
@@ -1799,10 +1799,10 @@ mod special_feature_tests {
 
     #[test]
     fn test_dspsc_shared_memory() {
-        let shared_size = DynListQueue::<usize>::shared_size();
+        let shared_size = DynListQueue::<usize>::shared_size(8192);
         let mut memory = vec![0u8; shared_size];
 
-        let queue = unsafe { DynListQueue::<usize>::init_in_shared(memory.as_mut_ptr()) };
+        let queue = unsafe { DynListQueue::<usize>::init_in_shared(memory.as_mut_ptr(), 8192) };
 
         queue.push(42).unwrap();
         assert_eq!(queue.pop().unwrap(), 42);
@@ -1829,7 +1829,7 @@ mod special_feature_tests {
 
     #[test]
     fn test_dspsc_heap_allocation() {
-        let queue = DynListQueue::<String>::new();
+        let queue = DynListQueue::<String>::with_capacity(8192);
 
         const PREALLOCATED_NODES: usize = 16384;
 

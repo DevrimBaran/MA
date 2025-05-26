@@ -11,17 +11,14 @@ const fn null_node<T: Send>() -> *mut Node<T> {
     null_mut()
 }
 
-// 2097152, 1048576, 524288, 65536, 32768, 16384, 8192, 4096, 2048, 1024
-const PREALLOCATED_NODES: usize = 4096;
-const NODE_CACHE_CAPACITY: usize = 8192;
+// Fixed cache line size - actual size on x86_64
 const CACHE_LINE_SIZE: usize = 64;
 
 #[repr(C, align(128))]
 struct Node<T: Send + 'static> {
     val: Option<T>,
     next: AtomicPtr<Node<T>>,
-
-    _padding: [u8; CACHE_LINE_SIZE - 16],
+    _padding: [u8; CACHE_LINE_SIZE - 24], // 24 = size of val + next on 64-bit
 }
 
 #[repr(transparent)]
@@ -36,17 +33,18 @@ pub struct DynListQueue<T: Send + 'static> {
     head: AtomicPtr<Node<T>>,
     tail: AtomicPtr<Node<T>>,
 
-    padding1: [u8; CACHE_LINE_SIZE - 16],
+    padding1: [u8; 128 - 16], // 16 = 2 pointers
 
     nodes_pool_ptr: *mut Node<T>,
     next_free_node: AtomicUsize,
 
-    padding2: [u8; CACHE_LINE_SIZE - 16],
+    padding2: [u8; 128 - 16], // 16 = 1 pointer + 1 atomic
 
     node_cache: LamportQueue<NodePtr<T>>,
 
     base_ptr: *mut Node<T>,
     pool_capacity: usize,
+    cache_capacity: usize,
     owns_all: bool,
 
     heap_allocs: AtomicUsize,
@@ -57,11 +55,15 @@ unsafe impl<T: Send> Send for DynListQueue<T> {}
 unsafe impl<T: Send> Sync for DynListQueue<T> {}
 
 impl<T: Send + 'static> DynListQueue<T> {
-    pub fn shared_size() -> usize {
+    pub fn shared_size(capacity: usize) -> usize {
+        // Calculate sizes based on capacity
+        let preallocated_nodes = capacity / 2; // Half of ring cap for pre-allocated
+        let node_cache_capacity = capacity; // Full ring cap for cache
+
         let layout_self = Layout::new::<Self>();
-        let lamport_cache_size = LamportQueue::<NodePtr<T>>::shared_size(NODE_CACHE_CAPACITY);
+        let lamport_cache_size = LamportQueue::<NodePtr<T>>::shared_size(node_cache_capacity);
         let layout_dummy_node = Layout::new::<Node<T>>();
-        let layout_pool_array = Layout::array::<Node<T>>(PREALLOCATED_NODES).unwrap();
+        let layout_pool_array = Layout::array::<Node<T>>(preallocated_nodes).unwrap();
 
         let (layout1, _) = layout_self.extend(layout_dummy_node).unwrap();
         let (layout2, _) = layout1.extend(layout_pool_array).unwrap();
@@ -75,52 +77,57 @@ impl<T: Send + 'static> DynListQueue<T> {
 
         final_layout.size()
     }
-}
 
-impl<T: Send + 'static> DynListQueue<T> {
-    pub fn new() -> Self {
+    pub fn with_capacity(capacity: usize) -> Self {
+        let preallocated_nodes = capacity / 2;
+        let node_cache_capacity = capacity;
+
         let dummy = Box::into_raw(Box::new(Node {
             val: None,
             next: AtomicPtr::new(null_node()),
-            _padding: [0; CACHE_LINE_SIZE - 16],
+            _padding: [0; CACHE_LINE_SIZE - 24],
         }));
 
-        let mut pool_nodes_vec: Vec<Node<T>> = Vec::with_capacity(PREALLOCATED_NODES);
-        for _ in 0..PREALLOCATED_NODES {
+        let mut pool_nodes_vec: Vec<Node<T>> = Vec::with_capacity(preallocated_nodes);
+        for _ in 0..preallocated_nodes {
             pool_nodes_vec.push(Node {
                 val: None,
                 next: AtomicPtr::new(null_node()),
-                _padding: [0; CACHE_LINE_SIZE - 16],
+                _padding: [0; CACHE_LINE_SIZE - 24],
             });
         }
         let pool_ptr = Box::into_raw(pool_nodes_vec.into_boxed_slice()) as *mut Node<T>;
 
-        let node_cache = LamportQueue::<NodePtr<T>>::with_capacity(NODE_CACHE_CAPACITY);
+        let node_cache = LamportQueue::<NodePtr<T>>::with_capacity(node_cache_capacity);
 
         Self {
             head: AtomicPtr::new(dummy),
             tail: AtomicPtr::new(dummy),
-            padding1: [0; CACHE_LINE_SIZE - 16],
+            padding1: [0; 128 - 16],
             base_ptr: dummy,
             nodes_pool_ptr: pool_ptr,
             next_free_node: AtomicUsize::new(0),
-            padding2: [0; CACHE_LINE_SIZE - 16],
+            padding2: [0; 128 - 16],
             node_cache,
-            pool_capacity: PREALLOCATED_NODES,
+            pool_capacity: preallocated_nodes,
+            cache_capacity: node_cache_capacity,
             owns_all: true,
             heap_allocs: AtomicUsize::new(0),
             heap_frees: AtomicUsize::new(0),
         }
     }
 
-    pub unsafe fn init_in_shared(mem_ptr: *mut u8) -> &'static mut Self {
+    pub unsafe fn init_in_shared(mem_ptr: *mut u8, capacity: usize) -> &'static mut Self {
+        let preallocated_nodes = capacity / 2;
+        let node_cache_capacity = capacity;
+
         let self_ptr = mem_ptr as *mut Self;
 
         let layout_self = Layout::new::<Self>();
         let layout_dummy_node = Layout::new::<Node<T>>();
-        let layout_pool_array = Layout::array::<Node<T>>(PREALLOCATED_NODES).unwrap();
+        let layout_pool_array = Layout::array::<Node<T>>(preallocated_nodes).unwrap();
 
-        let lamport_cache_size = LamportQueue::<NodePtr<T>>::shared_size(NODE_CACHE_CAPACITY);
+        let lamport_cache_size = LamportQueue::<NodePtr<T>>::shared_size(node_cache_capacity);
         let lamport_align = std::cmp::max(std::mem::align_of::<LamportQueue<NodePtr<T>>>(), 128);
 
         let (layout1, offset_dummy) = layout_self.extend(layout_dummy_node).unwrap();
@@ -138,19 +145,19 @@ impl<T: Send + 'static> DynListQueue<T> {
             Node {
                 val: None,
                 next: AtomicPtr::new(null_node()),
-                _padding: [0; CACHE_LINE_SIZE - 16],
+                _padding: [0; CACHE_LINE_SIZE - 24],
             },
         );
 
         let pool_nodes_ptr_val = mem_ptr.add(offset_pool_array) as *mut Node<T>;
 
-        for i in 0..PREALLOCATED_NODES {
+        for i in 0..preallocated_nodes {
             ptr::write(
                 pool_nodes_ptr_val.add(i),
                 Node {
                     val: None,
                     next: AtomicPtr::new(null_node()),
-                    _padding: [0; CACHE_LINE_SIZE - 16],
+                    _padding: [0; CACHE_LINE_SIZE - 24],
                 },
             );
         }
@@ -158,20 +165,21 @@ impl<T: Send + 'static> DynListQueue<T> {
         let node_cache_mem_start = mem_ptr.add(offset_node_cache);
 
         let initialized_node_cache_ref =
-            LamportQueue::<NodePtr<T>>::init_in_shared(node_cache_mem_start, NODE_CACHE_CAPACITY);
+            LamportQueue::<NodePtr<T>>::init_in_shared(node_cache_mem_start, node_cache_capacity);
 
         ptr::write(
             self_ptr,
             DynListQueue {
                 head: AtomicPtr::new(dummy_ptr_val),
                 tail: AtomicPtr::new(dummy_ptr_val),
-                padding1: [0; CACHE_LINE_SIZE - 16],
+                padding1: [0; 128 - 16],
                 base_ptr: dummy_ptr_val,
                 nodes_pool_ptr: pool_nodes_ptr_val,
                 next_free_node: AtomicUsize::new(0),
-                padding2: [0; CACHE_LINE_SIZE - 16],
+                padding2: [0; 128 - 16],
                 node_cache: ptr::read(initialized_node_cache_ref as *const _),
-                pool_capacity: PREALLOCATED_NODES,
+                pool_capacity: preallocated_nodes,
+                cache_capacity: node_cache_capacity,
                 owns_all: false,
                 heap_allocs: AtomicUsize::new(0),
                 heap_frees: AtomicUsize::new(0),
@@ -182,9 +190,7 @@ impl<T: Send + 'static> DynListQueue<T> {
 
         &mut *self_ptr
     }
-}
 
-impl<T: Send + 'static> DynListQueue<T> {
     fn alloc_node(&self, v: T) -> *mut Node<T> {
         for _ in 0..3 {
             if let Ok(node_ptr_wrapper) = self.node_cache.pop() {
@@ -219,13 +225,15 @@ impl<T: Send + 'static> DynListQueue<T> {
             std::alloc::handle_alloc_error(layout);
         }
 
+        self.heap_allocs.fetch_add(1, Ordering::Relaxed);
+
         unsafe {
             ptr::write(
                 ptr,
                 Node {
                     val: Some(v),
                     next: AtomicPtr::new(null_node()),
-                    _padding: [0; CACHE_LINE_SIZE - 16],
+                    _padding: [0; CACHE_LINE_SIZE - 24],
                 },
             );
         }
@@ -267,6 +275,7 @@ impl<T: Send + 'static> DynListQueue<T> {
             unsafe {
                 let layout = Layout::from_size_align(std::mem::size_of::<Node<T>>(), 128).unwrap();
                 std::alloc::dealloc(node_to_recycle as *mut u8, layout);
+                self.heap_frees.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -382,7 +391,7 @@ impl<T: Send + 'static> Drop for DynListQueue<T> {
 
                     let _ = Box::from_raw(std::slice::from_raw_parts_mut(
                         self.nodes_pool_ptr,
-                        PREALLOCATED_NODES,
+                        self.pool_capacity,
                     ));
                 }
 

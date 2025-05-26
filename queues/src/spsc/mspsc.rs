@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::{cell::UnsafeCell, fmt, mem::MaybeUninit, ptr};
 use std::alloc::Layout;
 
-const LOCAL_BUF: usize = 16;
+const LOCAL_BUF: usize = 32;
 
 pub struct MultiPushQueue<T: Send + 'static> {
     inner: *mut LamportQueue<T>,

@@ -23,7 +23,7 @@ use queues::spsc::blq::K_CACHE_LINE_SLOTS as BLQ_K_SLOTS;
 use queues::spsc::llq::K_CACHE_LINE_SLOTS as LLQ_K_SLOTS;
 
 const PERFORMANCE_TEST: bool = true;
-const RING_CAP: usize = 4096;
+const RING_CAP: usize = 8192;
 const ITERS: usize = 1_000_000;
 
 // Helper trait for benchmarking for SpscQueue error types
@@ -574,6 +574,7 @@ criterion_group! {
     name = benches;
     config = custom_criterion();
     targets =
+        bench_mp,
         bench_unbounded,
         bench_dspsc,
         bench_dehnavi,

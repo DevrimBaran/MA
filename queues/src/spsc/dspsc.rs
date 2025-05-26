@@ -12,9 +12,9 @@ const fn null_node<T: Send>() -> *mut Node<T> {
 }
 
 // 2097152, 1048576, 524288, 65536, 32768, 16384, 8192, 4096, 2048, 1024
-const PREALLOCATED_NODES: usize = 2048;
-const NODE_CACHE_CAPACITY: usize = 4096;
-const CACHE_LINE_SIZE: usize = 1024;
+const PREALLOCATED_NODES: usize = 4096;
+const NODE_CACHE_CAPACITY: usize = 8192;
+const CACHE_LINE_SIZE: usize = 64;
 
 #[repr(C, align(128))]
 struct Node<T: Send + 'static> {

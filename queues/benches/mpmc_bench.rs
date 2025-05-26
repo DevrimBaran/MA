@@ -4,19 +4,19 @@ use nix::{
     sys::wait::waitpid,
     unistd::{fork, ForkResult},
 };
-use queues::mpmc::YangCrummeyQueue;
+use queues::mpmc::{KWQueue, YangCrummeyQueue};
 use queues::MpmcQueue;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 const PERFORMANCE_TEST: bool = true;
-const ITEMS_PER_THREAD_TARGET: usize = 200_000;
-const THREAD_COUNTS_TO_TEST: &[(usize, usize)] = &[(1, 1), (2, 2), (4, 4), (7, 7)];
+const ITEMS_PER_PROCESS_TARGET: usize = 200_000;
+const PROCESS_COUNTS_TO_TEST: &[(usize, usize)] = &[(1, 1), (2, 2), (4, 4), (7, 7)];
 
 trait BenchMpmcQueue<T: Send + Clone>: Send + Sync + 'static {
-    fn bench_push(&self, item: T, thread_id: usize) -> Result<(), ()>;
-    fn bench_pop(&self, thread_id: usize) -> Result<T, ()>;
+    fn bench_push(&self, item: T, process_id: usize) -> Result<(), ()>;
+    fn bench_pop(&self, process_id: usize) -> Result<T, ()>;
     fn bench_is_empty(&self) -> bool;
     fn bench_is_full(&self) -> bool;
 }
@@ -43,12 +43,30 @@ unsafe fn unmap_shared(ptr: *mut u8, len: usize) {
 }
 
 impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for YangCrummeyQueue<T> {
-    fn bench_push(&self, item: T, thread_id: usize) -> Result<(), ()> {
-        self.enqueue(thread_id, item)
+    fn bench_push(&self, item: T, process_id: usize) -> Result<(), ()> {
+        self.enqueue(process_id, item)
     }
 
-    fn bench_pop(&self, thread_id: usize) -> Result<T, ()> {
-        self.dequeue(thread_id)
+    fn bench_pop(&self, process_id: usize) -> Result<T, ()> {
+        self.dequeue(process_id)
+    }
+
+    fn bench_is_empty(&self) -> bool {
+        self.is_empty()
+    }
+
+    fn bench_is_full(&self) -> bool {
+        false
+    }
+}
+
+impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for KWQueue<T> {
+    fn bench_push(&self, item: T, process_id: usize) -> Result<(), ()> {
+        self.enqueue(process_id, item)
+    }
+
+    fn bench_pop(&self, process_id: usize) -> Result<T, ()> {
+        self.dequeue(process_id)
     }
 
     fn bench_is_empty(&self) -> bool {
@@ -118,7 +136,7 @@ fn fork_and_run_mpmc<Q, F>(
     queue_init_fn: F,
     num_producers: usize,
     num_consumers: usize,
-    items_per_thread: usize,
+    items_per_process: usize,
 ) -> Duration
 where
     Q: BenchMpmcQueue<usize> + 'static,
@@ -128,7 +146,7 @@ where
         return Duration::from_nanos(1);
     }
 
-    let total_items = num_producers * items_per_thread;
+    let total_items = num_producers * items_per_process;
 
     let (q, q_shm_ptr, q_shm_size) = queue_init_fn();
 
@@ -152,8 +170,8 @@ where
                     std::hint::spin_loop();
                 }
 
-                for i in 0..items_per_thread {
-                    let item_value = producer_id * items_per_thread + i;
+                for i in 0..items_per_process {
+                    let item_value = producer_id * items_per_process + i;
                     while q.bench_push(item_value, producer_id).is_err() {
                         std::hint::spin_loop();
                     }
@@ -285,9 +303,9 @@ where
 fn bench_yang_crummey(c: &mut Criterion) {
     let mut group = c.benchmark_group("YangCrummeyMPMC");
 
-    for &(num_prods, num_cons) in THREAD_COUNTS_TO_TEST {
-        let items_per_thread = ITEMS_PER_THREAD_TARGET;
-        let total_threads = num_prods + num_cons;
+    for &(num_prods, num_cons) in PROCESS_COUNTS_TO_TEST {
+        let items_per_process = ITEMS_PER_PROCESS_TARGET;
+        let total_processes = num_prods + num_cons;
 
         group.bench_function(
             format!("{}P_{}C", num_prods, num_cons),
@@ -295,15 +313,46 @@ fn bench_yang_crummey(c: &mut Criterion) {
                 b.iter_custom(|_iters| {
                     fork_and_run_mpmc::<YangCrummeyQueue<usize>, _>(
                         || {
-                            let bytes = YangCrummeyQueue::<usize>::shared_size(total_threads);
+                            let bytes = YangCrummeyQueue::<usize>::shared_size(total_processes);
                             let shm_ptr = unsafe { map_shared(bytes) };
-                            let q =
-                                unsafe { YangCrummeyQueue::init_in_shared(shm_ptr, total_threads) };
+                            let q = unsafe {
+                                YangCrummeyQueue::init_in_shared(shm_ptr, total_processes)
+                            };
                             (q, shm_ptr, bytes)
                         },
                         num_prods,
                         num_cons,
-                        items_per_thread,
+                        items_per_process,
+                    )
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_kw_queue(c: &mut Criterion) {
+    let mut group = c.benchmark_group("KhanchandaniWattenhoferMPMC");
+
+    for &(num_prods, num_cons) in PROCESS_COUNTS_TO_TEST {
+        let items_per_process = ITEMS_PER_PROCESS_TARGET;
+        let total_processes = num_prods + num_cons;
+
+        group.bench_function(
+            format!("{}P_{}C", num_prods, num_cons),
+            |b: &mut Bencher| {
+                b.iter_custom(|_iters| {
+                    fork_and_run_mpmc::<KWQueue<usize>, _>(
+                        || {
+                            let bytes = KWQueue::<usize>::shared_size(total_processes);
+                            let shm_ptr = unsafe { map_shared(bytes) };
+                            let q = unsafe { KWQueue::init_in_shared(shm_ptr, total_processes) };
+                            (q, shm_ptr, bytes)
+                        },
+                        num_prods,
+                        num_cons,
+                        items_per_process,
                     )
                 })
             },
@@ -321,9 +370,9 @@ fn custom_criterion() -> Criterion {
 }
 
 criterion_group! {
-   name = benches;
-   config = custom_criterion();
-   targets = bench_yang_crummey
+    name = benches;
+    config = custom_criterion();
+    targets = bench_yang_crummey, bench_kw_queue
 }
 
 criterion_main!(benches);

@@ -1,3 +1,4 @@
+// benchmarking process-based SPSC queues using criterion
 // spinloops are just there so that producer and consumer can start at the same time and handling temporary empty/full queues
 // Since the algorithms are wait-free, the spinloops will not affect the wait-free synchronization between producer and consumer
 #![allow(clippy::cast_possible_truncation)]
@@ -11,26 +12,27 @@ use nix::{
 use std::ptr;
 use std::time::Duration;
 
-// Import all necessary queue types and the main SpscQueue trait
+// Import all necessary SPSC queue types and the main SpscQueue trait
 use queues::{
     BQueue, BiffqQueue, BlqQueue, DehnaviQueue, DynListQueue, FfqQueue, IffqQueue, LamportQueue,
-    LlqQueue, MultiPushQueue, SesdJpSpscBenchWrapper, SpscQueue, UnboundedQueue,
+    MultiPushQueue, SesdJpSpscBenchWrapper, SpscQueue, UnboundedQueue,
 };
+
 use std::sync::atomic::{AtomicU32, Ordering};
 
-// Add constants for LLQ and BLQ
 use queues::spsc::blq::K_CACHE_LINE_SLOTS as BLQ_K_SLOTS;
-use queues::spsc::llq::K_CACHE_LINE_SLOTS as LLQ_K_SLOTS;
+use queues::spsc::llq::{LlqQueue, K_CACHE_LINE_SLOTS};
 
-const PERFORMANCE_TEST: bool = true;
-const RING_CAP: usize = 4096;
-const ITERS: usize = 1_000_000;
+const PERFORMANCE_TEST: bool = false;
+const RING_CAP_GENERAL: usize = 65536;
+const ITERS_GENERAL: usize = 30_000_000;
 
-// Helper trait for benchmarking for SpscQueue error types
-// from what fork_and_run expects (Result<(), ()> and Result<T, ()>).
+// Helper trait for benchmarking SPSC-like queues
 trait BenchSpscQueue<T: Send>: Send + Sync + 'static {
     fn bench_push(&self, item: T) -> Result<(), ()>;
     fn bench_pop(&self) -> Result<T, ()>;
+    fn bench_is_empty(&self) -> bool;
+    fn bench_is_full(&self) -> bool;
 }
 
 // mmap / munmap helpers
@@ -50,11 +52,12 @@ unsafe fn map_shared(bytes: usize) -> *mut u8 {
 }
 
 unsafe fn unmap_shared(ptr: *mut u8, len: usize) {
-    let ret = libc::munmap(ptr.cast(), len);
-    assert_eq!(ret, 0, "munmap failed: {}", std::io::Error::last_os_error());
+    if libc::munmap(ptr.cast(), len) == -1 {
+        panic!("munmap failed: {}", std::io::Error::last_os_error());
+    }
 }
 
-// Implement BenchSpscQueue for all queue types
+// BenchSpscQueue Implementations
 impl<T: Send + 'static> BenchSpscQueue<T> for DehnaviQueue<T> {
     fn bench_push(&self, item: T) -> Result<(), ()> {
         SpscQueue::push(self, item).map_err(|_| ())
@@ -62,8 +65,13 @@ impl<T: Send + 'static> BenchSpscQueue<T> for DehnaviQueue<T> {
     fn bench_pop(&self) -> Result<T, ()> {
         SpscQueue::pop(self).map_err(|_| ())
     }
+    fn bench_is_empty(&self) -> bool {
+        SpscQueue::empty(self)
+    }
+    fn bench_is_full(&self) -> bool {
+        !SpscQueue::available(self)
+    }
 }
-
 impl<T: Send + 'static> BenchSpscQueue<T> for LamportQueue<T> {
     fn bench_push(&self, item: T) -> Result<(), ()> {
         SpscQueue::push(self, item)
@@ -71,8 +79,13 @@ impl<T: Send + 'static> BenchSpscQueue<T> for LamportQueue<T> {
     fn bench_pop(&self) -> Result<T, ()> {
         SpscQueue::pop(self)
     }
+    fn bench_is_empty(&self) -> bool {
+        SpscQueue::empty(self)
+    }
+    fn bench_is_full(&self) -> bool {
+        !SpscQueue::available(self)
+    }
 }
-
 impl<T: Send + 'static> BenchSpscQueue<T> for BQueue<T> {
     fn bench_push(&self, item: T) -> Result<(), ()> {
         SpscQueue::push(self, item).map_err(|_| ())
@@ -80,8 +93,13 @@ impl<T: Send + 'static> BenchSpscQueue<T> for BQueue<T> {
     fn bench_pop(&self) -> Result<T, ()> {
         SpscQueue::pop(self)
     }
+    fn bench_is_empty(&self) -> bool {
+        SpscQueue::empty(self)
+    }
+    fn bench_is_full(&self) -> bool {
+        !SpscQueue::available(self)
+    }
 }
-
 impl<T: Send + 'static> BenchSpscQueue<T> for MultiPushQueue<T> {
     fn bench_push(&self, item: T) -> Result<(), ()> {
         SpscQueue::push(self, item)
@@ -89,8 +107,13 @@ impl<T: Send + 'static> BenchSpscQueue<T> for MultiPushQueue<T> {
     fn bench_pop(&self) -> Result<T, ()> {
         SpscQueue::pop(self).map_err(|_| ())
     }
+    fn bench_is_empty(&self) -> bool {
+        SpscQueue::empty(self)
+    }
+    fn bench_is_full(&self) -> bool {
+        !SpscQueue::available(self)
+    }
 }
-
 impl<T: Send + 'static> BenchSpscQueue<T> for UnboundedQueue<T> {
     fn bench_push(&self, item: T) -> Result<(), ()> {
         SpscQueue::push(self, item)
@@ -98,8 +121,13 @@ impl<T: Send + 'static> BenchSpscQueue<T> for UnboundedQueue<T> {
     fn bench_pop(&self) -> Result<T, ()> {
         SpscQueue::pop(self)
     }
+    fn bench_is_empty(&self) -> bool {
+        SpscQueue::empty(self)
+    }
+    fn bench_is_full(&self) -> bool {
+        !SpscQueue::available(self)
+    }
 }
-
 impl<T: Send + 'static> BenchSpscQueue<T> for DynListQueue<T> {
     fn bench_push(&self, item: T) -> Result<(), ()> {
         SpscQueue::push(self, item)
@@ -107,8 +135,13 @@ impl<T: Send + 'static> BenchSpscQueue<T> for DynListQueue<T> {
     fn bench_pop(&self) -> Result<T, ()> {
         SpscQueue::pop(self)
     }
+    fn bench_is_empty(&self) -> bool {
+        SpscQueue::empty(self)
+    }
+    fn bench_is_full(&self) -> bool {
+        !SpscQueue::available(self)
+    }
 }
-
 impl<T: Send + 'static> BenchSpscQueue<T> for IffqQueue<T> {
     fn bench_push(&self, item: T) -> Result<(), ()> {
         SpscQueue::push(self, item).map_err(|_e| ())
@@ -116,8 +149,13 @@ impl<T: Send + 'static> BenchSpscQueue<T> for IffqQueue<T> {
     fn bench_pop(&self) -> Result<T, ()> {
         SpscQueue::pop(self).map_err(|_e| ())
     }
+    fn bench_is_empty(&self) -> bool {
+        SpscQueue::empty(self)
+    }
+    fn bench_is_full(&self) -> bool {
+        !SpscQueue::available(self)
+    }
 }
-
 impl<T: Send + 'static> BenchSpscQueue<T> for BiffqQueue<T> {
     fn bench_push(&self, item: T) -> Result<(), ()> {
         SpscQueue::push(self, item).map_err(|_e| ())
@@ -125,8 +163,13 @@ impl<T: Send + 'static> BenchSpscQueue<T> for BiffqQueue<T> {
     fn bench_pop(&self) -> Result<T, ()> {
         SpscQueue::pop(self).map_err(|_e| ())
     }
+    fn bench_is_empty(&self) -> bool {
+        SpscQueue::empty(self)
+    }
+    fn bench_is_full(&self) -> bool {
+        !SpscQueue::available(self)
+    }
 }
-
 impl<T: Send + 'static> BenchSpscQueue<T> for FfqQueue<T> {
     fn bench_push(&self, item: T) -> Result<(), ()> {
         SpscQueue::push(self, item).map_err(|_e| ())
@@ -134,8 +177,13 @@ impl<T: Send + 'static> BenchSpscQueue<T> for FfqQueue<T> {
     fn bench_pop(&self) -> Result<T, ()> {
         SpscQueue::pop(self).map_err(|_e| ())
     }
+    fn bench_is_empty(&self) -> bool {
+        SpscQueue::empty(self)
+    }
+    fn bench_is_full(&self) -> bool {
+        !SpscQueue::available(self)
+    }
 }
-
 impl<T: Send + 'static> BenchSpscQueue<T> for LlqQueue<T> {
     fn bench_push(&self, item: T) -> Result<(), ()> {
         SpscQueue::push(self, item).map_err(|_| ())
@@ -143,8 +191,13 @@ impl<T: Send + 'static> BenchSpscQueue<T> for LlqQueue<T> {
     fn bench_pop(&self) -> Result<T, ()> {
         SpscQueue::pop(self).map_err(|_| ())
     }
+    fn bench_is_empty(&self) -> bool {
+        SpscQueue::empty(self)
+    }
+    fn bench_is_full(&self) -> bool {
+        !SpscQueue::available(self)
+    }
 }
-
 impl<T: Send + 'static> BenchSpscQueue<T> for BlqQueue<T> {
     fn bench_push(&self, item: T) -> Result<(), ()> {
         SpscQueue::push(self, item).map_err(|_| ())
@@ -152,8 +205,13 @@ impl<T: Send + 'static> BenchSpscQueue<T> for BlqQueue<T> {
     fn bench_pop(&self) -> Result<T, ()> {
         SpscQueue::pop(self).map_err(|_| ())
     }
+    fn bench_is_empty(&self) -> bool {
+        SpscQueue::empty(self)
+    }
+    fn bench_is_full(&self) -> bool {
+        !SpscQueue::available(self)
+    }
 }
-
 impl<T: Send + Clone + 'static> BenchSpscQueue<T> for SesdJpSpscBenchWrapper<T> {
     fn bench_push(&self, item: T) -> Result<(), ()> {
         SpscQueue::push(self, item).map_err(|_| ())
@@ -161,21 +219,29 @@ impl<T: Send + Clone + 'static> BenchSpscQueue<T> for SesdJpSpscBenchWrapper<T> 
     fn bench_pop(&self) -> Result<T, ()> {
         SpscQueue::pop(self).map_err(|_| ())
     }
+    fn bench_is_empty(&self) -> bool {
+        SpscQueue::empty(self)
+    }
+    fn bench_is_full(&self) -> bool {
+        !SpscQueue::available(self)
+    }
 }
 
-// Benchmark functions for each queue type
+// Benchmark Functions
 fn bench_dehnavi(c: &mut Criterion) {
     c.bench_function("Dehnavi", |b| {
-        b.iter(|| {
-            // Dehnavi is a lossy queue, it will overwrite old items if consumer is too slow
-            // To prevent data loss, we need a capacity at least equal to ITERS
-            // Used ITERS + 1 to ensure the queue never completely fills
-            let dehnavi_capacity = ITERS + 1;
-            let bytes = DehnaviQueue::<usize>::shared_size(dehnavi_capacity);
+        b.iter_custom(|_iters_arg_ignored| {
+            // Dehnavi is a lossy queue, it will overwrite the beginning of the queue if consumer not fast enough.
+            let dehnavi_k_param = if ITERS_GENERAL == 0 {
+                2
+            } else {
+                ITERS_GENERAL + 1
+            };
+            let current_ring_cap_param = dehnavi_k_param.max(2);
+            let bytes = DehnaviQueue::<usize>::shared_size(current_ring_cap_param);
             let shm_ptr = unsafe { map_shared(bytes) };
-            let q = unsafe { DehnaviQueue::init_in_shared(shm_ptr, dehnavi_capacity) };
-
-            let dur = fork_and_run(q);
+            let q = unsafe { DehnaviQueue::init_in_shared(shm_ptr, current_ring_cap_param) };
+            let dur = fork_and_run(q, ITERS_GENERAL);
             unsafe {
                 unmap_shared(shm_ptr, bytes);
             }
@@ -186,11 +252,11 @@ fn bench_dehnavi(c: &mut Criterion) {
 
 fn bench_lamport(c: &mut Criterion) {
     c.bench_function("Lamport", |b| {
-        b.iter(|| {
-            let bytes = LamportQueue::<usize>::shared_size(RING_CAP);
+        b.iter_custom(|_iters| {
+            let bytes = LamportQueue::<usize>::shared_size(RING_CAP_GENERAL);
             let shm_ptr = unsafe { map_shared(bytes) };
-            let q = unsafe { LamportQueue::init_in_shared(shm_ptr, RING_CAP) };
-            let dur = fork_and_run(q);
+            let q = unsafe { LamportQueue::init_in_shared(shm_ptr, RING_CAP_GENERAL) };
+            let dur = fork_and_run(q, ITERS_GENERAL);
             unsafe { unmap_shared(shm_ptr, bytes) };
             dur
         })
@@ -199,11 +265,11 @@ fn bench_lamport(c: &mut Criterion) {
 
 fn bench_bqueue(c: &mut Criterion) {
     c.bench_function("B-Queue", |b| {
-        b.iter(|| {
-            let bytes = BQueue::<usize>::shared_size(RING_CAP);
+        b.iter_custom(|_iters| {
+            let bytes = BQueue::<usize>::shared_size(RING_CAP_GENERAL);
             let shm_ptr = unsafe { map_shared(bytes) };
-            let q = unsafe { BQueue::init_in_shared(shm_ptr, RING_CAP) };
-            let dur = fork_and_run(q);
+            let q = unsafe { BQueue::init_in_shared(shm_ptr, RING_CAP_GENERAL) };
+            let dur = fork_and_run(q, ITERS_GENERAL);
             unsafe { unmap_shared(shm_ptr, bytes) };
             dur
         })
@@ -212,16 +278,12 @@ fn bench_bqueue(c: &mut Criterion) {
 
 fn bench_mp(c: &mut Criterion) {
     c.bench_function("mSPSC", |b| {
-        b.iter(|| {
-            let bytes = MultiPushQueue::<usize>::shared_size(RING_CAP);
+        b.iter_custom(|_iters| {
+            let bytes = MultiPushQueue::<usize>::shared_size(RING_CAP_GENERAL);
             let shm_ptr = unsafe { map_shared(bytes) };
-            let q = unsafe { MultiPushQueue::init_in_shared(shm_ptr, RING_CAP) };
-            let q_ptr: *mut MultiPushQueue<usize> = q;
-
-            let dur = fork_and_run(q);
-
+            let q = unsafe { MultiPushQueue::init_in_shared(shm_ptr, RING_CAP_GENERAL) };
+            let dur = fork_and_run(q, ITERS_GENERAL);
             unsafe {
-                ptr::drop_in_place(q_ptr);
                 unmap_shared(shm_ptr, bytes);
             }
             dur
@@ -231,13 +293,11 @@ fn bench_mp(c: &mut Criterion) {
 
 fn bench_dspsc(c: &mut Criterion) {
     c.bench_function("dSPSC", |b| {
-        b.iter(|| {
+        b.iter_custom(|_iters| {
             let bytes = DynListQueue::<usize>::shared_size();
             let shm_ptr = unsafe { map_shared(bytes) };
             let q = unsafe { DynListQueue::init_in_shared(shm_ptr) };
-
-            let dur = fork_and_run(q);
-
+            let dur = fork_and_run(q, ITERS_GENERAL);
             unsafe {
                 unmap_shared(shm_ptr, bytes);
             }
@@ -248,11 +308,11 @@ fn bench_dspsc(c: &mut Criterion) {
 
 fn bench_unbounded(c: &mut Criterion) {
     c.bench_function("uSPSC", |b| {
-        b.iter(|| {
-            let size = UnboundedQueue::<usize>::shared_size(RING_CAP);
+        b.iter_custom(|_iters| {
+            let size = UnboundedQueue::<usize>::shared_size(RING_CAP_GENERAL);
             let shm_ptr = unsafe { map_shared(size) };
-            let q = unsafe { UnboundedQueue::init_in_shared(shm_ptr, RING_CAP) };
-            let dur = fork_and_run(q);
+            let q = unsafe { UnboundedQueue::init_in_shared(shm_ptr, RING_CAP_GENERAL) };
+            let dur = fork_and_run(q, ITERS_GENERAL);
             unsafe {
                 unmap_shared(shm_ptr, size);
             }
@@ -263,25 +323,14 @@ fn bench_unbounded(c: &mut Criterion) {
 
 fn bench_iffq(c: &mut Criterion) {
     c.bench_function("Iffq", |b| {
-        b.iter(|| {
-            assert!(RING_CAP.is_power_of_two());
-            // H_PARTITION_SIZE is 32 in iffq.rs
-            assert_eq!(
-                RING_CAP % 32,
-                0,
-                "RING_CAP must be a multiple of IFFQ H_PARTITION_SIZE (32)"
-            );
-            assert!(
-                RING_CAP >= 2 * 32,
-                "RING_CAP must be >= 2 * IFFQ H_PARTITION_SIZE (64)"
-            );
-
-            let bytes = IffqQueue::<usize>::shared_size(RING_CAP);
+        b.iter_custom(|_iters| {
+            assert!(RING_CAP_GENERAL.is_power_of_two());
+            assert_eq!(RING_CAP_GENERAL % 32, 0);
+            assert!(RING_CAP_GENERAL >= 2 * 32);
+            let bytes = IffqQueue::<usize>::shared_size(RING_CAP_GENERAL);
             let shm_ptr = unsafe { map_shared(bytes) };
-            let q = unsafe { IffqQueue::init_in_shared(shm_ptr, RING_CAP) };
-
-            let dur = fork_and_run(q);
-
+            let q = unsafe { IffqQueue::init_in_shared(shm_ptr, RING_CAP_GENERAL) };
+            let dur = fork_and_run(q, ITERS_GENERAL);
             unsafe {
                 unmap_shared(shm_ptr, bytes);
             }
@@ -292,25 +341,14 @@ fn bench_iffq(c: &mut Criterion) {
 
 fn bench_biffq(c: &mut Criterion) {
     c.bench_function("Biffq", |b| {
-        b.iter(|| {
-            assert!(RING_CAP.is_power_of_two());
-            // H_PARTITION_SIZE is 32 in biffq.rs
-            assert_eq!(
-                RING_CAP % 32,
-                0,
-                "RING_CAP must be a multiple of BIFFQ H_PARTITION_SIZE (32)"
-            );
-            assert!(
-                RING_CAP >= 2 * 32,
-                "RING_CAP must be >= 2 * BIFFQ H_PARTITION_SIZE (64)"
-            );
-
-            let bytes = BiffqQueue::<usize>::shared_size(RING_CAP);
+        b.iter_custom(|_iters| {
+            assert!(RING_CAP_GENERAL.is_power_of_two());
+            assert_eq!(RING_CAP_GENERAL % 32, 0);
+            assert!(RING_CAP_GENERAL >= 2 * 32);
+            let bytes = BiffqQueue::<usize>::shared_size(RING_CAP_GENERAL);
             let shm_ptr = unsafe { map_shared(bytes) };
-            let q = unsafe { BiffqQueue::init_in_shared(shm_ptr, RING_CAP) };
-
-            let dur = fork_and_run(q);
-
+            let q = unsafe { BiffqQueue::init_in_shared(shm_ptr, RING_CAP_GENERAL) };
+            let dur = fork_and_run(q, ITERS_GENERAL);
             unsafe {
                 unmap_shared(shm_ptr, bytes);
             }
@@ -321,16 +359,12 @@ fn bench_biffq(c: &mut Criterion) {
 
 fn bench_ffq(c: &mut Criterion) {
     c.bench_function("FFq", |b| {
-        b.iter(|| {
-            // FFQ does not have H_PARTITION_SIZE constraints, only power of two for capacity.
-            assert!(RING_CAP.is_power_of_two() && RING_CAP > 0);
-
-            let bytes = FfqQueue::<usize>::shared_size(RING_CAP);
+        b.iter_custom(|_iters| {
+            assert!(RING_CAP_GENERAL.is_power_of_two() && RING_CAP_GENERAL > 0);
+            let bytes = FfqQueue::<usize>::shared_size(RING_CAP_GENERAL);
             let shm_ptr = unsafe { map_shared(bytes) };
-            let q = unsafe { FfqQueue::init_in_shared(shm_ptr, RING_CAP) };
-
-            let dur = fork_and_run(q);
-
+            let q = unsafe { FfqQueue::init_in_shared(shm_ptr, RING_CAP_GENERAL) };
+            let dur = fork_and_run(q, ITERS_GENERAL);
             unsafe {
                 unmap_shared(shm_ptr, bytes);
             }
@@ -341,27 +375,26 @@ fn bench_ffq(c: &mut Criterion) {
 
 fn bench_llq(c: &mut Criterion) {
     c.bench_function("Llq", |b| {
-        b.iter(|| {
-            // Ensure capacity is valid for LLQ
-            let current_ring_cap = if RING_CAP <= LLQ_K_SLOTS {
-                let min_valid_cap = (LLQ_K_SLOTS + 1).next_power_of_two();
+        b.iter_custom(|_iters| {
+            let current_ring_cap = if RING_CAP_GENERAL <= K_CACHE_LINE_SLOTS {
+                let min_valid_cap = (K_CACHE_LINE_SLOTS + 1).next_power_of_two();
                 if min_valid_cap < 16 {
                     16
                 } else {
                     min_valid_cap
                 }
             } else {
-                RING_CAP.next_power_of_two()
+                RING_CAP_GENERAL.next_power_of_two()
             };
 
             assert!(current_ring_cap.is_power_of_two());
-            assert!(current_ring_cap > LLQ_K_SLOTS);
+            assert!(current_ring_cap > K_CACHE_LINE_SLOTS);
 
             let bytes = LlqQueue::<usize>::llq_shared_size(current_ring_cap);
             let shm_ptr = unsafe { map_shared(bytes) };
-            let q = unsafe { LlqQueue::init_in_shared(shm_ptr, current_ring_cap) };
+            let q_static = unsafe { LlqQueue::<usize>::init_in_shared(shm_ptr, current_ring_cap) };
 
-            let dur = fork_and_run(q);
+            let dur = fork_and_run(q_static, ITERS_GENERAL);
 
             unsafe {
                 unmap_shared(shm_ptr, bytes);
@@ -373,9 +406,8 @@ fn bench_llq(c: &mut Criterion) {
 
 fn bench_blq(c: &mut Criterion) {
     c.bench_function("Blq", |b| {
-        b.iter(|| {
-            // Ensure capacity is valid for BLQ
-            let current_ring_cap = if RING_CAP <= BLQ_K_SLOTS {
+        b.iter_custom(|_iters| {
+            let current_ring_cap = if RING_CAP_GENERAL <= BLQ_K_SLOTS {
                 let mut min_valid_cap = (BLQ_K_SLOTS + 1).next_power_of_two();
                 if min_valid_cap <= BLQ_K_SLOTS {
                     min_valid_cap = (BLQ_K_SLOTS + 1).next_power_of_two();
@@ -389,7 +421,7 @@ fn bench_blq(c: &mut Criterion) {
                     min_valid_cap
                 }
             } else {
-                RING_CAP.next_power_of_two()
+                RING_CAP_GENERAL.next_power_of_two()
             };
 
             assert!(current_ring_cap.is_power_of_two());
@@ -397,9 +429,9 @@ fn bench_blq(c: &mut Criterion) {
 
             let bytes = BlqQueue::<usize>::shared_size(current_ring_cap);
             let shm_ptr = unsafe { map_shared(bytes) };
-            let q = unsafe { BlqQueue::init_in_shared(shm_ptr, current_ring_cap) };
+            let q_static = unsafe { BlqQueue::<usize>::init_in_shared(shm_ptr, current_ring_cap) };
 
-            let dur = fork_and_run(q);
+            let dur = fork_and_run(q_static, ITERS_GENERAL);
 
             unsafe {
                 unmap_shared(shm_ptr, bytes);
@@ -411,14 +443,15 @@ fn bench_blq(c: &mut Criterion) {
 
 fn bench_sesd_jp(c: &mut Criterion) {
     c.bench_function("SesdJpSPSC", |b| {
-        b.iter(|| {
-            let pool_capacity = ITERS + 1000; // Extra buffer for safety
+        b.iter_custom(|_iters_arg_ignored| {
+            let pool_capacity = ITERS_GENERAL + 1000; // Extra buffer for safety
 
             let bytes = SesdJpSpscBenchWrapper::<usize>::shared_size(pool_capacity);
             let shm_ptr = unsafe { map_shared(bytes) };
-            let q = unsafe { SesdJpSpscBenchWrapper::init_in_shared(shm_ptr, pool_capacity) };
+            let q_shared: &'static SesdJpSpscBenchWrapper<usize> =
+                unsafe { SesdJpSpscBenchWrapper::init_in_shared(shm_ptr, pool_capacity) };
 
-            let dur = fork_and_run(q);
+            let dur = fork_and_run(q_shared, ITERS_GENERAL);
 
             unsafe {
                 unmap_shared(shm_ptr, bytes);
@@ -428,10 +461,10 @@ fn bench_sesd_jp(c: &mut Criterion) {
     });
 }
 
-// Generic fork-and-run helper with improved synchronization and error handling
-fn fork_and_run<Q>(q: &'static Q) -> std::time::Duration
+// Generic fork-and-run helper
+fn fork_and_run<Q>(q: &'static Q, iterations: usize) -> std::time::Duration
 where
-    Q: BenchSpscQueue<usize> + Sync,
+    Q: BenchSpscQueue<usize> + Sync + 'static,
 {
     let page_size = 4096;
     let sync_shm = unsafe {
@@ -455,132 +488,160 @@ where
     let sync_atomic_flag = unsafe { &*(sync_shm as *const AtomicU32) };
     sync_atomic_flag.store(0, Ordering::Relaxed);
 
-    match unsafe { fork() }.expect("fork failed") {
-        ForkResult::Child => {
+    match unsafe { fork() } {
+        Ok(ForkResult::Child) => {
             // Producer
             sync_atomic_flag.store(1, Ordering::Release);
             while sync_atomic_flag.load(Ordering::Acquire) < 2 {
                 std::hint::spin_loop();
             }
 
-            for i in 0..ITERS {
+            for i in 0..iterations {
                 while q.bench_push(i).is_err() {
-                    std::hint::spin_loop();
+                    // If queue is full, yield to allow consumer to progress.
+                    std::thread::yield_now();
                 }
             }
 
-            // Handle special flush requirements for queues with local buffers
             if let Some(mp_queue) =
                 (q as &dyn std::any::Any).downcast_ref::<MultiPushQueue<usize>>()
             {
-                // Flush MultiPushQueue's local buffer
-                for _attempt in 0..1000 {
-                    if mp_queue.local_count.load(Ordering::Relaxed) == 0 {
-                        break;
-                    }
-                    if mp_queue.flush() {
+                let mut attempts = 0;
+                while mp_queue.local_count.load(Ordering::Relaxed) > 0 && attempts < 10000 {
+                    if !mp_queue.flush() {
+                        std::thread::yield_now(); // Yield if flush fails
+                        attempts += 1;
+                    } else {
                         if mp_queue.local_count.load(Ordering::Relaxed) == 0 {
                             break;
                         }
+                        std::thread::yield_now();
+                        attempts += 1;
                     }
-                    std::hint::spin_loop();
                 }
-                if !PERFORMANCE_TEST && mp_queue.local_count.load(Ordering::Relaxed) > 0 {
+                if mp_queue.local_count.load(Ordering::Relaxed) > 0 && !PERFORMANCE_TEST {
                     eprintln!(
-                        "Warning: MultiPushQueue failed to flush all items. {} items remaining",
-                        mp_queue.local_count.load(Ordering::Relaxed)
-                    );
+                     "Warning (SPSC Producer): MultiPushQueue failed to flush all local items after {} attempts. {} items remaining in local_buf.",
+                     attempts,
+                     mp_queue.local_count.load(Ordering::Relaxed)
+                  );
                 }
             } else if let Some(biffq_queue) =
                 (q as &dyn std::any::Any).downcast_ref::<BiffqQueue<usize>>()
             {
-                // Flush BiffqQueue's local buffer
-                for _attempt in 0..1000 {
-                    if biffq_queue.flush_producer_buffer().is_ok() {
-                        break;
+                let mut attempts = 0;
+                while biffq_queue.prod.local_count.load(Ordering::Relaxed) > 0 && attempts < 10000 {
+                    match biffq_queue.flush_producer_buffer() {
+                        Ok(_published_count) => {
+                            if biffq_queue.prod.local_count.load(Ordering::Relaxed) == 0 {
+                                break;
+                            }
+                            std::thread::yield_now();
+                            attempts += 1;
+                        }
+                        Err(_) => {
+                            std::thread::yield_now();
+                            attempts += 1;
+                        }
                     }
-                    std::hint::spin_loop();
+                }
+                if biffq_queue.prod.local_count.load(Ordering::Relaxed) > 0 && !PERFORMANCE_TEST {
+                    eprintln!(
+                     "Warning (SPSC Producer): BiffqQueue failed to flush all local items after {} attempts. {} items remaining in local_buf.",
+                     attempts,
+                     biffq_queue.prod.local_count.load(Ordering::Relaxed)
+                  );
                 }
             }
-
             sync_atomic_flag.store(3, Ordering::Release);
             unsafe { libc::_exit(0) };
         }
-        ForkResult::Parent { child } => {
+        Ok(ForkResult::Parent { child }) => {
             // Consumer
             while sync_atomic_flag.load(Ordering::Acquire) < 1 {
                 std::hint::spin_loop();
             }
 
             sync_atomic_flag.store(2, Ordering::Release);
-
             let start_time = std::time::Instant::now();
             let mut consumed_count = 0;
 
-            while consumed_count < ITERS {
-                if sync_atomic_flag.load(Ordering::Acquire) == 3 {
-                    // Producer is done, try to pop any remaining items
-                    if q.bench_pop().is_err() {
+            if iterations > 0 {
+                loop {
+                    if consumed_count >= iterations {
                         break;
-                    } else {
-                        consumed_count += 1;
-                        if consumed_count == ITERS {
-                            break;
+                    }
+
+                    match q.bench_pop() {
+                        Ok(_item) => {
+                            consumed_count += 1;
+                        }
+                        Err(_) => {
+                            if sync_atomic_flag.load(Ordering::Acquire) == 3 {
+                                if q.bench_is_empty() {
+                                    break;
+                                }
+                                std::thread::yield_now(); // Yield if producer done but queue not empty
+                            } else {
+                                std::thread::yield_now(); // Yield if queue temporarily empty
+                            }
                         }
                     }
-                }
-
-                if let Ok(_item) = q.bench_pop() {
-                    consumed_count += 1;
-                } else {
-                    std::hint::spin_loop();
                 }
             }
 
             let duration = start_time.elapsed();
-
-            // Wait for child to properly exit
             while sync_atomic_flag.load(Ordering::Acquire) != 3 {
                 std::hint::spin_loop();
             }
-            let _ = waitpid(child, None).expect("waitpid failed");
+            waitpid(child, None).expect("SPSC waitpid failed");
 
             unsafe {
-                libc::munmap(sync_shm as *mut libc::c_void, page_size);
+                unmap_shared(sync_shm as *mut u8, page_size);
             }
 
-            if !PERFORMANCE_TEST && consumed_count != ITERS {
+            if !PERFORMANCE_TEST && consumed_count != iterations {
                 eprintln!(
-                    "Warning: Parent consumed {}/{} items. Queue type: {}",
+                    "Warning (SPSC Consumer): Consumed {}/{} items. Q: {}. Potential items missed.",
                     consumed_count,
-                    ITERS,
+                    iterations,
                     std::any::type_name::<Q>()
                 );
             }
             duration
         }
+        Err(e) => {
+            unsafe {
+                unmap_shared(sync_shm as *mut u8, page_size);
+            }
+            panic!("SPSC fork failed: {}", e);
+        }
     }
 }
 
-// Criterion setup with same parameters as your old benchmark
+// Criterion setup
 fn custom_criterion() -> Criterion {
     Criterion::default()
-        .warm_up_time(Duration::from_secs(5))
+        .warm_up_time(Duration::from_secs(2))
         .measurement_time(Duration::from_secs(15))
         .sample_size(10)
 }
 
 criterion_group! {
-    name = benches;
-    config = custom_criterion();
-    targets =
-        bench_unbounded,
-        bench_dspsc,
-        bench_dehnavi,
-        bench_iffq,
-        bench_biffq,
-        bench_ffq,
-        bench_llq,
-        bench_blq,
+   name = benches;
+   config = custom_criterion();
+   targets =
+      bench_sesd_jp,
+      bench_lamport,
+      bench_bqueue,
+      bench_mp,
+      bench_unbounded,
+      bench_dspsc,
+      bench_dehnavi,
+      bench_iffq,
+      bench_biffq,
+      bench_ffq,
+      bench_llq,
+      bench_blq,
 }
 criterion_main!(benches);

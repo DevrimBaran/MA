@@ -745,9 +745,9 @@ mod unbounded_tests {
 
     #[test]
     fn test_unbounded_basic() {
-        let shared_size = UnboundedQueue::<usize>::shared_size();
+        let shared_size = UnboundedQueue::<usize>::shared_size(8192);
         let mut memory = vec![0u8; shared_size];
-        let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr()) };
+        let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 8192) };
 
         queue.push(42).unwrap();
         assert_eq!(queue.pop().unwrap(), 42);
@@ -756,9 +756,9 @@ mod unbounded_tests {
 
     #[test]
     fn test_unbounded_segment_growth() {
-        let shared_size = UnboundedQueue::<usize>::shared_size();
+        let shared_size = UnboundedQueue::<usize>::shared_size(8192);
         let mut memory = vec![0u8; shared_size];
-        let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr()) };
+        let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 8192) };
 
         let num_items = 100000;
         for i in 0..num_items {
@@ -792,9 +792,9 @@ mod unbounded_tests {
         DROP_COUNT.store(0, Ordering::SeqCst);
 
         {
-            let shared_size = UnboundedQueue::<DropCounter>::shared_size();
+            let shared_size = UnboundedQueue::<DropCounter>::shared_size(8192);
             let mut memory = vec![0u8; shared_size];
-            let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr()) };
+            let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 8192) };
 
             let items_to_push = 70000;
 
@@ -818,9 +818,9 @@ mod unbounded_tests {
         DROP_COUNT.store(0, Ordering::SeqCst);
 
         {
-            let shared_size = UnboundedQueue::<DropCounter>::shared_size();
+            let shared_size = UnboundedQueue::<DropCounter>::shared_size(8192);
             let mut memory = vec![0u8; shared_size];
-            let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr()) };
+            let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 8192) };
 
             let items_to_push = 100;
             for i in 0..items_to_push {
@@ -850,9 +850,9 @@ mod unbounded_tests {
         const BUF_CAP: usize = 65536;
         const POOL_CAP: usize = 32;
 
-        let shared_size = UnboundedQueue::<usize>::shared_size();
+        let shared_size = UnboundedQueue::<usize>::shared_size(8192);
         let mut memory = vec![0u8; shared_size];
-        let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr()) };
+        let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 8192) };
 
         for batch in 0..10 {
             for i in 0..BUF_CAP - 100 {
@@ -903,9 +903,9 @@ mod unbounded_tests {
         DROP_COUNT.store(0, Ordering::SeqCst);
 
         {
-            let shared_size = UnboundedQueue::<TrackingItem>::shared_size();
+            let shared_size = UnboundedQueue::<TrackingItem>::shared_size(8192);
             let mut memory = vec![0u8; shared_size];
-            let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr()) };
+            let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 8192) };
 
             for i in 0..1000 {
                 queue.push(TrackingItem::new(i)).unwrap();
@@ -941,11 +941,11 @@ mod unbounded_tests {
             data: String,
         }
 
-        let shared_size = UnboundedQueue::<NeedsDrop>::shared_size();
+        let shared_size = UnboundedQueue::<NeedsDrop>::shared_size(8192);
         let mut memory = vec![0u8; shared_size];
 
         {
-            let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr()) };
+            let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 8192) };
 
             for i in 0..BUF_CAP - 1 {
                 queue
@@ -980,9 +980,9 @@ mod unbounded_tests {
     #[test]
     fn test_unbounded_drop_implementation() {
         {
-            let shared_size = UnboundedQueue::<()>::shared_size();
+            let shared_size = UnboundedQueue::<()>::shared_size(8192);
             let mut memory = vec![0u8; shared_size];
-            let queue = unsafe { UnboundedQueue::<()>::init_in_shared(memory.as_mut_ptr()) };
+            let queue = unsafe { UnboundedQueue::<()>::init_in_shared(memory.as_mut_ptr(), 8192) };
 
             for _ in 0..100000 {
                 queue.push(()).unwrap();
@@ -994,9 +994,10 @@ mod unbounded_tests {
         }
 
         {
-            let shared_size = UnboundedQueue::<Vec<u8>>::shared_size();
+            let shared_size = UnboundedQueue::<Vec<u8>>::shared_size(8192);
             let mut memory = vec![0u8; shared_size];
-            let queue = unsafe { UnboundedQueue::<Vec<u8>>::init_in_shared(memory.as_mut_ptr()) };
+            let queue =
+                unsafe { UnboundedQueue::<Vec<u8>>::init_in_shared(memory.as_mut_ptr(), 8192) };
 
             for i in 0..1000 {
                 queue.push(vec![i as u8; 100]).unwrap();
@@ -1008,9 +1009,10 @@ mod unbounded_tests {
         }
 
         {
-            let shared_size = UnboundedQueue::<String>::shared_size();
+            let shared_size = UnboundedQueue::<String>::shared_size(8192);
             let mut memory = vec![0u8; shared_size];
-            let queue = unsafe { UnboundedQueue::<String>::init_in_shared(memory.as_mut_ptr()) };
+            let queue =
+                unsafe { UnboundedQueue::<String>::init_in_shared(memory.as_mut_ptr(), 8192) };
 
             for batch in 0..5 {
                 for i in 0..1000 {
@@ -1029,9 +1031,10 @@ mod unbounded_tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         {
-            let shared_size = UnboundedQueue::<usize>::shared_size();
+            let shared_size = UnboundedQueue::<usize>::shared_size(8192);
             let mut memory = vec![0u8; shared_size];
-            let queue = unsafe { UnboundedQueue::<usize>::init_in_shared(memory.as_mut_ptr()) };
+            let queue =
+                unsafe { UnboundedQueue::<usize>::init_in_shared(memory.as_mut_ptr(), 8192) };
 
             unsafe {
                 queue._deallocate_segment(std::ptr::null_mut());
@@ -1039,9 +1042,10 @@ mod unbounded_tests {
         }
 
         {
-            let shared_size = UnboundedQueue::<usize>::shared_size();
+            let shared_size = UnboundedQueue::<usize>::shared_size(8192);
             let mut memory = vec![0u8; shared_size];
-            let queue = unsafe { UnboundedQueue::<usize>::init_in_shared(memory.as_mut_ptr()) };
+            let queue =
+                unsafe { UnboundedQueue::<usize>::init_in_shared(memory.as_mut_ptr(), 8192) };
 
             let original_size = queue.segment_mmap_size.load(Ordering::Acquire);
 
@@ -1057,12 +1061,12 @@ mod unbounded_tests {
         }
 
         {
-            let shared_size = UnboundedQueue::<String>::shared_size();
+            let shared_size = UnboundedQueue::<String>::shared_size(8192);
             let mut memory = vec![0u8; shared_size];
 
             {
                 let queue =
-                    unsafe { UnboundedQueue::<String>::init_in_shared(memory.as_mut_ptr()) };
+                    unsafe { UnboundedQueue::<String>::init_in_shared(memory.as_mut_ptr(), 8192) };
 
                 for i in 0..70000 {
                     if queue.push(format!("item_{}", i)).is_err() {
@@ -1093,10 +1097,11 @@ mod unbounded_tests {
             DROP_COUNT.store(0, Ordering::SeqCst);
 
             {
-                let shared_size = UnboundedQueue::<DropCounter>::shared_size();
+                let shared_size = UnboundedQueue::<DropCounter>::shared_size(8192);
                 let mut memory = vec![0u8; shared_size];
-                let queue =
-                    unsafe { UnboundedQueue::<DropCounter>::init_in_shared(memory.as_mut_ptr()) };
+                let queue = unsafe {
+                    UnboundedQueue::<DropCounter>::init_in_shared(memory.as_mut_ptr(), 8192)
+                };
 
                 for i in 0..1000 {
                     queue.push(DropCounter { _id: i }).unwrap();
@@ -1120,10 +1125,11 @@ mod unbounded_tests {
         }
 
         {
-            let shared_size = UnboundedQueue::<Vec<u8>>::shared_size();
+            let shared_size = UnboundedQueue::<Vec<u8>>::shared_size(8192);
             let mut memory = vec![0u8; shared_size];
 
-            let queue = unsafe { UnboundedQueue::<Vec<u8>>::init_in_shared(memory.as_mut_ptr()) };
+            let queue =
+                unsafe { UnboundedQueue::<Vec<u8>>::init_in_shared(memory.as_mut_ptr(), 8192) };
 
             for i in 0..100000 {
                 if queue.push(vec![i as u8; 10]).is_err() {
@@ -1161,10 +1167,10 @@ mod unbounded_tests {
         DROP_COUNT.store(0, Ordering::SeqCst);
 
         {
-            let shared_size = UnboundedQueue::<DropTracker>::shared_size();
+            let shared_size = UnboundedQueue::<DropTracker>::shared_size(8192);
             let mut memory = vec![0u8; shared_size];
             let queue =
-                unsafe { UnboundedQueue::<DropTracker>::init_in_shared(memory.as_mut_ptr()) };
+                unsafe { UnboundedQueue::<DropTracker>::init_in_shared(memory.as_mut_ptr(), 8192) };
 
             for i in 0..1000 {
                 queue.push(DropTracker { id: i }).unwrap();
@@ -1190,9 +1196,9 @@ mod unbounded_tests {
     fn test_unbounded_transition_item_pending() {
         const BUF_CAP: usize = 65536;
 
-        let shared_size = UnboundedQueue::<String>::shared_size();
+        let shared_size = UnboundedQueue::<String>::shared_size(8192);
         let mut memory = vec![0u8; shared_size];
-        let queue = unsafe { UnboundedQueue::<String>::init_in_shared(memory.as_mut_ptr()) };
+        let queue = unsafe { UnboundedQueue::<String>::init_in_shared(memory.as_mut_ptr(), 8192) };
 
         for i in 0..BUF_CAP - 2 {
             queue.push(format!("item_{}", i)).unwrap();
@@ -1214,9 +1220,9 @@ mod unbounded_tests {
     fn test_unbounded_transition_item_multiple_segments() {
         const BUF_CAP: usize = 65536;
 
-        let shared_size = UnboundedQueue::<usize>::shared_size();
+        let shared_size = UnboundedQueue::<usize>::shared_size(8192);
         let mut memory = vec![0u8; shared_size];
-        let queue = unsafe { UnboundedQueue::<usize>::init_in_shared(memory.as_mut_ptr()) };
+        let queue = unsafe { UnboundedQueue::<usize>::init_in_shared(memory.as_mut_ptr(), 8192) };
 
         let mut total_pushed = 0;
         for batch in 0..3 {
@@ -1255,9 +1261,9 @@ mod unbounded_tests {
     fn test_unbounded_segment_boundary_conditions() {
         const BUF_CAP: usize = 65536;
 
-        let shared_size = UnboundedQueue::<Vec<u8>>::shared_size();
+        let shared_size = UnboundedQueue::<Vec<u8>>::shared_size(8192);
         let mut memory = vec![0u8; shared_size];
-        let queue = unsafe { UnboundedQueue::<Vec<u8>>::init_in_shared(memory.as_mut_ptr()) };
+        let queue = unsafe { UnboundedQueue::<Vec<u8>>::init_in_shared(memory.as_mut_ptr(), 8192) };
 
         for i in 0..BUF_CAP - 1 {
             queue.push(vec![i as u8; 10]).unwrap();
@@ -1304,11 +1310,11 @@ mod unbounded_tests {
         {
             DROP_COUNT.store(0, Ordering::SeqCst);
 
-            let shared_size = UnboundedQueue::<DropCounter>::shared_size();
+            let shared_size = UnboundedQueue::<DropCounter>::shared_size(8192);
             let mut memory = vec![0u8; shared_size];
 
             {
-                let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr()) };
+                let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 8192) };
 
                 for i in 0..100 {
                     queue.push(DropCounter { value: i }).unwrap();
@@ -1641,10 +1647,10 @@ mod shared_memory_tests {
 
     #[test]
     fn test_unbounded_shared() {
-        let shared_size = UnboundedQueue::<usize>::shared_size();
+        let shared_size = UnboundedQueue::<usize>::shared_size(8192);
         let mut memory = vec![0u8; shared_size];
 
-        let queue = unsafe { UnboundedQueue::<usize>::init_in_shared(memory.as_mut_ptr()) };
+        let queue = unsafe { UnboundedQueue::<usize>::init_in_shared(memory.as_mut_ptr(), 8192) };
 
         queue.push(123).unwrap();
         assert_eq!(queue.pop().unwrap(), 123);
@@ -2305,7 +2311,7 @@ mod ipc_tests {
 
     #[test]
     fn test_unbounded_ipc() {
-        let shared_size = UnboundedQueue::<usize>::shared_size();
+        let shared_size = UnboundedQueue::<usize>::shared_size(8192);
         let sync_size = std::mem::size_of::<AtomicBool>() * 2;
         let sync_size = (sync_size + 63) & !63;
         let total_size = shared_size + sync_size + 128;
@@ -2322,7 +2328,7 @@ mod ipc_tests {
         let queue_ptr = unsafe { shm_ptr.add(sync_size) };
         let queue_ptr = ((queue_ptr as usize + 127) & !127) as *mut u8;
 
-        let queue = unsafe { UnboundedQueue::init_in_shared(queue_ptr) };
+        let queue = unsafe { UnboundedQueue::init_in_shared(queue_ptr, 8192) };
 
         const NUM_ITEMS: usize = 100000;
 

@@ -1,3 +1,4 @@
+// spinloop does not break wait-freedom since dehnavi proved in his paper that these loops hav a worst-case execution time
 use crate::SpscQueue;
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;

@@ -18,6 +18,7 @@ loom = "0.7"
 [features]
 bench = ["criterion"]
 debug_logging = []
+miri = []
 
 [[bench]]
 name = "spsc_bench"
@@ -39,3 +40,11 @@ debug = 2
 split-debuginfo = "off"
 strip = false
 lto = false
+
+[[test]]
+name = "miri_spsc_tests"
+required-features = ["miri"]
+
+[[test]]
+name = "miri_mpsc_tests"
+required-features = ["miri"]

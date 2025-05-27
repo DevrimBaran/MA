@@ -1,36 +1,14 @@
-// queues/tests/miri_spsc_tests.rs
-//! Miri-compatible tests for SPSC queue implementations
-//!
-//! Run with: cargo +nightly miri test --test miri_spsc_tests
-//!
-//! These tests avoid:
-//! - FFI calls (mmap, fork, etc.)
-//! - Large allocations
-//! - Excessive concurrency
-//! - Platform-specific code
-//!
-//! NOT TESTED IN MIRI (documented exclusions):
-//! - UnboundedQueue (uSPSC) - uses mmap with MAP_SHARED which Miri doesn't support
-//! - FfqQueue may show false positive data races in Miri - relies on cache-line synchronization
-//! - IPC tests using fork() and shared memory
-//! - Performance/timing tests
-//! - Large-scale stress tests (>10K items)
-//! - Tests requiring precise timing or sleep()
-//! - Tests using mmap/munmap directly
-
 #![cfg(miri)]
 
 use queues::{spsc::*, SpscQueue};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-// Smaller capacities for Miri
 const MIRI_SMALL_CAP: usize = 16;
 const MIRI_MEDIUM_CAP: usize = 64;
 const MIRI_LARGE_CAP: usize = 256;
 const MIRI_TEST_ITEMS: usize = 100;
 
-// Helper for aligned memory allocation with RAII cleanup
 struct AlignedMemory {
     ptr: *mut u8,
     layout: std::alloc::Layout,
@@ -66,7 +44,6 @@ impl AlignedMemory {
 
 impl Drop for AlignedMemory {
     fn drop(&mut self) {
-        // Run cleanup before deallocating memory
         if let Some(cleanup) = self.cleanup.take() {
             cleanup();
         }
@@ -77,13 +54,11 @@ impl Drop for AlignedMemory {
     }
 }
 
-// Basic queue tests with heap allocation
 mod miri_basic_tests {
     use super::*;
 
     #[test]
     fn miri_test_lamport() {
-        // Test 1: Basic push/pop
         {
             let queue = LamportQueue::<usize>::with_capacity(MIRI_SMALL_CAP);
 
@@ -96,10 +71,9 @@ mod miri_basic_tests {
             assert!(queue.empty());
         }
 
-        // Test 2: Fill and drain
         {
             let queue = LamportQueue::<usize>::with_capacity(MIRI_SMALL_CAP);
-            let items_to_push = MIRI_SMALL_CAP - 1; // Leave one slot
+            let items_to_push = MIRI_SMALL_CAP - 1;
 
             for i in 0..items_to_push {
                 assert!(queue.push(i).is_ok(), "Failed to push item {}", i);
@@ -114,7 +88,6 @@ mod miri_basic_tests {
             assert!(queue.empty());
         }
 
-        // Test 3: Simple concurrent test
         {
             let queue = Arc::new(LamportQueue::<usize>::with_capacity(MIRI_SMALL_CAP));
             let barrier = Arc::new(Barrier::new(2));
@@ -167,11 +140,6 @@ mod miri_basic_tests {
 
     #[test]
     fn miri_test_ffq() {
-        // NOTE: FfqQueue is the FastForward queue implementation
-        // It may show false positive data races in Miri because it relies on
-        // cache-line-based synchronization and temporal slipping
-
-        // Test 1: Basic push/pop
         {
             let queue = FfqQueue::<usize>::with_capacity(MIRI_MEDIUM_CAP);
 
@@ -183,11 +151,9 @@ mod miri_basic_tests {
             assert!(queue.empty());
         }
 
-        // Test 2: Fill and drain
         {
             let queue = FfqQueue::<usize>::with_capacity(MIRI_MEDIUM_CAP);
 
-            // Fill queue to capacity
             let mut pushed = 0;
             for i in 0..MIRI_MEDIUM_CAP {
                 if queue.push(i).is_ok() {
@@ -199,19 +165,16 @@ mod miri_basic_tests {
 
             assert!(pushed > 0, "Should push at least some items");
 
-            // Check if really full
             if pushed < MIRI_MEDIUM_CAP {
                 assert!(!queue.available());
             }
 
-            // Pop all items
             for i in 0..pushed {
                 assert_eq!(queue.pop().unwrap(), i);
             }
             assert!(queue.empty());
         }
 
-        // Test 3: Distance tracking
         {
             let queue = FfqQueue::<usize>::with_capacity(MIRI_MEDIUM_CAP);
 
@@ -229,7 +192,6 @@ mod miri_basic_tests {
 
     #[test]
     fn miri_test_bqueue() {
-        // Test 1: Basic push/pop
         {
             let queue = BQueue::<usize>::new(MIRI_MEDIUM_CAP);
 
@@ -241,11 +203,9 @@ mod miri_basic_tests {
             assert!(queue.empty());
         }
 
-        // Test 2: Fill and drain
         {
             let queue = BQueue::<usize>::new(MIRI_MEDIUM_CAP);
 
-            // BQueue may have complex capacity behavior due to batching
             let mut pushed = 0;
             for i in 0..MIRI_MEDIUM_CAP {
                 if queue.push(i).is_ok() {
@@ -262,10 +222,8 @@ mod miri_basic_tests {
             assert!(pushed > 0, "Should push at least some items");
             assert!(pushed <= MIRI_MEDIUM_CAP, "Should not exceed capacity");
 
-            // Try one more push - should fail if full
             assert!(queue.push(999).is_err() || pushed < MIRI_MEDIUM_CAP);
 
-            // Pop all items
             for i in 0..pushed {
                 assert_eq!(queue.pop().unwrap(), i);
             }
@@ -275,7 +233,6 @@ mod miri_basic_tests {
 
     #[test]
     fn miri_test_dehnavi() {
-        // Test 1: Basic operations
         {
             let queue = DehnaviQueue::<usize>::new(MIRI_SMALL_CAP);
 
@@ -287,23 +244,20 @@ mod miri_basic_tests {
             assert!(queue.empty());
         }
 
-        // Test 2: Lossy behavior
         {
             let queue = DehnaviQueue::<usize>::new(4);
 
-            // Overfill to test lossy behavior
             for i in 0..10 {
-                queue.push(i).unwrap(); // Always succeeds due to lossy nature
+                queue.push(i).unwrap();
             }
 
-            // Should see some items but not necessarily all due to lossy nature
             let mut items = Vec::new();
             while let Ok(item) = queue.pop() {
                 items.push(item);
             }
 
             assert!(!items.is_empty());
-            // Items should be in increasing order
+
             for window in items.windows(2) {
                 assert!(window[1] > window[0]);
             }
@@ -314,25 +268,20 @@ mod miri_basic_tests {
     fn miri_test_multipush() {
         let queue = MultiPushQueue::<usize>::with_capacity(MIRI_MEDIUM_CAP);
 
-        // Test basic operations
         queue.push(42).unwrap();
         assert!(!queue.empty());
 
-        // Force flush
         assert!(queue.flush());
 
         assert_eq!(queue.pop().unwrap(), 42);
         assert!(queue.empty());
 
-        // Test local buffer
         for i in 0..10 {
             queue.push(i).unwrap();
         }
 
-        // Verify items are buffered
         assert!(queue.local_count.load(std::sync::atomic::Ordering::Relaxed) > 0);
 
-        // Force flush
         assert!(queue.flush());
         assert_eq!(
             queue.local_count.load(std::sync::atomic::Ordering::Relaxed),
@@ -346,7 +295,7 @@ mod miri_basic_tests {
 
     #[test]
     fn miri_test_llq() {
-        let queue = LlqQueue::<usize>::with_capacity(128); // Must be > K_CACHE_LINE_SLOTS
+        let queue = LlqQueue::<usize>::with_capacity(128);
 
         assert!(queue.empty());
         assert!(queue.available());
@@ -356,7 +305,6 @@ mod miri_basic_tests {
         assert_eq!(queue.pop().unwrap(), 42);
         assert!(queue.empty());
 
-        // Test capacity
         let mut pushed = 0;
         for i in 0..100 {
             if queue.push(i).is_ok() {
@@ -376,7 +324,7 @@ mod miri_basic_tests {
 
     #[test]
     fn miri_test_blq() {
-        let queue = BlqQueue::<usize>::with_capacity(64); // Must be > K_CACHE_LINE_SLOTS
+        let queue = BlqQueue::<usize>::with_capacity(64);
 
         assert!(queue.empty());
         assert!(queue.available());
@@ -385,7 +333,6 @@ mod miri_basic_tests {
         assert_eq!(queue.pop().unwrap(), 42);
         assert!(queue.empty());
 
-        // Test batch operations
         let space = queue.blq_enq_space(10);
         assert!(space >= 10);
 
@@ -405,7 +352,7 @@ mod miri_basic_tests {
 
     #[test]
     fn miri_test_iffq() {
-        let queue = IffqQueue::<usize>::with_capacity(128); // Must be power of 2 and multiple of 32
+        let queue = IffqQueue::<usize>::with_capacity(128);
 
         assert!(queue.empty());
         assert!(queue.available());
@@ -414,12 +361,10 @@ mod miri_basic_tests {
         assert_eq!(queue.pop().unwrap(), 42);
         assert!(queue.empty());
 
-        // Test partition boundaries
         for i in 0..31 {
             queue.push(i).unwrap();
         }
 
-        // Should still have space
         assert!(queue.available());
         queue.push(31).unwrap();
 
@@ -430,26 +375,23 @@ mod miri_basic_tests {
 
     #[test]
     fn miri_test_biffq() {
-        let queue = BiffqQueue::<usize>::with_capacity(128); // Same requirements as IFFQ
+        let queue = BiffqQueue::<usize>::with_capacity(128);
 
         assert!(queue.empty());
         assert!(queue.available());
 
         queue.push(42).unwrap();
 
-        // Flush to ensure item is visible
         let _ = queue.flush_producer_buffer();
 
         assert!(!queue.empty());
         assert_eq!(queue.pop().unwrap(), 42);
         assert!(queue.empty());
 
-        // Test local buffer
         for i in 0..20 {
             queue.push(i).unwrap();
         }
 
-        // Check local buffer has items
         assert!(
             queue
                 .prod
@@ -458,7 +400,6 @@ mod miri_basic_tests {
                 > 0
         );
 
-        // Flush and verify
         let _ = queue.flush_producer_buffer();
         assert_eq!(
             queue
@@ -485,7 +426,6 @@ mod miri_basic_tests {
         assert_eq!(queue.pop().unwrap(), 42);
         assert!(queue.empty());
 
-        // Test dynamic allocation
         for i in 0..100 {
             queue.push(i).unwrap();
         }
@@ -496,17 +436,13 @@ mod miri_basic_tests {
         assert!(queue.empty());
     }
 
-    // UnboundedQueue uses mmap with MAP_SHARED which Miri doesn't support
-    // Skip this test in Miri
     #[cfg(not(miri))]
     #[test]
     fn miri_test_unbounded() {
-        // This test is skipped in Miri because UnboundedQueue uses mmap
         unreachable!("This test should not run under Miri");
     }
 }
 
-// Shared memory tests without mmap
 mod miri_shared_memory {
     use super::*;
 
@@ -523,7 +459,6 @@ mod miri_shared_memory {
         assert_eq!(queue.pop().unwrap(), 123);
         assert!(queue.empty());
 
-        // Test fill
         for i in 0..capacity - 1 {
             queue.push(i).unwrap();
         }
@@ -560,11 +495,9 @@ mod miri_shared_memory {
 
         let queue = unsafe { FfqQueue::<usize>::init_in_shared(mem_ptr, capacity) };
 
-        // Test basic operations
         queue.push(42).unwrap();
         assert_eq!(queue.pop().unwrap(), 42);
 
-        // Test temporal slipping features
         queue.push(1).unwrap();
         queue.push(2).unwrap();
         let distance = queue.distance();
@@ -584,7 +517,6 @@ mod miri_shared_memory {
         assert_eq!(queue.pop().unwrap(), 123);
         assert!(queue.empty());
 
-        // Test Dehnavi's wait-free property
         let mut pushed = 0;
         for i in 0..capacity * 2 {
             queue.push(i).unwrap();
@@ -603,7 +535,7 @@ mod miri_shared_memory {
 
     #[test]
     fn test_llq_shared_init() {
-        let capacity = 128; // Must be > K_CACHE_LINE_SLOTS
+        let capacity = 128;
         let shared_size = LlqQueue::<usize>::llq_shared_size(capacity);
         let mut memory = AlignedMemory::new(shared_size, 64);
         let mem_ptr = memory.as_mut_ptr();
@@ -632,7 +564,7 @@ mod miri_shared_memory {
 
     #[test]
     fn test_blq_shared_init() {
-        let capacity = 64; // Must be > K_CACHE_LINE_SLOTS
+        let capacity = 64;
         let shared_size = BlqQueue::<usize>::shared_size(capacity);
         let mut memory = AlignedMemory::new(shared_size, 64);
         let mem_ptr = memory.as_mut_ptr();
@@ -646,7 +578,7 @@ mod miri_shared_memory {
 
     #[test]
     fn test_iffq_shared_init() {
-        let capacity = 128; // Power of 2 and multiple of H_PARTITION_SIZE
+        let capacity = 128;
         let shared_size = IffqQueue::<usize>::shared_size(capacity);
         let mut memory = AlignedMemory::new(shared_size, 64);
         let mem_ptr = memory.as_mut_ptr();
@@ -660,7 +592,7 @@ mod miri_shared_memory {
 
     #[test]
     fn test_biffq_shared_init() {
-        let capacity = 128; // Power of 2 and multiple of H_PARTITION_SIZE
+        let capacity = 128;
         let shared_size = BiffqQueue::<usize>::shared_size(capacity);
         let mut memory = AlignedMemory::new(shared_size, 64);
         let mem_ptr = memory.as_mut_ptr();
@@ -672,7 +604,6 @@ mod miri_shared_memory {
         assert_eq!(queue.pop().unwrap(), 123);
         assert!(queue.empty());
 
-        // Ensure buffer is flushed
         let _ = queue.flush_producer_buffer();
         assert_eq!(
             queue
@@ -697,7 +628,6 @@ mod miri_shared_memory {
         assert_eq!(queue.pop().unwrap(), 123);
         assert!(queue.empty());
 
-        // Ensure local buffer is empty
         assert_eq!(
             queue.local_count.load(std::sync::atomic::Ordering::Relaxed),
             0
@@ -720,7 +650,6 @@ mod miri_shared_memory {
 
         let mut pushed = 0;
         for i in 0..pool_capacity - 10 {
-            // Leave some buffer
             match queue.push(i) {
                 Ok(_) => pushed += 1,
                 Err(_) => break,
@@ -762,17 +691,8 @@ mod miri_shared_memory {
         queue.push(999).unwrap();
         assert_eq!(queue.pop().unwrap(), 999);
     }
-
-    // UnboundedQueue uses mmap with MAP_SHARED which Miri doesn't support
-    // Skip this test in Miri
-    #[cfg(not(miri))]
-    #[test]
-    fn test_unbounded_shared_init() {
-        unreachable!("This test should not run under Miri");
-    }
 }
 
-// Special queue features that need careful handling
 mod miri_special_features {
     use super::*;
 
@@ -780,22 +700,18 @@ mod miri_special_features {
     fn test_multipush_local_buffer() {
         let queue = MultiPushQueue::<usize>::with_capacity(MIRI_MEDIUM_CAP);
 
-        // Push items to local buffer
         for i in 0..10 {
             queue.push(i).unwrap();
         }
 
-        // Verify local buffer has items
         assert!(queue.local_count.load(std::sync::atomic::Ordering::Relaxed) > 0);
 
-        // Force flush
         assert!(queue.flush());
         assert_eq!(
             queue.local_count.load(std::sync::atomic::Ordering::Relaxed),
             0
         );
 
-        // Verify items
         for i in 0..10 {
             assert_eq!(queue.pop().unwrap(), i);
         }
@@ -805,18 +721,15 @@ mod miri_special_features {
     fn test_multipush_automatic_flush() {
         let queue = MultiPushQueue::<usize>::with_capacity(MIRI_LARGE_CAP);
 
-        // Push exactly LOCAL_BUF (32) items to trigger automatic flush
         for i in 0..32 {
             queue.push(i).unwrap();
         }
 
-        // Should have automatically flushed
         assert_eq!(
             queue.local_count.load(std::sync::atomic::Ordering::Relaxed),
             0
         );
 
-        // All items should be in main queue
         for i in 0..32 {
             assert_eq!(queue.pop().unwrap(), i);
         }
@@ -826,12 +739,10 @@ mod miri_special_features {
     fn test_biffq_producer_buffer() {
         let queue = BiffqQueue::<usize>::with_capacity(128);
 
-        // Fill local buffer
         for i in 0..20 {
             queue.push(i).unwrap();
         }
 
-        // Check local buffer has items
         assert!(
             queue
                 .prod
@@ -840,7 +751,6 @@ mod miri_special_features {
                 > 0
         );
 
-        // Flush to shared buffer
         let flushed = queue.flush_producer_buffer().unwrap();
         assert!(flushed > 0);
         assert_eq!(
@@ -851,7 +761,6 @@ mod miri_special_features {
             0
         );
 
-        // Consume items
         for i in 0..20 {
             assert_eq!(queue.pop().unwrap(), i);
         }
@@ -861,12 +770,10 @@ mod miri_special_features {
     fn test_biffq_automatic_flush() {
         let queue = BiffqQueue::<usize>::with_capacity(128);
 
-        // Push exactly LOCAL_BATCH_SIZE (32) items to trigger automatic flush
         for i in 0..32 {
             queue.push(i).unwrap();
         }
 
-        // Should have some items flushed
         assert!(!queue.empty());
 
         let mut count = 0;
@@ -874,7 +781,6 @@ mod miri_special_features {
             count += 1;
         }
 
-        // Flush any remaining
         let _ = queue.flush_producer_buffer();
 
         while queue.pop().is_ok() {
@@ -888,21 +794,18 @@ mod miri_special_features {
     fn test_dehnavi_lossy() {
         let queue = DehnaviQueue::<usize>::new(4);
 
-        // Overfill to test lossy behavior
         for i in 0..10 {
             queue.push(i).unwrap();
         }
 
-        // Should see some items, but not necessarily all
         let mut items = Vec::new();
         while let Ok(item) = queue.pop() {
             items.push(item);
         }
 
         assert!(!items.is_empty());
-        assert!(items.len() <= 4); // At most capacity items
+        assert!(items.len() <= 4);
 
-        // Items should be in increasing order
         for window in items.windows(2) {
             assert!(window[1] > window[0]);
         }
@@ -917,11 +820,8 @@ mod miri_special_features {
         let distance = queue.distance();
         assert_eq!(distance, 2);
 
-        // Note: adjust_slip uses timing which Miri doesn't handle well
-        // Just verify it doesn't crash
         queue.adjust_slip(100);
 
-        // Clean up
         let _ = queue.pop();
         let _ = queue.pop();
     }
@@ -930,7 +830,6 @@ mod miri_special_features {
     fn test_blq_batch_operations() {
         let queue = BlqQueue::<usize>::with_capacity(128);
 
-        // Test batch enqueue
         let space = queue.blq_enq_space(10);
         assert!(space >= 10);
 
@@ -939,7 +838,6 @@ mod miri_special_features {
         }
         queue.blq_enq_publish();
 
-        // Test batch dequeue
         let available = queue.blq_deq_space(10);
         assert_eq!(available, 10);
 
@@ -955,12 +853,10 @@ mod miri_special_features {
     fn test_dspsc_dynamic_allocation() {
         let queue = DynListQueue::<usize>::with_capacity(MIRI_MEDIUM_CAP);
 
-        // Push more items than pre-allocated nodes
         for i in 0..100 {
             queue.push(i).unwrap();
         }
 
-        // Should allocate new nodes dynamically
         for i in 0..100 {
             assert_eq!(queue.pop().unwrap(), i);
         }
@@ -968,8 +864,6 @@ mod miri_special_features {
         assert!(queue.empty());
     }
 
-    // UnboundedQueue uses mmap with MAP_SHARED which Miri doesn't support
-    // Skip this test in Miri
     #[cfg(not(miri))]
     #[test]
     fn test_unbounded_segment_growth() {
@@ -977,7 +871,6 @@ mod miri_special_features {
     }
 }
 
-// Test with types that need drop
 mod miri_drop_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1002,24 +895,19 @@ mod miri_drop_tests {
         {
             let queue = LamportQueue::<DropCounter>::with_capacity(MIRI_SMALL_CAP);
 
-            // Push items
             for i in 0..5 {
                 queue.push(DropCounter { _value: i }).unwrap();
             }
 
-            // Pop some
             for _ in 0..2 {
                 drop(queue.pop().unwrap());
             }
 
             assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 2);
-            // Queue drops here, should drop remaining 3 items
         }
 
-        // Give time for drops
         thread::yield_now();
 
-        // At least the 2 explicitly dropped items should be counted
         assert!(DROP_COUNT.load(Ordering::SeqCst) >= 2);
     }
 
@@ -1027,24 +915,19 @@ mod miri_drop_tests {
     fn test_drop_with_strings() {
         let queue = BQueue::<String>::new(MIRI_MEDIUM_CAP);
 
-        // Push strings (which allocate)
         for i in 0..10 {
             queue.push(format!("item_{}", i)).unwrap();
         }
 
-        // Pop half
         for _ in 0..5 {
             let _ = queue.pop().unwrap();
         }
-
-        // Queue drops here with remaining strings
     }
 
     #[test]
     fn test_drop_in_buffered_queues() {
         DROP_COUNT.store(0, Ordering::SeqCst);
 
-        // Test MultiPushQueue
         {
             let queue = MultiPushQueue::<DropCounter>::with_capacity(MIRI_MEDIUM_CAP);
 
@@ -1052,26 +935,19 @@ mod miri_drop_tests {
                 queue.push(DropCounter { _value: i }).unwrap();
             }
 
-            // Items still in local buffer
             assert!(queue.local_count.load(Ordering::Relaxed) > 0);
 
-            // Manually flush before drop to ensure items are in main queue
             queue.flush();
 
-            // Pop a few items
             for _ in 0..5 {
                 drop(queue.pop().unwrap());
             }
 
-            // Check drops so far
             assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 5);
-
-            // Queue drops here, should drop remaining 5 items
         }
 
         thread::yield_now();
 
-        // Should have dropped all 10 items (5 explicit + 5 on queue drop)
         let drops_after_multipush = DROP_COUNT.load(Ordering::SeqCst);
         assert!(
             drops_after_multipush >= 5,
@@ -1080,7 +956,6 @@ mod miri_drop_tests {
 
         DROP_COUNT.store(0, Ordering::SeqCst);
 
-        // Test BiffqQueue
         {
             let queue = BiffqQueue::<DropCounter>::with_capacity(128);
 
@@ -1088,26 +963,19 @@ mod miri_drop_tests {
                 queue.push(DropCounter { _value: i }).unwrap();
             }
 
-            // Items still in local buffer
             assert!(queue.prod.local_count.load(Ordering::Relaxed) > 0);
 
-            // Flush buffer
             let _ = queue.flush_producer_buffer();
 
-            // Pop a few items
             for _ in 0..5 {
                 drop(queue.pop().unwrap());
             }
 
-            // Check drops so far
             assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 5);
-
-            // Queue drops here, should drop remaining 5 items
         }
 
         thread::yield_now();
 
-        // Should have dropped all items
         let final_drops = DROP_COUNT.load(Ordering::SeqCst);
         assert!(
             final_drops >= 5,
@@ -1116,13 +984,11 @@ mod miri_drop_tests {
     }
 }
 
-// Memory safety tests
 mod miri_memory_safety {
     use super::*;
 
     #[test]
     fn test_shared_memory_bounds() {
-        // Test that we don't write outside allocated memory
         let capacity = 32;
         let shared_size = LamportQueue::<u64>::shared_size(capacity);
         let mut memory = AlignedMemory::new(shared_size, 64);
@@ -1130,7 +996,6 @@ mod miri_memory_safety {
 
         let queue = unsafe { LamportQueue::<u64>::init_in_shared(mem_ptr, capacity) };
 
-        // Fill to capacity - 1
         let mut pushed = 0;
         for i in 0..capacity {
             if queue.push(i as u64).is_ok() {
@@ -1142,10 +1007,8 @@ mod miri_memory_safety {
 
         assert_eq!(pushed, capacity - 1);
 
-        // Try to push more (should fail without corrupting memory)
         assert!(queue.push(999).is_err());
 
-        // Drain queue
         for _ in 0..pushed {
             queue.pop().unwrap();
         }
@@ -1158,7 +1021,6 @@ mod miri_memory_safety {
 
         let queue = LamportQueue::<ZeroSized>::with_capacity(32);
 
-        // ZSTs should work correctly
         for _ in 0..10 {
             queue.push(ZeroSized).unwrap();
         }
@@ -1172,7 +1034,7 @@ mod miri_memory_safety {
     fn test_large_types() {
         #[derive(Clone, Debug, PartialEq)]
         struct LargeType {
-            data: [u64; 32], // Smaller than non-Miri test but still large
+            data: [u64; 32],
         }
 
         let queue = LamportQueue::<LargeType>::with_capacity(8);
@@ -1184,9 +1046,6 @@ mod miri_memory_safety {
 
     #[test]
     fn test_alignment_requirements() {
-        // Test queues with different alignment requirements
-
-        // 64-byte aligned queue
         {
             let shared_size = LamportQueue::<usize>::shared_size(32);
             let mut memory = AlignedMemory::new(shared_size, 64);
@@ -1199,7 +1058,6 @@ mod miri_memory_safety {
             assert_eq!(queue.pop().unwrap(), 42);
         }
 
-        // 128-byte aligned queue (skip UnboundedQueue in Miri)
         #[cfg(not(miri))]
         {
             let shared_size = UnboundedQueue::<usize>::shared_size(64);
@@ -1213,7 +1071,6 @@ mod miri_memory_safety {
             assert_eq!(queue.pop().unwrap(), 42);
         }
 
-        // Test DynListQueue with 128-byte alignment instead
         #[cfg(miri)]
         {
             let shared_size = DynListQueue::<usize>::shared_size(64);
@@ -1229,14 +1086,13 @@ mod miri_memory_safety {
     }
 }
 
-// Concurrency tests (limited for Miri performance)
 mod miri_concurrency {
     use super::*;
 
     #[test]
     fn test_concurrent_small() {
         let queue = Arc::new(LamportQueue::<usize>::with_capacity(64));
-        let items = 20; // Small number for Miri
+        let items = 20;
 
         let q1 = queue.clone();
         let producer = thread::spawn(move || {
@@ -1265,13 +1121,11 @@ mod miri_concurrency {
         producer.join().unwrap();
         let sum = consumer.join().unwrap();
 
-        // Sum of 0..20 = 190
         assert_eq!(sum, (items - 1) * items / 2);
     }
 
     #[test]
     fn test_concurrent_buffered_queues() {
-        // Test MultiPushQueue with concurrency
         {
             let queue = Arc::new(MultiPushQueue::<usize>::with_capacity(128));
             let items = 50;
@@ -1281,7 +1135,7 @@ mod miri_concurrency {
                 for i in 0..items {
                     q_prod.push(i).unwrap();
                 }
-                // Ensure flush
+
                 q_prod.flush();
             });
 
@@ -1309,12 +1163,9 @@ mod miri_concurrency {
             let received = consumer.join().unwrap();
 
             assert_eq!(received.len(), items);
-            // Note: order might not be preserved due to buffering
         }
     }
 
-    // Skip concurrent test for FfqQueue in Miri due to false positive data race detection
-    // FfqQueue (FastForward) relies on cache-line synchronization which Miri doesn't understand
     #[cfg(not(miri))]
     #[test]
     fn test_concurrent_ffq() {
@@ -1354,12 +1205,10 @@ mod miri_concurrency {
 
     #[test]
     fn test_concurrent_multiple_queue_types() {
-        // Test only BlqQueue in Miri to avoid false positives
         let blq = Arc::new(BlqQueue::<usize>::with_capacity(64));
 
         let items = 10;
 
-        // BLQ producer/consumer
         let blq_prod = blq.clone();
         let blq_producer = thread::spawn(move || {
             for i in 0..items {
@@ -1384,7 +1233,6 @@ mod miri_concurrency {
             sum
         });
 
-        // Join threads
         blq_producer.join().unwrap();
         let blq_sum = blq_consumer.join().unwrap();
 
@@ -1393,14 +1241,12 @@ mod miri_concurrency {
     }
 }
 
-// Test queues that need special initialization
 mod miri_special_init {
     use super::*;
 
     #[test]
     fn test_llq_init() {
-        // LLQ has special capacity requirements
-        let capacity = 128; // Must be > K_CACHE_LINE_SLOTS and power of 2
+        let capacity = 128;
         let queue = LlqQueue::<usize>::with_capacity(capacity);
 
         queue.push(42).unwrap();
@@ -1409,11 +1255,9 @@ mod miri_special_init {
 
     #[test]
     fn test_blq_init() {
-        // BLQ also has special requirements
-        let capacity = 64; // Must be > K_CACHE_LINE_SLOTS
+        let capacity = 64;
         let queue = BlqQueue::<usize>::with_capacity(capacity);
 
-        // Test batch operations
         queue.blq_enq_local(1).unwrap();
         queue.blq_enq_local(2).unwrap();
         queue.blq_enq_publish();
@@ -1425,7 +1269,6 @@ mod miri_special_init {
 
     #[test]
     fn test_iffq_init() {
-        // IFFQ requires capacity to be power of 2 and multiple of H_PARTITION_SIZE
         let capacity = 128;
         let queue = IffqQueue::<usize>::with_capacity(capacity);
 
@@ -1435,7 +1278,6 @@ mod miri_special_init {
 
     #[test]
     fn test_biffq_init() {
-        // BIFFQ has similar requirements to IFFQ
         let capacity = 128;
         let queue = BiffqQueue::<usize>::with_capacity(capacity);
 
@@ -1446,7 +1288,6 @@ mod miri_special_init {
 
     #[test]
     fn test_sesd_wrapper_init() {
-        // SESD wrapper needs pool capacity
         let pool_capacity = 100;
         let shared_size = SesdJpSpscBenchWrapper::<usize>::shared_size(pool_capacity);
         let mut memory = AlignedMemory::new(shared_size, 64);
@@ -1460,7 +1301,6 @@ mod miri_special_init {
     }
 }
 
-// Error handling tests
 mod miri_error_handling {
     use super::*;
 
@@ -1479,21 +1319,18 @@ mod miri_error_handling {
     #[test]
     #[should_panic(expected = "Capacity must be greater than K_CACHE_LINE_SLOTS")]
     fn test_llq_small_capacity() {
-        let _ = LlqQueue::<usize>::with_capacity(4); // Too small
+        let _ = LlqQueue::<usize>::with_capacity(4);
     }
 
     #[test]
     #[should_panic(expected = "Capacity must be at least 2 * H_PARTITION_SIZE")]
     fn test_iffq_invalid_capacity() {
-        // Too small - less than 2 * H_PARTITION_SIZE (64)
         let _ = IffqQueue::<usize>::with_capacity(32);
     }
 
     #[test]
     #[should_panic(expected = "Capacity must be a power of two")]
     fn test_iffq_invalid_capacity_not_power_of_two() {
-        // Not a power of two (96 is not a power of 2)
-        // This check happens before the multiple check
         let _ = IffqQueue::<usize>::with_capacity(96);
     }
 
@@ -1503,9 +1340,8 @@ mod miri_error_handling {
 
         queue.push("first".to_string()).unwrap();
 
-        // Should fail on full queue
         match queue.push("second".to_string()) {
-            Err(_) => {} // Expected
+            Err(_) => {}
             Ok(_) => panic!("Push should have failed on full queue"),
         }
     }
@@ -1514,18 +1350,15 @@ mod miri_error_handling {
     fn test_pop_error_handling() {
         let queue = BQueue::<usize>::new(16);
 
-        // Pop from empty queue should fail
         assert!(queue.pop().is_err());
 
         queue.push(42).unwrap();
         assert_eq!(queue.pop().unwrap(), 42);
 
-        // Should fail again when empty
         assert!(queue.pop().is_err());
     }
 }
 
-// Additional edge cases
 mod miri_edge_cases {
     use super::*;
 
@@ -1533,7 +1366,6 @@ mod miri_edge_cases {
     fn test_alternating_push_pop() {
         let queue = LamportQueue::<usize>::with_capacity(4);
 
-        // Alternating push/pop pattern
         for i in 0..20 {
             queue.push(i).unwrap();
             assert_eq!(queue.pop().unwrap(), i);
@@ -1546,22 +1378,18 @@ mod miri_edge_cases {
     fn test_wraparound() {
         let queue = FfqQueue::<usize>::with_capacity(8);
 
-        // Fill half
         for i in 0..4 {
             queue.push(i).unwrap();
         }
 
-        // Pop half
         for i in 0..4 {
             assert_eq!(queue.pop().unwrap(), i);
         }
 
-        // Push more to cause wraparound
         for i in 4..12 {
             queue.push(i).unwrap();
         }
 
-        // Pop all
         for i in 4..12 {
             assert_eq!(queue.pop().unwrap(), i);
         }
@@ -1571,7 +1399,6 @@ mod miri_edge_cases {
     fn test_queue_state_transitions() {
         let queue = BQueue::<usize>::new(16);
 
-        // Empty -> Has items
         assert!(queue.empty());
         assert!(queue.available());
 
@@ -1579,8 +1406,7 @@ mod miri_edge_cases {
         assert!(!queue.empty());
         assert!(queue.available());
 
-        // Fill to capacity (BQueue uses capacity - 1)
-        let mut pushed = 1; // Already pushed 1
+        let mut pushed = 1;
         for i in 2..16 {
             if queue.push(i).is_ok() {
                 pushed += 1;
@@ -1591,11 +1417,8 @@ mod miri_edge_cases {
 
         println!("Pushed {} items to BQueue with capacity 16", pushed);
 
-        // Should have some items
         assert!(!queue.empty());
 
-        // BQueue might still report available even when nearly full due to batching
-        // Just verify we can't push many more items
         let mut extra_pushed = 0;
         for i in 100..110 {
             if queue.push(i).is_ok() {
@@ -1611,7 +1434,6 @@ mod miri_edge_cases {
             "Should not be able to push many more items when nearly full"
         );
 
-        // Back to empty
         let mut popped = 0;
         while queue.pop().is_ok() {
             popped += 1;
@@ -1624,10 +1446,8 @@ mod miri_edge_cases {
     }
 }
 
-// Additional safety tests
 #[test]
 fn test_multiple_queues() {
-    // Ensure multiple queues don't interfere
     let q1 = LamportQueue::<u32>::with_capacity(32);
     let q2 = LamportQueue::<u32>::with_capacity(32);
 
@@ -1640,37 +1460,30 @@ fn test_multiple_queues() {
 
 #[test]
 fn test_arc_safety() {
-    // Test Arc doesn't cause issues
     let queue = Arc::new(BQueue::<i32>::new(64));
     let q1 = queue.clone();
     let q2 = queue.clone();
 
     drop(q1);
 
-    // q2 should still work
     q2.push(42).unwrap();
     assert_eq!(q2.pop().unwrap(), 42);
 }
 
 #[test]
 fn test_different_types() {
-    // Test with different types to ensure generic implementation works
-
-    // Primitive types
     {
         let q_u8 = LamportQueue::<u8>::with_capacity(16);
         q_u8.push(255u8).unwrap();
         assert_eq!(q_u8.pop().unwrap(), 255u8);
     }
 
-    // Box types
     {
         let q_box = FfqQueue::<Box<usize>>::with_capacity(16);
         q_box.push(Box::new(42)).unwrap();
         assert_eq!(*q_box.pop().unwrap(), 42);
     }
 
-    // Option types
     {
         let q_opt = BQueue::<Option<String>>::new(16);
         q_opt.push(Some("hello".to_string())).unwrap();

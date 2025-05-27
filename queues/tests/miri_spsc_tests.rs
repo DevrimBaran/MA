@@ -1895,13 +1895,12 @@ mod miri_additional_concurrent_tests {
         assert!(queue.empty());
     }
 
-    // Additional concurrent tests for queue types that were missing
     #[test]
     #[ignore = "FFQ has race conditions in concurrent scenarios detected by Miri"]
     fn test_concurrent_ffq() {
         // FFQ (FastForward Queue) has a race condition when producer and consumer
         // access the same slot simultaneously. The algorithm embeds synchronization
-        // in the slots, which can cause data races.
+        // in the slots, which can cause data races. Miri does not look for higher level alg correctnes but rather at memory location level
         let queue = Arc::new(FfqQueue::<usize>::with_capacity(64));
         let barrier = Arc::new(Barrier::new(2));
         let items_to_send = 50;
@@ -2023,12 +2022,6 @@ mod miri_additional_concurrent_tests {
     }
 }
 
-// Note: The following tests cannot be added to Miri:
-// 1. IPC tests using fork() - Miri doesn't support fork()
-// 2. UnboundedQueue tests - These use mmap() which Miri doesn't support
-// 3. Tests with explicit timing/sleep - Miri doesn't support time-based operations accurately
-
-// Additional tests for comprehensive coverage
 mod miri_capacity_tests {
     use super::*;
 

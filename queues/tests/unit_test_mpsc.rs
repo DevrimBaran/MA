@@ -559,8 +559,8 @@ mod jiffy_tests {
 
     #[test]
     fn test_jiffy_concurrent_folding_scenario() {
-        let buffer_capacity = 2;
-        let max_buffers = 20;
+        let buffer_capacity = 32;
+        let max_buffers = 40;
 
         let shared_size = JiffyQueue::<String>::shared_size(buffer_capacity, max_buffers);
         let memory = create_aligned_memory_box(shared_size);

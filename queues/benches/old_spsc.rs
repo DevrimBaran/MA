@@ -25,7 +25,7 @@ use queues::spsc::llq::{LlqQueue, K_CACHE_LINE_SLOTS};
 
 const PERFORMANCE_TEST: bool = false;
 const RING_CAP_GENERAL: usize = 65536;
-const ITERS_GENERAL: usize = 40_000_000;
+const ITERS_GENERAL: usize = 35_000_000;
 
 // Helper trait for benchmarking SPSC-like queues
 trait BenchSpscQueue<T: Send>: Send + Sync + 'static {

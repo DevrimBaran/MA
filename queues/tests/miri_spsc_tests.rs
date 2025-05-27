@@ -34,6 +34,7 @@ const MIRI_TEST_ITEMS: usize = 100;
 struct AlignedMemory {
     ptr: *mut u8,
     layout: std::alloc::Layout,
+    cleanup: Option<Box<dyn FnOnce()>>,
 }
 
 impl AlignedMemory {
@@ -45,8 +46,17 @@ impl AlignedMemory {
             if ptr.is_null() {
                 std::alloc::handle_alloc_error(layout);
             }
-            Self { ptr, layout }
+            Self {
+                ptr,
+                layout,
+                cleanup: None,
+            }
         }
+    }
+
+    fn with_cleanup<F: FnOnce() + 'static>(mut self, cleanup: F) -> Self {
+        self.cleanup = Some(Box::new(cleanup));
+        self
     }
 
     fn as_mut_ptr(&mut self) -> *mut u8 {
@@ -56,6 +66,11 @@ impl AlignedMemory {
 
 impl Drop for AlignedMemory {
     fn drop(&mut self) {
+        // Run cleanup before deallocating memory
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+
         unsafe {
             std::alloc::dealloc(self.ptr, self.layout);
         }
@@ -726,7 +741,7 @@ mod miri_shared_memory {
     fn test_dspsc_shared_init() {
         let capacity = MIRI_MEDIUM_CAP;
         let shared_size = DynListQueue::<usize>::shared_size(capacity);
-        let mut memory = AlignedMemory::new(shared_size, 128); // DynListQueue uses 128-byte alignment
+        let mut memory = AlignedMemory::new(shared_size, 128);
         let mem_ptr = memory.as_mut_ptr();
 
         let queue = unsafe { DynListQueue::<usize>::init_in_shared(mem_ptr, capacity) };
@@ -735,7 +750,6 @@ mod miri_shared_memory {
         assert_eq!(queue.pop().unwrap(), 123);
         assert!(queue.empty());
 
-        // Test multiple items
         for i in 0..50 {
             queue.push(i).unwrap();
         }
@@ -744,6 +758,9 @@ mod miri_shared_memory {
             assert_eq!(queue.pop().unwrap(), i);
         }
         assert!(queue.empty());
+
+        queue.push(999).unwrap();
+        assert_eq!(queue.pop().unwrap(), 999);
     }
 
     // UnboundedQueue uses mmap with MAP_SHARED which Miri doesn't support

@@ -353,26 +353,27 @@ impl<T: Send + 'static> SpscQueue<T> for BiffqQueue<T> {
 
 impl<T: Send + 'static> Drop for BiffqQueue<T> {
     fn drop(&mut self) {
-        if self.owns_buffer || !(*self.prod.local_buffer.get_mut()).as_mut_ptr().is_null() {
-            let local_count_val = *self.prod.local_count.get_mut();
-            if local_count_val > 0 {
+        if self.owns_buffer {
+            // Flush any items in local buffer
+            let local_count = *self.prod.local_count.get_mut();
+            if local_count > 0 {
                 let _ = self.publish_batch_internal();
             }
-        }
 
-        if self.owns_buffer {
+            // Drop items still in local buffer after flush attempt
             if std::mem::needs_drop::<T>() {
-                let local_count = *self.prod.local_count.get_mut();
-                let local_buf_ptr_mut = (*self.prod.local_buffer.get_mut()).as_mut_ptr();
-                for i in 0..local_count {
+                let remaining_local = *self.prod.local_count.get_mut();
+                if remaining_local > 0 {
                     unsafe {
-                        let mut item_mu = ptr::read(local_buf_ptr_mut.add(i));
-                        item_mu.assume_init_drop();
+                        let local_buf_ptr = (*self.prod.local_buffer.get_mut()).as_mut_ptr();
+                        for i in 0..remaining_local {
+                            ptr::drop_in_place(local_buf_ptr.add(i).cast::<T>());
+                        }
                     }
                 }
-                *self.prod.local_count.get_mut() = 0;
             }
 
+            // Drop items in the main buffer
             if std::mem::needs_drop::<T>() {
                 let mut current_read = *self.cons.read.get_mut();
                 let current_write = *self.prod.write.get_mut();
@@ -385,6 +386,8 @@ impl<T: Send + 'static> Drop for BiffqQueue<T> {
                     current_read = current_read.wrapping_add(1);
                 }
             }
+
+            // Free the buffer
             unsafe {
                 let buffer_slice = std::slice::from_raw_parts_mut(self.buffer, self.capacity);
                 let _ = Box::from_raw(buffer_slice);

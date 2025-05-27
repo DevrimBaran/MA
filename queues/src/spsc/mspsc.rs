@@ -136,26 +136,25 @@ impl<T: Send + 'static> MultiPushQueue<T> {
 
 impl<T: Send + 'static> Drop for MultiPushQueue<T> {
     fn drop(&mut self) {
-        if self.local_count.load(Ordering::Relaxed) > 0 {
-            self.flush();
-        }
+        // First try to flush
+        let _ = self.flush();
 
+        // Drop any remaining items in local buffer
         let final_local_count = self.local_count.load(Ordering::Relaxed);
-        if final_local_count > 0 {
-            let local_b_mut_ptr = self.local_buf.get();
+        if final_local_count > 0 && std::mem::needs_drop::<T>() {
             unsafe {
-                let local_b_slice_mut = &mut *local_b_mut_ptr;
+                let local_buf_ptr = self.local_buf.get();
                 for i in 0..final_local_count {
-                    if std::mem::needs_drop::<T>() {
-                        ptr::drop_in_place(local_b_slice_mut[i].as_mut_ptr());
-                    }
+                    // Properly drop the item
+                    ptr::drop_in_place((*local_buf_ptr)[i].as_mut_ptr());
                 }
             }
         }
 
+        // Drop the inner queue if we own it
         if !self.shared.load(Ordering::Relaxed) {
             unsafe {
-                drop(Box::from_raw(self.inner));
+                let _ = Box::from_raw(self.inner);
             }
         }
     }

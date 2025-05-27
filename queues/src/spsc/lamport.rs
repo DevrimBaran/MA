@@ -11,6 +11,7 @@ pub struct LamportQueue<T: Send> {
     pub buf: ManuallyDrop<Box<[UnsafeCell<Option<T>>]>>,
     pub head: AtomicUsize,
     pub tail: AtomicUsize,
+    pub owns_buffer: bool,
 }
 
 unsafe impl<T: Send> Sync for LamportQueue<T> {}
@@ -30,6 +31,7 @@ impl<T: Send> LamportQueue<T> {
             buf: ManuallyDrop::new(boxed),
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
+            owns_buffer: true,
         }
     }
 
@@ -57,6 +59,7 @@ impl<T: Send> LamportQueue<T> {
             buf: ManuallyDrop::new(boxed),
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
+            owns_buffer: false,
         });
 
         &mut *header
@@ -144,5 +147,34 @@ impl<T: Send + 'static> SpscQueue<T> for LamportQueue<T> {
         let head = self.head.load(Ordering::Acquire);
         let tail = self.tail.load(Ordering::Acquire);
         head == tail
+    }
+}
+
+impl<T: Send> Drop for LamportQueue<T> {
+    fn drop(&mut self) {
+        if std::mem::needs_drop::<T>() {
+            let head = *self.head.get_mut();
+            let tail = *self.tail.get_mut();
+
+            // Drop all remaining items in the queue
+            let mut current = head;
+            while current != tail {
+                let slot = self.idx(current);
+                unsafe {
+                    // Take the item out and drop it
+                    if let Some(item) = (*self.buf[slot].get()).take() {
+                        drop(item);
+                    }
+                }
+                current = current.wrapping_add(1);
+            }
+        }
+
+        // Only drop the buffer if we own it
+        if self.owns_buffer {
+            unsafe {
+                ManuallyDrop::drop(&mut self.buf);
+            }
+        }
     }
 }

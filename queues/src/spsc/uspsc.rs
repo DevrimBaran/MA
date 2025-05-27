@@ -608,6 +608,7 @@ impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
 
 impl<T: Send + 'static> Drop for UnboundedQueue<T> {
     fn drop(&mut self) {
+        // Drop any pending transition item first
         unsafe {
             if let Some(item) = (*self.transition_item.get()).take() {
                 drop(item);

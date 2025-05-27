@@ -364,42 +364,119 @@ impl<T: Send + 'static> SpscQueue<T> for DynListQueue<T> {
 
 impl<T: Send + 'static> Drop for DynListQueue<T> {
     fn drop(&mut self) {
-        if self.owns_all {
-            while let Ok(item) = SpscQueue::pop(self) {
-                drop(item);
-            }
+        // Pop all remaining items
+        while let Ok(item) = SpscQueue::pop(self) {
+            drop(item);
+        }
 
-            unsafe {
+        unsafe {
+            if self.owns_all {
+                // Calculate pool bounds before we free anything
+                let pool_start = self.nodes_pool_ptr as usize;
+                let pool_end = if self.nodes_pool_ptr.is_null() {
+                    0
+                } else {
+                    self.nodes_pool_ptr.add(self.pool_capacity) as usize
+                };
+
+                // Helper closure to check if a node is in the pool
+                let is_in_pool = |node: *mut Node<T>| -> bool {
+                    if node.is_null() || self.nodes_pool_ptr.is_null() {
+                        return false;
+                    }
+                    let addr = node as usize;
+                    addr >= pool_start && addr < pool_end
+                };
+
+                // Collect all nodes that need to be freed
+                let mut heap_allocated_nodes = Vec::new();
+
+                // Drain the node cache
                 while let Ok(node_ptr) = self.node_cache.pop() {
-                    if !node_ptr.0.is_null() && !self.is_pool_node(node_ptr.0) {
-                        ptr::drop_in_place(&mut (*node_ptr.0).val);
-                        let layout =
-                            Layout::from_size_align(std::mem::size_of::<Node<T>>(), 128).unwrap();
-                        std::alloc::dealloc(node_ptr.0 as *mut u8, layout);
+                    if !node_ptr.0.is_null()
+                        && !is_in_pool(node_ptr.0)
+                        && node_ptr.0 != self.base_ptr
+                    {
+                        heap_allocated_nodes.push(node_ptr.0);
                     }
                 }
 
-                ptr::drop_in_place(&mut self.node_cache.buf);
-            }
+                // Walk the linked list
+                let mut current = self.head.load(Ordering::Relaxed);
+                while !current.is_null() {
+                    let next = (*current).next.load(Ordering::Relaxed);
 
-            unsafe {
-                if !self.nodes_pool_ptr.is_null() {
-                    for i in 0..self.pool_capacity {
-                        let node = self.nodes_pool_ptr.add(i);
-                        ptr::drop_in_place(&mut (*node).val);
+                    if current != self.base_ptr && !is_in_pool(current) {
+                        heap_allocated_nodes.push(current);
                     }
 
+                    current = next;
+                }
+
+                // Free heap-allocated nodes
+                for node in heap_allocated_nodes {
+                    let layout =
+                        Layout::from_size_align(std::mem::size_of::<Node<T>>(), 128).unwrap();
+                    std::alloc::dealloc(node as *mut u8, layout);
+                }
+
+                // Free the pool
+                if !self.nodes_pool_ptr.is_null() {
                     let _ = Box::from_raw(std::slice::from_raw_parts_mut(
                         self.nodes_pool_ptr,
                         self.pool_capacity,
                     ));
                 }
 
+                // Free the base dummy node
                 if !self.base_ptr.is_null() {
-                    if self.head.load(Ordering::Relaxed) == self.base_ptr {
-                        ptr::drop_in_place(&mut (*self.base_ptr).val);
-                        let _ = Box::from_raw(self.base_ptr);
+                    let _ = Box::from_raw(self.base_ptr);
+                }
+            } else {
+                // For shared memory queues, need to free heap-allocated nodes
+                // but NOT pool nodes or the base dummy (they're in shared memory)
+
+                // Calculate pool bounds
+                let pool_start = self.nodes_pool_ptr as usize;
+                let pool_end = if self.nodes_pool_ptr.is_null() {
+                    0
+                } else {
+                    self.nodes_pool_ptr.add(self.pool_capacity) as usize
+                };
+
+                let is_in_pool = |node: *mut Node<T>| -> bool {
+                    if node.is_null() || self.nodes_pool_ptr.is_null() {
+                        return false;
                     }
+                    let addr = node as usize;
+                    addr >= pool_start && addr < pool_end
+                };
+
+                // Free nodes from cache that were heap-allocated
+                while let Ok(node_ptr) = self.node_cache.pop() {
+                    if !node_ptr.0.is_null()
+                        && !is_in_pool(node_ptr.0)
+                        && node_ptr.0 != self.base_ptr
+                    {
+                        let layout =
+                            Layout::from_size_align(std::mem::size_of::<Node<T>>(), 128).unwrap();
+                        std::alloc::dealloc(node_ptr.0 as *mut u8, layout);
+                    }
+                }
+
+                // Walk the linked list and free heap-allocated nodes
+                let mut current = self.head.load(Ordering::Relaxed);
+                while !current.is_null() {
+                    let next = (*current).next.load(Ordering::Relaxed);
+
+                    // In shared memory, only free nodes that were heap-allocated
+                    if !is_in_pool(current) && current != self.base_ptr {
+                        let layout =
+                            Layout::from_size_align(std::mem::size_of::<Node<T>>(), 128).unwrap();
+                        std::alloc::dealloc(current as *mut u8, layout);
+                    }
+
+                    current = next;
                 }
             }
         }

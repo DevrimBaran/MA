@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use queues::spsc::blq::K_CACHE_LINE_SLOTS as BLQ_K_SLOTS;
 use queues::spsc::llq::K_CACHE_LINE_SLOTS as LLQ_K_SLOTS;
 
-const PERFORMANCE_TEST: bool = true;
+const PERFORMANCE_TEST: bool = false;
 const RING_CAP: usize = 32_768;
 const ITERS: usize = 1_000_000;
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 100_000_000;
@@ -119,7 +119,7 @@ impl<T: Send + 'static> BenchSpscQueue<T> for IffqQueue<T> {
     }
 }
 
-impl<T: Send + 'static> BenchSpscQueue<T> for BiffqQueue<T> {
+impl<T: Copy + Send + Default + 'static> BenchSpscQueue<T> for BiffqQueue<T> {
     fn bench_push(&self, item: T) -> Result<(), ()> {
         SpscQueue::push(self, item).map_err(|_e| ())
     }
@@ -591,6 +591,7 @@ criterion_group! {
     name = benches;
     config = custom_criterion();
     targets =
+        bench_iffq,
         bench_biffq,
         bench_ffq,
         bench_llq,

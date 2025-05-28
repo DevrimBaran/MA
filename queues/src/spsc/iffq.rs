@@ -40,18 +40,22 @@ impl<T> AtomicSlot<T> {
 
     #[inline]
     fn read(&self) -> Option<T> {
-        // Check if we have a value and atomically take ownership
-        if self.state.swap(0, Ordering::Acquire) == 1 {
-            // We now own the value, extract it
-            Some(unsafe { (*self.value.get()).assume_init_read() })
-        } else {
-            None
+        // Use compare_exchange for atomic read-and-clear
+        match self
+            .state
+            .compare_exchange(1, 0, Ordering::Acquire, Ordering::Relaxed)
+        {
+            Ok(_) => {
+                // We successfully took ownership
+                Some(unsafe { (*self.value.get()).assume_init_read() })
+            }
+            Err(_) => None,
         }
     }
 
     #[inline]
     fn clear(&self) {
-        // Just mark as empty - the value was already taken by read()
+        // This might be redundant now since read() already clears
         self.state.store(0, Ordering::Release);
     }
 }
@@ -244,7 +248,7 @@ impl<T: Send + 'static> IffqQueue<T> {
                 .read
                 .store(current_read.wrapping_add(1), Ordering::Release);
 
-            // Handle clearing
+            // Clear operation might need adjustment since read() already clears
             let current_clear = self.cons.clear.load(Ordering::Relaxed);
             let read_partition_start = current_read & !self.h_mask;
             let next_clear_target = read_partition_start.wrapping_sub(H_PARTITION_SIZE);
@@ -256,8 +260,9 @@ impl<T: Send + 'static> IffqQueue<T> {
                     break;
                 }
 
-                let clear_slot = self.get_slot(temp_clear);
-                clear_slot.clear();
+                // Skip the clear since read() already cleared
+                // let clear_slot = self.get_slot(temp_clear);
+                // clear_slot.clear();
 
                 temp_clear = temp_clear.wrapping_add(1);
                 advanced_clear = true;

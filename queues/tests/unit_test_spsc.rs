@@ -2584,12 +2584,173 @@ mod ipc_tests {
     }
 
     test_queue_ipc!(LamportQueue<usize>, 1024, test_lamport_ipc);
-    test_queue_ipc!(FfqQueue<usize>, 1024, test_ffq_ipc);
     test_queue_ipc!(BlqQueue<usize>, 128, test_blq_ipc);
     test_queue_ipc!(IffqQueue<usize>, 1024, test_iffq_ipc);
     test_queue_ipc!(BiffqQueue<usize>, 1024, test_biffq_ipc);
     test_queue_ipc!(BQueue<usize>, 1024, test_bqueue_ipc);
     test_queue_ipc!(MultiPushQueue<usize>, 1024, test_multipush_ipc);
+
+    #[test]
+    fn test_ffq_ipc() {
+        const ATOMIC_BOOL_SIZE: usize = std::mem::size_of::<AtomicBool>();
+        const ATOMIC_USIZE_SIZE: usize = std::mem::size_of::<AtomicUsize>();
+        const ATOMIC_BOOL_ALIGN: usize = std::mem::align_of::<AtomicBool>();
+        const ATOMIC_USIZE_ALIGN: usize = std::mem::align_of::<AtomicUsize>();
+
+        let mut sync_size = 0;
+        sync_size += ATOMIC_BOOL_SIZE;
+        sync_size = (sync_size + ATOMIC_BOOL_ALIGN - 1) & !(ATOMIC_BOOL_ALIGN - 1);
+        sync_size += ATOMIC_BOOL_SIZE;
+        sync_size = (sync_size + ATOMIC_USIZE_ALIGN.max(8) - 1) & !(ATOMIC_USIZE_ALIGN.max(8) - 1);
+        sync_size += ATOMIC_USIZE_SIZE;
+        sync_size = (sync_size + 63) & !63;
+
+        let capacity = 1024;
+        let shared_size = FfqQueue::<usize>::shared_size(capacity);
+        let total_size = shared_size + sync_size;
+
+        let shm_ptr = unsafe { map_shared(total_size) };
+
+        // CRITICAL: Zero out ALL shared memory before use
+        unsafe {
+            std::ptr::write_bytes(shm_ptr, 0, total_size);
+        }
+
+        // Add memory barrier to ensure zeroing is complete
+        std::sync::atomic::fence(Ordering::SeqCst);
+
+        let producer_ready = unsafe { &*(shm_ptr as *const AtomicBool) };
+        let consumer_ready_offset =
+            (ATOMIC_BOOL_SIZE + ATOMIC_BOOL_ALIGN - 1) & !(ATOMIC_BOOL_ALIGN - 1);
+        let consumer_ready = unsafe { &*(shm_ptr.add(consumer_ready_offset) as *const AtomicBool) };
+        let items_consumed_offset = {
+            let offset = consumer_ready_offset + ATOMIC_BOOL_SIZE;
+            (offset + ATOMIC_USIZE_ALIGN.max(8) - 1) & !(ATOMIC_USIZE_ALIGN.max(8) - 1)
+        };
+        let items_consumed =
+            unsafe { &*(shm_ptr.add(items_consumed_offset) as *const AtomicUsize) };
+
+        producer_ready.store(false, Ordering::SeqCst);
+        consumer_ready.store(false, Ordering::SeqCst);
+        items_consumed.store(0, Ordering::SeqCst);
+
+        let queue_ptr = unsafe { shm_ptr.add(sync_size) };
+        let queue = unsafe { FfqQueue::<usize>::init_in_shared(queue_ptr, capacity) };
+
+        const NUM_ITEMS: usize = 10000;
+
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                // Producer
+                producer_ready.store(true, Ordering::Release);
+                while !consumer_ready.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+
+                // Add a small delay to ensure consumer is ready
+                std::thread::sleep(std::time::Duration::from_millis(10));
+
+                for i in 0..NUM_ITEMS {
+                    let mut retry_count = 0;
+                    loop {
+                        match queue.push(i) {
+                            Ok(_) => break,
+                            Err(_) => {
+                                retry_count += 1;
+                                if retry_count > 10_000_000 {
+                                    eprintln!("Producer: Excessive retries at item {}", i);
+                                }
+                                std::thread::yield_now();
+                            }
+                        }
+                    }
+                }
+
+                unsafe { libc::_exit(0) };
+            }
+            Ok(ForkResult::Parent { child }) => {
+                // Consumer
+                while !producer_ready.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                consumer_ready.store(true, Ordering::Release);
+
+                let mut received = Vec::new();
+                let mut empty_count = 0;
+                let mut total_empty_polls = 0;
+
+                while received.len() < NUM_ITEMS {
+                    match queue.pop() {
+                        Ok(item) => {
+                            // Check immediately if we got the right value
+                            if item != received.len() {
+                                eprintln!(
+                                    "ERROR: Expected {}, got {} at position {}",
+                                    received.len(),
+                                    item,
+                                    received.len()
+                                );
+                                eprintln!(
+                                    "Queue head: {}, tail: {}",
+                                    queue.head.load(Ordering::SeqCst),
+                                    queue.tail.load(Ordering::SeqCst)
+                                );
+                            }
+                            received.push(item);
+                            empty_count = 0;
+                        }
+                        Err(_) => {
+                            empty_count += 1;
+                            total_empty_polls += 1;
+                            if empty_count > 10_000_000 {
+                                eprintln!(
+                                    "Consumer: Too many empty polls, breaking. Received {} items",
+                                    received.len()
+                                );
+                                break;
+                            }
+                            std::thread::yield_now();
+                        }
+                    }
+                }
+
+                items_consumed.store(received.len(), Ordering::SeqCst);
+
+                // Wait for child with timeout
+                use nix::sys::wait::WaitStatus;
+                match waitpid(child, None) {
+                    Ok(WaitStatus::Exited(_, 0)) => {}
+                    other => eprintln!("Child process ended with: {:?}", other),
+                }
+
+                let consumed = items_consumed.load(Ordering::SeqCst);
+                assert_eq!(
+                    consumed, NUM_ITEMS,
+                    "Not all items were consumed in IPC test"
+                );
+
+                // Now check order
+                for (i, &item) in received.iter().enumerate() {
+                    if item != i {
+                        panic!(
+                            "Items received out of order at position {}: expected {}, got {}",
+                            i, i, item
+                        );
+                    }
+                }
+
+                unsafe {
+                    unmap_shared(shm_ptr, total_size);
+                }
+            }
+            Err(e) => {
+                unsafe {
+                    unmap_shared(shm_ptr, total_size);
+                }
+                panic!("Fork failed: {}", e);
+            }
+        }
+    }
 
     #[test]
     fn test_llq_ipc() {

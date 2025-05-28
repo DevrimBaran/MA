@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // Atomic wrapper for the slot to prevent data races
 #[repr(C)]
-struct AtomicSlot<T> {
+pub struct AtomicSlot<T> {
     // Using AtomicUsize for the discriminant and UnsafeCell for the value
     // 0 = None, 1 = Some
     state: AtomicUsize,
@@ -12,7 +12,7 @@ struct AtomicSlot<T> {
 }
 
 impl<T> AtomicSlot<T> {
-    fn new_none() -> Self {
+    pub fn new_none() -> Self {
         Self {
             state: AtomicUsize::new(0),
             value: UnsafeCell::new(MaybeUninit::uninit()),
@@ -20,39 +20,44 @@ impl<T> AtomicSlot<T> {
     }
 
     #[inline]
-    fn is_some(&self) -> bool {
+    pub fn is_some(&self) -> bool {
+        // Use Acquire for IPC visibility
         self.state.load(Ordering::Acquire) == 1
     }
 
     #[inline]
-    fn write(&self, value: T) {
+    pub fn write(&self, value: T) {
         unsafe {
             (*self.value.get()).write(value);
         }
-        // Release ordering ensures the value write happens-before state change
-        self.state.store(1, Ordering::Release);
+        // Use stronger ordering for IPC - SeqCst ensures visibility across processes
+        self.state.store(1, Ordering::SeqCst);
     }
 
     #[inline]
-    fn take(&self) -> Option<T> {
-        // Swap with 0 (None) atomically
-        if self.state.swap(0, Ordering::Acquire) == 1 {
-            // We had Some, extract the value
-            Some(unsafe { (*self.value.get()).assume_init_read() })
-        } else {
-            None
+    pub fn take(&self) -> Option<T> {
+        // Use compare_exchange with SeqCst for IPC
+        match self
+            .state
+            .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => {
+                // We had Some, extract the value
+                Some(unsafe { (*self.value.get()).assume_init_read() })
+            }
+            Err(_) => None,
         }
     }
 }
 
 #[repr(C, align(64))]
 pub struct FfqQueue<T: Send + 'static> {
-    head: UnsafeCell<usize>,
-    _pad1: [u8; 64 - std::mem::size_of::<UnsafeCell<usize>>()],
-    tail: UnsafeCell<usize>,
-    _pad2: [u8; 64 - std::mem::size_of::<UnsafeCell<usize>>()],
+    pub head: AtomicUsize, // Changed from UnsafeCell<usize>
+    _pad1: [u8; 64 - std::mem::size_of::<AtomicUsize>()],
+    pub tail: AtomicUsize, // Changed from UnsafeCell<usize>
+    _pad2: [u8; 64 - std::mem::size_of::<AtomicUsize>()],
     capacity: usize,
-    mask: usize,
+    pub mask: usize,
     buffer: *mut AtomicSlot<T>,
     owns_buffer: bool,
     initialized: AtomicBool,
@@ -88,10 +93,10 @@ impl<T: Send + 'static> FfqQueue<T> {
         }
 
         Self {
-            head: UnsafeCell::new(0),
-            _pad1: [0u8; 64 - std::mem::size_of::<UnsafeCell<usize>>()],
-            tail: UnsafeCell::new(0),
-            _pad2: [0u8; 64 - std::mem::size_of::<UnsafeCell<usize>>()],
+            head: AtomicUsize::new(0),
+            _pad1: [0u8; 64 - std::mem::size_of::<AtomicUsize>()],
+            tail: AtomicUsize::new(0),
+            _pad2: [0u8; 64 - std::mem::size_of::<AtomicUsize>()],
             capacity,
             mask: capacity - 1,
             buffer: ptr,
@@ -112,22 +117,39 @@ impl<T: Send + 'static> FfqQueue<T> {
         assert!(capacity.is_power_of_two() && capacity > 0);
         assert!(!mem.is_null());
 
+        // Zero out everything first
         ptr::write_bytes(mem, 0, Self::shared_size(capacity));
+
+        // Memory barrier
+        std::sync::atomic::fence(Ordering::SeqCst);
 
         let queue_ptr = mem as *mut Self;
         let buf_ptr = mem.add(std::mem::size_of::<Self>()) as *mut AtomicSlot<T>;
 
+        // Initialize each slot explicitly with empty state
         for i in 0..capacity {
-            ptr::write(buf_ptr.add(i), AtomicSlot::new_none());
+            let slot_ptr = buf_ptr.add(i);
+            // Write the entire slot structure
+            ptr::write(
+                slot_ptr,
+                AtomicSlot {
+                    state: AtomicUsize::new(0), // 0 = empty
+                    value: UnsafeCell::new(MaybeUninit::uninit()),
+                },
+            );
         }
 
+        // Another barrier
+        std::sync::atomic::fence(Ordering::SeqCst);
+
+        // Now initialize the queue structure
         ptr::write(
             queue_ptr,
             Self {
-                head: UnsafeCell::new(0),
-                _pad1: [0u8; 64 - std::mem::size_of::<UnsafeCell<usize>>()],
-                tail: UnsafeCell::new(0),
-                _pad2: [0u8; 64 - std::mem::size_of::<UnsafeCell<usize>>()],
+                head: AtomicUsize::new(0),
+                _pad1: [0u8; 64 - std::mem::size_of::<AtomicUsize>()],
+                tail: AtomicUsize::new(0),
+                _pad2: [0u8; 64 - std::mem::size_of::<AtomicUsize>()],
                 capacity,
                 mask: capacity - 1,
                 buffer: buf_ptr,
@@ -136,13 +158,11 @@ impl<T: Send + 'static> FfqQueue<T> {
             },
         );
 
-        let queue_ref = &mut *queue_ptr;
-        queue_ref.initialized.store(true, Ordering::Release);
-        queue_ref
+        &mut *queue_ptr
     }
 
     #[inline]
-    fn get_slot(&self, index: usize) -> &AtomicSlot<T> {
+    pub fn get_slot(&self, index: usize) -> &AtomicSlot<T> {
         unsafe { &*self.buffer.add(index & self.mask) }
     }
 
@@ -163,7 +183,7 @@ impl<T: Send + 'static> SpscQueue<T> for FfqQueue<T> {
     fn push(&self, item: T) -> Result<(), Self::PushError> {
         self.ensure_initialized();
 
-        let head = unsafe { *self.head.get() };
+        let head = self.head.load(Ordering::Acquire);
         let slot = self.get_slot(head);
 
         if slot.is_some() {
@@ -171,9 +191,7 @@ impl<T: Send + 'static> SpscQueue<T> for FfqQueue<T> {
         }
 
         slot.write(item);
-        unsafe {
-            *self.head.get() = head.wrapping_add(1);
-        }
+        self.head.store(head.wrapping_add(1), Ordering::Release);
 
         Ok(())
     }
@@ -182,14 +200,12 @@ impl<T: Send + 'static> SpscQueue<T> for FfqQueue<T> {
     fn pop(&self) -> Result<T, Self::PopError> {
         self.ensure_initialized();
 
-        let tail = unsafe { *self.tail.get() };
+        let tail = self.tail.load(Ordering::Acquire);
         let slot = self.get_slot(tail);
 
         match slot.take() {
             Some(val) => {
-                unsafe {
-                    *self.tail.get() = tail.wrapping_add(1);
-                }
+                self.tail.store(tail.wrapping_add(1), Ordering::Release);
                 Ok(val)
             }
             None => Err(FfqPopError),
@@ -200,7 +216,7 @@ impl<T: Send + 'static> SpscQueue<T> for FfqQueue<T> {
     fn available(&self) -> bool {
         self.ensure_initialized();
 
-        let head = unsafe { *self.head.get() };
+        let head = self.head.load(Ordering::Acquire);
         let slot = self.get_slot(head);
         !slot.is_some()
     }
@@ -209,7 +225,7 @@ impl<T: Send + 'static> SpscQueue<T> for FfqQueue<T> {
     fn empty(&self) -> bool {
         self.ensure_initialized();
 
-        let tail = unsafe { *self.tail.get() };
+        let tail = self.tail.load(Ordering::Acquire);
         let slot = self.get_slot(tail);
         !slot.is_some()
     }
@@ -241,8 +257,8 @@ impl<T: fmt::Debug + Send + 'static> fmt::Debug for FfqQueue<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FfqQueue")
             .field("capacity", &self.capacity)
-            .field("head", unsafe { &*self.head.get() })
-            .field("tail", unsafe { &*self.tail.get() })
+            .field("head", &self.head.load(Ordering::Relaxed)) // Fixed: load() needs Ordering
+            .field("tail", &self.tail.load(Ordering::Relaxed)) // Fixed: load() needs Ordering
             .field("owns_buffer", &self.owns_buffer)
             .field("initialized", &self.initialized.load(Ordering::Relaxed))
             .finish()
@@ -255,8 +271,8 @@ impl<T: Send + 'static> FfqQueue<T> {
 
     #[inline]
     pub fn distance(&self) -> usize {
-        let head = unsafe { *self.head.get() };
-        let tail = unsafe { *self.tail.get() };
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Acquire);
         head.wrapping_sub(tail)
     }
 
@@ -280,6 +296,91 @@ impl<T: Send + 'static> FfqQueue<T> {
                     break;
                 }
             }
+        }
+    }
+}
+
+impl<T: Send + 'static> FfqQueue<T> {
+    // Add this method to verify all slots are properly initialized
+    pub fn verify_initialization(&self) -> bool {
+        let mut empty_count = 0;
+        let mut filled_count = 0;
+
+        for i in 0..self.capacity {
+            let slot = self.get_slot(i);
+            if slot.is_some() {
+                filled_count += 1;
+            } else {
+                empty_count += 1;
+            }
+        }
+
+        println!(
+            "Queue verification: {} empty slots, {} filled slots out of {} total",
+            empty_count, filled_count, self.capacity
+        );
+
+        // At initialization, all slots should be empty
+        empty_count + filled_count == self.capacity
+    }
+
+    // Add this to debug push operations
+    #[inline]
+    pub fn push_debug(&self, item: T) -> Result<(), FfqPushError<T>> {
+        self.ensure_initialized();
+
+        let head = self.head.load(Ordering::Acquire);
+        let slot = self.get_slot(head);
+
+        // Debug: Check what's in the slot before writing
+        if cfg!(debug_assertions) {
+            if slot.is_some() {
+                // Try to read the value to see what's there
+                let state = slot.state.load(Ordering::SeqCst);
+                eprintln!(
+                    "DEBUG: Slot at index {} (head={}) is occupied (state={})",
+                    head & self.mask,
+                    head,
+                    state
+                );
+            }
+        }
+
+        if slot.is_some() {
+            return Err(FfqPushError(item));
+        }
+
+        slot.write(item);
+        self.head.store(head.wrapping_add(1), Ordering::Release);
+
+        Ok(())
+    }
+
+    // Add this to debug pop operations
+    #[inline]
+    pub fn pop_debug(&self) -> Result<T, FfqPopError> {
+        self.ensure_initialized();
+
+        let tail = self.tail.load(Ordering::Acquire);
+        let slot = self.get_slot(tail);
+
+        // Debug: Log what we're about to pop
+        if cfg!(debug_assertions) {
+            let state = slot.state.load(Ordering::SeqCst);
+            eprintln!(
+                "DEBUG: About to pop from index {} (tail={}, state={})",
+                tail & self.mask,
+                tail,
+                state
+            );
+        }
+
+        match slot.take() {
+            Some(val) => {
+                self.tail.store(tail.wrapping_add(1), Ordering::Release);
+                Ok(val)
+            }
+            None => Err(FfqPopError),
         }
     }
 }

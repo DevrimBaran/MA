@@ -25,6 +25,7 @@ use queues::spsc::llq::K_CACHE_LINE_SLOTS as LLQ_K_SLOTS;
 const PERFORMANCE_TEST: bool = true;
 const RING_CAP: usize = 32_768;
 const ITERS: usize = 1_000_000;
+const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 100_000_000;
 
 // Helper trait for benchmarking for SpscQueue error types
 // from what fork_and_run expects (Result<(), ()> and Result<T, ()>).
@@ -463,8 +464,13 @@ where
                 std::hint::spin_loop();
             }
 
+            let mut push_attempts = 0;
             for i in 0..ITERS {
                 while q.bench_push(i).is_err() {
+                    push_attempts += 1;
+                    if push_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS {
+                        panic!("Producer exceeded max spin retry attempts for push");
+                    }
                     std::hint::spin_loop();
                 }
             }
@@ -516,6 +522,7 @@ where
 
             let start_time = std::time::Instant::now();
             let mut consumed_count = 0;
+            let mut pop_spin_attempts = 0;
 
             while consumed_count < ITERS {
                 if sync_atomic_flag.load(Ordering::Acquire) == 3 {
@@ -527,12 +534,22 @@ where
                         if consumed_count == ITERS {
                             break;
                         }
+                        pop_spin_attempts = 0; // Reset spin attempts after a successful pop
                     }
                 }
 
                 if let Ok(_item) = q.bench_pop() {
                     consumed_count += 1;
+                    pop_spin_attempts = 0; // Reset spin attempts after a successful pop
                 } else {
+                    pop_spin_attempts += 1;
+                    if pop_spin_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS
+                        && sync_atomic_flag.load(Ordering::Acquire) != 3
+                    {
+                        panic!(
+                            "Consumer exceeded max spin retry attempts for pop (producer not done)"
+                        );
+                    }
                     std::hint::spin_loop();
                 }
             }
@@ -566,8 +583,8 @@ where
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(5))
-        .measurement_time(Duration::from_secs(270))
-        .sample_size(1000)
+        .measurement_time(Duration::from_secs(15))
+        .sample_size(10)
 }
 
 criterion_group! {

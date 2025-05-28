@@ -1,4 +1,4 @@
-// spinloop does not break wait-freedom since dehnavi proved in his paper that these loops hav a worst-case execution time
+// remove queue, we would need to prove that our hardware supports the scheduling guarantees given in the paper to have the same wcet
 use crate::SpscQueue;
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
@@ -109,9 +109,6 @@ impl<T: Send + 'static> SpscQueue<T> for DehnaviQueue<T> {
                 // Line 6: pclaim=0
                 self.pclaim.store(false, Ordering::Release);
             }
-
-            // Continue loop to check if still full
-            std::hint::spin_loop();
         }
 
         // Line 7: Write token
@@ -141,9 +138,7 @@ impl<T: Send + 'static> SpscQueue<T> for DehnaviQueue<T> {
         self.cclaim.store(true, Ordering::Release);
 
         // Line 2: while (pclaim==1);
-        while self.pclaim.load(Ordering::Acquire) {
-            std::hint::spin_loop();
-        }
+        self.pclaim.load(Ordering::Acquire);
 
         // Line 3: Read token
         let rc = self.rc.load(Ordering::Acquire);

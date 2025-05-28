@@ -22,6 +22,7 @@ const PERFORMANCE_TEST: bool = true;
 const ITEMS_PER_PRODUCER_TARGET: usize = 3_000_000;
 const JIFFY_NODES_PER_BUFFER_BENCH: usize = 8192;
 const PRODUCER_COUNTS_TO_TEST: &[usize] = &[1, 2, 4, 8, 14];
+const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 100_000_000;
 
 trait BenchMpscQueue<T: Send>: Send + Sync + 'static {
     fn bench_push(&self, item: T, producer_id: usize) -> Result<(), ()>;
@@ -195,9 +196,17 @@ where
                 while !startup_sync.go_signal.load(Ordering::Acquire) {
                     std::hint::spin_loop();
                 }
+                let mut push_attempts = 0;
                 for i in 0..items_per_producer_arg {
                     let item_value = producer_id * items_per_producer_arg + i;
                     while q.bench_push(item_value, producer_id).is_err() {
+                        push_attempts += 1;
+                        if push_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS {
+                            panic!(
+                                "Producer {} exceeded max spin retry attempts for push",
+                                producer_id
+                            );
+                        }
                         std::hint::spin_loop();
                     }
                 }
@@ -231,11 +240,22 @@ where
     let mut consumed_count = 0;
 
     if total_items_to_produce > 0 {
+        let mut pop_attempts_outer = 0;
         loop {
             // Main consumption loop
             if q.bench_pop().is_ok() {
                 consumed_count += 1;
+                pop_attempts_outer = 0; // Reset attempts on successful pop
             } else {
+                pop_attempts_outer += 1;
+                if pop_attempts_outer > MAX_BENCH_SPIN_RETRY_ATTEMPTS
+                    && !(done_sync.producers_done_count.load(Ordering::Acquire)
+                        == num_producers as u32)
+                {
+                    panic!(
+                        "Consumer exceeded max spin retry attempts for pop (producers not done)"
+                    );
+                }
                 // Pop returned None or Error
                 let producers_done =
                     done_sync.producers_done_count.load(Ordering::Acquire) == num_producers as u32;
@@ -461,7 +481,7 @@ criterion_group! {
     name = mpsc_benches;
     config = custom_criterion();
     targets =
-        //bench_drescher_mpsc,
+        bench_drescher_mpsc,
         bench_jayanti_petrovic_mpsc,
         bench_jiffy_mpsc,
         bench_d_queue_mpsc,

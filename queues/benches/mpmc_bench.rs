@@ -13,6 +13,7 @@ use std::time::Duration;
 const PERFORMANCE_TEST: bool = true;
 const ITEMS_PER_PROCESS_TARGET: usize = 200_000;
 const PROCESS_COUNTS_TO_TEST: &[(usize, usize)] = &[(1, 1), (2, 2), (4, 4), (7, 7)];
+const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 100_000_000;
 
 trait BenchMpmcQueue<T: Send + Clone>: Send + Sync + 'static {
     fn bench_push(&self, item: T, process_id: usize) -> Result<(), ()>;
@@ -169,10 +170,17 @@ where
                 while !startup_sync.go_signal.load(Ordering::Acquire) {
                     std::hint::spin_loop();
                 }
-
+                let mut push_attempts = 0;
                 for i in 0..items_per_process {
                     let item_value = producer_id * items_per_process + i;
                     while q.bench_push(item_value, producer_id).is_err() {
+                        push_attempts += 1;
+                        if push_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS {
+                            panic!(
+                                "Producer {} exceeded max spin retry attempts for push",
+                                producer_id
+                            );
+                        }
                         std::hint::spin_loop();
                     }
                 }
@@ -215,11 +223,23 @@ where
                 let my_target = target_items + extra_items;
 
                 while consumed_count < my_target {
+                    let mut pop_attempts = 0;
                     match q.bench_pop(num_producers + consumer_id) {
                         Ok(_item) => {
                             consumed_count += 1;
+                            pop_attempts = 0; // Reset attempts on successful pop
                         }
                         Err(_) => {
+                            pop_attempts += 1;
+                            if pop_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS
+                                && !(done_sync.producers_done.load(Ordering::Acquire)
+                                    == num_producers as u32)
+                            {
+                                panic!(
+                                    "Consumer {} exceeded max spin retry attempts for pop",
+                                    consumer_id
+                                );
+                            }
                             if done_sync.producers_done.load(Ordering::Acquire)
                                 == num_producers as u32
                             {

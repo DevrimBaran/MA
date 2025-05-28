@@ -175,20 +175,6 @@ mod miri_basic_tests {
             }
             assert!(queue.empty());
         }
-
-        {
-            let queue = FfqQueue::<usize>::with_capacity(MIRI_MEDIUM_CAP);
-
-            assert_eq!(queue.distance(), 0);
-            queue.push(1).unwrap();
-            queue.push(2).unwrap();
-            assert_eq!(queue.distance(), 2);
-
-            queue.pop().unwrap();
-            assert_eq!(queue.distance(), 1);
-            queue.pop().unwrap();
-            assert_eq!(queue.distance(), 0);
-        }
     }
 
     #[test]
@@ -501,8 +487,6 @@ mod miri_shared_memory {
 
         queue.push(1).unwrap();
         queue.push(2).unwrap();
-        let distance = queue.distance();
-        assert_eq!(distance, 2);
     }
 
     #[test]
@@ -810,21 +794,6 @@ mod miri_special_features {
         for window in items.windows(2) {
             assert!(window[1] > window[0]);
         }
-    }
-
-    #[test]
-    fn test_ffq_temporal_slipping() {
-        let queue = FfqQueue::<usize>::with_capacity(128);
-
-        queue.push(1).unwrap();
-        queue.push(2).unwrap();
-        let distance = queue.distance();
-        assert_eq!(distance, 2);
-
-        queue.adjust_slip(100);
-
-        let _ = queue.pop();
-        let _ = queue.pop();
     }
 
     #[test]

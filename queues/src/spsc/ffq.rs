@@ -1,3 +1,5 @@
+// In queues/src/spsc/ffq.rs
+
 use crate::SpscQueue;
 use core::{cell::UnsafeCell, fmt, mem::MaybeUninit, ptr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -52,9 +54,9 @@ impl<T> AtomicSlot<T> {
 
 #[repr(C, align(64))]
 pub struct FfqQueue<T: Send + 'static> {
-    pub head: AtomicUsize, // Changed from UnsafeCell<usize>
+    pub head: AtomicUsize,
     _pad1: [u8; 64 - std::mem::size_of::<AtomicUsize>()],
-    pub tail: AtomicUsize, // Changed from UnsafeCell<usize>
+    pub tail: AtomicUsize,
     _pad2: [u8; 64 - std::mem::size_of::<AtomicUsize>()],
     capacity: usize,
     pub mask: usize,
@@ -257,130 +259,10 @@ impl<T: fmt::Debug + Send + 'static> fmt::Debug for FfqQueue<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FfqQueue")
             .field("capacity", &self.capacity)
-            .field("head", &self.head.load(Ordering::Relaxed)) // Fixed: load() needs Ordering
-            .field("tail", &self.tail.load(Ordering::Relaxed)) // Fixed: load() needs Ordering
+            .field("head", &self.head.load(Ordering::Relaxed))
+            .field("tail", &self.tail.load(Ordering::Relaxed))
             .field("owns_buffer", &self.owns_buffer)
             .field("initialized", &self.initialized.load(Ordering::Relaxed))
             .finish()
-    }
-}
-
-impl<T: Send + 'static> FfqQueue<T> {
-    pub const DANGER_THRESHOLD: usize = 16;
-    pub const GOOD_THRESHOLD: usize = 48;
-
-    #[inline]
-    pub fn distance(&self) -> usize {
-        let head = self.head.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Acquire);
-        head.wrapping_sub(tail)
-    }
-
-    pub fn adjust_slip(&self, avg_stage_time_ns: u64) {
-        let mut dist = self.distance();
-        if dist < Self::DANGER_THRESHOLD {
-            let mut dist_old;
-            loop {
-                dist_old = dist;
-
-                let spin_time = avg_stage_time_ns * ((Self::GOOD_THRESHOLD + 1) - dist) as u64;
-
-                let start = std::time::Instant::now();
-                while start.elapsed().as_nanos() < spin_time as u128 {
-                    std::hint::spin_loop();
-                }
-
-                dist = self.distance();
-
-                if dist >= Self::GOOD_THRESHOLD || dist <= dist_old {
-                    break;
-                }
-            }
-        }
-    }
-}
-
-impl<T: Send + 'static> FfqQueue<T> {
-    // Add this method to verify all slots are properly initialized
-    pub fn verify_initialization(&self) -> bool {
-        let mut empty_count = 0;
-        let mut filled_count = 0;
-
-        for i in 0..self.capacity {
-            let slot = self.get_slot(i);
-            if slot.is_some() {
-                filled_count += 1;
-            } else {
-                empty_count += 1;
-            }
-        }
-
-        println!(
-            "Queue verification: {} empty slots, {} filled slots out of {} total",
-            empty_count, filled_count, self.capacity
-        );
-
-        // At initialization, all slots should be empty
-        empty_count + filled_count == self.capacity
-    }
-
-    // Add this to debug push operations
-    #[inline]
-    pub fn push_debug(&self, item: T) -> Result<(), FfqPushError<T>> {
-        self.ensure_initialized();
-
-        let head = self.head.load(Ordering::Acquire);
-        let slot = self.get_slot(head);
-
-        // Debug: Check what's in the slot before writing
-        if cfg!(debug_assertions) {
-            if slot.is_some() {
-                // Try to read the value to see what's there
-                let state = slot.state.load(Ordering::SeqCst);
-                eprintln!(
-                    "DEBUG: Slot at index {} (head={}) is occupied (state={})",
-                    head & self.mask,
-                    head,
-                    state
-                );
-            }
-        }
-
-        if slot.is_some() {
-            return Err(FfqPushError(item));
-        }
-
-        slot.write(item);
-        self.head.store(head.wrapping_add(1), Ordering::Release);
-
-        Ok(())
-    }
-
-    // Add this to debug pop operations
-    #[inline]
-    pub fn pop_debug(&self) -> Result<T, FfqPopError> {
-        self.ensure_initialized();
-
-        let tail = self.tail.load(Ordering::Acquire);
-        let slot = self.get_slot(tail);
-
-        // Debug: Log what we're about to pop
-        if cfg!(debug_assertions) {
-            let state = slot.state.load(Ordering::SeqCst);
-            eprintln!(
-                "DEBUG: About to pop from index {} (tail={}, state={})",
-                tail & self.mask,
-                tail,
-                state
-            );
-        }
-
-        match slot.take() {
-            Some(val) => {
-                self.tail.store(tail.wrapping_add(1), Ordering::Release);
-                Ok(val)
-            }
-            None => Err(FfqPopError),
-        }
     }
 }

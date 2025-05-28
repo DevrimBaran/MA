@@ -2197,18 +2197,6 @@ mod special_feature_tests {
 
         while queue.pop().is_ok() {}
     }
-
-    #[test]
-    fn test_ffq_temporal_slipping() {
-        let queue = FfqQueue::<usize>::with_capacity(128);
-
-        queue.push(1).unwrap();
-        queue.push(2).unwrap();
-        let distance = queue.distance();
-        assert_eq!(distance, 2);
-
-        queue.adjust_slip(100);
-    }
 }
 
 mod error_handling_tests {

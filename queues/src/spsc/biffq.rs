@@ -12,14 +12,14 @@ const LOCAL_BATCH_SIZE: usize = 32;
 #[repr(C, align(8))]
 struct AtomicSlot<T: Copy> {
     occupied: AtomicBool,
-    value: UnsafeCell<T>,
+    value: UnsafeCell<MaybeUninit<T>>,
 }
 
 impl<T: Copy> AtomicSlot<T> {
-    const fn new(value: T) -> Self {
+    const fn new(_value: T) -> Self {
         Self {
             occupied: AtomicBool::new(false),
-            value: UnsafeCell::new(value),
+            value: UnsafeCell::new(MaybeUninit::uninit()),
         }
     }
 
@@ -31,27 +31,21 @@ impl<T: Copy> AtomicSlot<T> {
     #[inline]
     fn store(&self, value: T) {
         unsafe {
-            *self.value.get() = value;
+            // Write the value first
+            (*self.value.get()).write(value);
         }
-        // Use Release ordering to ensure the value write happens-before any subsequent read
+        // Then set occupied flag with Release ordering to ensure the value write happens-before any subsequent read
         self.occupied.store(true, Ordering::Release);
     }
 
     #[inline]
-    fn load(&self) -> Option<T> {
-        // Use Acquire ordering to ensure we see the value write if occupied is true
-        if self.occupied.load(Ordering::Acquire) {
-            Some(unsafe { *self.value.get() })
-        } else {
-            None
-        }
-    }
-
-    #[inline]
     fn take(&self) -> Option<T> {
-        // Use Acquire ordering to establish happens-before with the store
-        if self.occupied.swap(false, Ordering::Acquire) {
-            Some(unsafe { *self.value.get() })
+        // Use AcqRel for the swap to ensure:
+        // - Acquire: we see the value write if occupied was true
+        // - Release: our subsequent operations don't get reordered before this
+        if self.occupied.swap(false, Ordering::AcqRel) {
+            // Safety: if occupied was true, then a value was written
+            Some(unsafe { (*self.value.get()).assume_init_read() })
         } else {
             None
         }
@@ -242,9 +236,19 @@ impl<T: Copy + Send + Default + 'static> BiffqQueue<T> {
 
                     // Copy remaining items back to the beginning of local buffer
                     unsafe {
-                        let src = (*local_buf_ptr).as_ptr().add(i);
-                        let dst = (*local_buf_ptr).as_mut_ptr();
-                        ptr::copy(src, dst, local_count - i);
+                        let remaining = local_count - i;
+                        if remaining > 0 && i > 0 {
+                            // Use memmove instead of copy to handle potential overlap
+                            // First, read all remaining items into a temporary buffer
+                            let mut temp: Vec<MaybeUninit<T>> = Vec::with_capacity(remaining);
+                            for j in 0..remaining {
+                                temp.push(ptr::read((*local_buf_ptr).as_ptr().add(i + j)));
+                            }
+                            // Then write them back to the beginning
+                            for j in 0..remaining {
+                                ptr::write((*local_buf_ptr).as_mut_ptr().add(j), temp[j]);
+                            }
+                        }
                     }
                     self.prod
                         .local_count

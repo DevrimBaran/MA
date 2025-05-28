@@ -47,7 +47,7 @@ pub struct DynListQueue<T: Send + 'static> {
     cache_capacity: usize,
     owns_all: bool,
 
-    heap_allocs: AtomicUsize,
+    pub heap_allocs: AtomicUsize,
     heap_frees: AtomicUsize,
 }
 

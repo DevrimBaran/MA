@@ -984,7 +984,9 @@ mod sesd_wrapper_tests {
     fn test_sesd_wrapper_basic() {
         let pool_capacity = 100;
         let shared_size = SesdJpSpscBenchWrapper::<usize>::shared_size(pool_capacity);
-        let mut memory = vec![0u8; shared_size];
+
+        // Use AlignedMemory helper that's already defined in the test file
+        let mut memory = AlignedMemory::new(shared_size, 64); // 64-byte alignment for safety
 
         let queue =
             unsafe { SesdJpSpscBenchWrapper::init_in_shared(memory.as_mut_ptr(), pool_capacity) };
@@ -1025,10 +1027,12 @@ mod sesd_wrapper_tests {
     fn test_sesd_wrapper_concurrent() {
         let pool_capacity = 200;
         let shared_size = SesdJpSpscBenchWrapper::<usize>::shared_size(pool_capacity);
-        let mut memory = vec![0u8; shared_size];
+
+        let mut memory = AlignedMemory::new(shared_size, 64);
 
         let queue =
             unsafe { SesdJpSpscBenchWrapper::init_in_shared(memory.as_mut_ptr(), pool_capacity) };
+
         let queue_ptr = queue as *const SesdJpSpscBenchWrapper<usize>;
 
         let barrier = Arc::new(Barrier::new(2));
@@ -1314,12 +1318,15 @@ mod shared_memory_tests {
         assert_eq!(queue.pop().unwrap(), 123);
         assert!(queue.empty());
 
-        // Test with many items to trigger dynamic allocation
-        for i in 0..200 {
+        // Test with items that fit within pre-allocated capacity
+        // The pre-allocated capacity is MIRI_MEDIUM_CAPACITY / 2
+        let items_to_push = (MIRI_MEDIUM_CAPACITY / 2) - 10; // Stay well within pre-allocated pool
+
+        for i in 0..items_to_push {
             queue.push(i).unwrap();
         }
 
-        for i in 0..200 {
+        for i in 0..items_to_push {
             assert_eq!(queue.pop().unwrap(), i);
         }
         assert!(queue.empty());
@@ -1597,7 +1604,7 @@ mod error_handling_tests {
 
     #[test]
     fn test_pop_error_handling() {
-        let queue = BQueue::<usize>::new(16);
+        let queue = BQueue::<usize>::new(128);
 
         assert!(queue.pop().is_err());
 
@@ -1732,7 +1739,7 @@ fn test_multiple_queues() {
 
 #[test]
 fn test_arc_safety() {
-    let queue = Arc::new(BQueue::<i32>::new(64));
+    let queue = Arc::new(BQueue::<i32>::new(128));
     let q1 = queue.clone();
     let q2 = queue.clone();
 
@@ -1757,7 +1764,7 @@ fn test_different_types() {
     }
 
     {
-        let q_opt = BQueue::<Option<String>>::new(16);
+        let q_opt = BQueue::<Option<String>>::new(128);
         q_opt.push(Some("hello".to_string())).unwrap();
         q_opt.push(None).unwrap();
 

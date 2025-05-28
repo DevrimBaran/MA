@@ -1,8 +1,49 @@
 use crate::SpscQueue;
 use core::{cell::UnsafeCell, fmt, mem::MaybeUninit, ptr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-type Slot<T> = Option<T>;
+// Atomic wrapper for the slot to prevent data races
+#[repr(C)]
+struct AtomicSlot<T> {
+    // Using AtomicUsize for the discriminant and UnsafeCell for the value
+    // 0 = None, 1 = Some
+    state: AtomicUsize,
+    value: UnsafeCell<MaybeUninit<T>>,
+}
+
+impl<T> AtomicSlot<T> {
+    fn new_none() -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+            value: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+
+    #[inline]
+    fn is_some(&self) -> bool {
+        self.state.load(Ordering::Acquire) == 1
+    }
+
+    #[inline]
+    fn write(&self, value: T) {
+        unsafe {
+            (*self.value.get()).write(value);
+        }
+        // Release ordering ensures the value write happens-before state change
+        self.state.store(1, Ordering::Release);
+    }
+
+    #[inline]
+    fn take(&self) -> Option<T> {
+        // Swap with 0 (None) atomically
+        if self.state.swap(0, Ordering::Acquire) == 1 {
+            // We had Some, extract the value
+            Some(unsafe { (*self.value.get()).assume_init_read() })
+        } else {
+            None
+        }
+    }
+}
 
 #[repr(C, align(64))]
 pub struct FfqQueue<T: Send + 'static> {
@@ -12,7 +53,7 @@ pub struct FfqQueue<T: Send + 'static> {
     _pad2: [u8; 64 - std::mem::size_of::<UnsafeCell<usize>>()],
     capacity: usize,
     mask: usize,
-    buffer: *mut UnsafeCell<MaybeUninit<Slot<T>>>,
+    buffer: *mut AtomicSlot<T>,
     owns_buffer: bool,
     initialized: AtomicBool,
 }
@@ -29,12 +70,12 @@ impl<T: Send + 'static> FfqQueue<T> {
     pub fn with_capacity(capacity: usize) -> Self {
         assert!(capacity.is_power_of_two() && capacity > 0);
 
-        let layout = std::alloc::Layout::array::<UnsafeCell<MaybeUninit<Slot<T>>>>(capacity)
+        let layout = std::alloc::Layout::array::<AtomicSlot<T>>(capacity)
             .unwrap()
             .align_to(64)
             .unwrap();
 
-        let ptr = unsafe { std::alloc::alloc(layout) as *mut UnsafeCell<MaybeUninit<Slot<T>>> };
+        let ptr = unsafe { std::alloc::alloc(layout) as *mut AtomicSlot<T> };
 
         if ptr.is_null() {
             panic!("Failed to allocate buffer");
@@ -42,7 +83,7 @@ impl<T: Send + 'static> FfqQueue<T> {
 
         unsafe {
             for i in 0..capacity {
-                ptr::write(ptr.add(i), UnsafeCell::new(MaybeUninit::new(None)));
+                ptr::write(ptr.add(i), AtomicSlot::new_none());
             }
         }
 
@@ -62,8 +103,7 @@ impl<T: Send + 'static> FfqQueue<T> {
     pub fn shared_size(capacity: usize) -> usize {
         assert!(capacity.is_power_of_two() && capacity > 0);
         let self_layout = core::alloc::Layout::new::<Self>();
-        let buf_layout =
-            core::alloc::Layout::array::<UnsafeCell<MaybeUninit<Slot<T>>>>(capacity).unwrap();
+        let buf_layout = core::alloc::Layout::array::<AtomicSlot<T>>(capacity).unwrap();
         let (layout, _) = self_layout.extend(buf_layout).unwrap();
         layout.size()
     }
@@ -75,10 +115,10 @@ impl<T: Send + 'static> FfqQueue<T> {
         ptr::write_bytes(mem, 0, Self::shared_size(capacity));
 
         let queue_ptr = mem as *mut Self;
-        let buf_ptr = mem.add(std::mem::size_of::<Self>()) as *mut UnsafeCell<MaybeUninit<Slot<T>>>;
+        let buf_ptr = mem.add(std::mem::size_of::<Self>()) as *mut AtomicSlot<T>;
 
         for i in 0..capacity {
-            ptr::write(buf_ptr.add(i), UnsafeCell::new(MaybeUninit::new(None)));
+            ptr::write(buf_ptr.add(i), AtomicSlot::new_none());
         }
 
         ptr::write(
@@ -97,15 +137,13 @@ impl<T: Send + 'static> FfqQueue<T> {
         );
 
         let queue_ref = &mut *queue_ptr;
-
         queue_ref.initialized.store(true, Ordering::Release);
-
         queue_ref
     }
 
     #[inline]
-    fn slot_ptr(&self, index: usize) -> *mut MaybeUninit<Slot<T>> {
-        unsafe { (*self.buffer.add(index & self.mask)).get() }
+    fn get_slot(&self, index: usize) -> &AtomicSlot<T> {
+        unsafe { &*self.buffer.add(index & self.mask) }
     }
 
     #[inline]
@@ -126,16 +164,14 @@ impl<T: Send + 'static> SpscQueue<T> for FfqQueue<T> {
         self.ensure_initialized();
 
         let head = unsafe { *self.head.get() };
-        let slot = self.slot_ptr(head);
+        let slot = self.get_slot(head);
 
+        if slot.is_some() {
+            return Err(FfqPushError(item));
+        }
+
+        slot.write(item);
         unsafe {
-            let slot_ref = &*slot;
-            if slot_ref.assume_init_ref().is_some() {
-                return Err(FfqPushError(item));
-            }
-
-            ptr::write(slot, MaybeUninit::new(Some(item)));
-
             *self.head.get() = head.wrapping_add(1);
         }
 
@@ -147,22 +183,16 @@ impl<T: Send + 'static> SpscQueue<T> for FfqQueue<T> {
         self.ensure_initialized();
 
         let tail = unsafe { *self.tail.get() };
-        let slot = self.slot_ptr(tail);
+        let slot = self.get_slot(tail);
 
-        unsafe {
-            let slot_ref = &*slot;
-            match slot_ref.assume_init_ref() {
-                Some(_) => {
-                    let val = ptr::read(slot).assume_init().unwrap();
-
-                    ptr::write(slot, MaybeUninit::new(None));
-
+        match slot.take() {
+            Some(val) => {
+                unsafe {
                     *self.tail.get() = tail.wrapping_add(1);
-
-                    Ok(val)
                 }
-                None => Err(FfqPopError),
+                Ok(val)
             }
+            None => Err(FfqPopError),
         }
     }
 
@@ -171,11 +201,8 @@ impl<T: Send + 'static> SpscQueue<T> for FfqQueue<T> {
         self.ensure_initialized();
 
         let head = unsafe { *self.head.get() };
-        let slot = self.slot_ptr(head);
-        unsafe {
-            let slot_ref = &*slot;
-            slot_ref.assume_init_ref().is_none()
-        }
+        let slot = self.get_slot(head);
+        !slot.is_some()
     }
 
     #[inline]
@@ -183,11 +210,8 @@ impl<T: Send + 'static> SpscQueue<T> for FfqQueue<T> {
         self.ensure_initialized();
 
         let tail = unsafe { *self.tail.get() };
-        let slot = self.slot_ptr(tail);
-        unsafe {
-            let slot_ref = &*slot;
-            slot_ref.assume_init_ref().is_none()
-        }
+        let slot = self.get_slot(tail);
+        !slot.is_some()
     }
 }
 
@@ -195,18 +219,18 @@ impl<T: Send + 'static> Drop for FfqQueue<T> {
     fn drop(&mut self) {
         if self.owns_buffer && !self.buffer.is_null() {
             unsafe {
+                // Drain any remaining items
                 if core::mem::needs_drop::<T>() {
                     for i in 0..self.capacity {
-                        let slot = self.slot_ptr(i);
-                        let maybe = ptr::read(slot).assume_init();
+                        let slot = self.get_slot(i);
+                        drop(slot.take());
                     }
                 }
 
-                let layout =
-                    std::alloc::Layout::array::<UnsafeCell<MaybeUninit<Slot<T>>>>(self.capacity)
-                        .unwrap()
-                        .align_to(64)
-                        .unwrap();
+                let layout = std::alloc::Layout::array::<AtomicSlot<T>>(self.capacity)
+                    .unwrap()
+                    .align_to(64)
+                    .unwrap();
                 std::alloc::dealloc(self.buffer as *mut u8, layout);
             }
         }

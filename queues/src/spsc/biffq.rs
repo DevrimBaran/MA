@@ -1,17 +1,65 @@
 use crate::SpscQueue;
 use std::cell::UnsafeCell;
 use std::fmt;
-use std::mem::{self, MaybeUninit};
+use std::mem::MaybeUninit;
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering};
 
 const H_PARTITION_SIZE: usize = 32;
 const LOCAL_BATCH_SIZE: usize = 32;
 
-type Slot<T> = Option<T>;
+// Atomic slot that can store Copy types directly
+#[repr(C, align(8))]
+struct AtomicSlot<T: Copy> {
+    occupied: AtomicBool,
+    value: UnsafeCell<T>,
+}
+
+impl<T: Copy> AtomicSlot<T> {
+    const fn new(value: T) -> Self {
+        Self {
+            occupied: AtomicBool::new(false),
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    #[inline]
+    fn is_occupied(&self) -> bool {
+        self.occupied.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn store(&self, value: T) {
+        unsafe {
+            *self.value.get() = value;
+        }
+        // Use Release ordering to ensure the value write happens-before any subsequent read
+        self.occupied.store(true, Ordering::Release);
+    }
+
+    #[inline]
+    fn load(&self) -> Option<T> {
+        // Use Acquire ordering to ensure we see the value write if occupied is true
+        if self.occupied.load(Ordering::Acquire) {
+            Some(unsafe { *self.value.get() })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn take(&self) -> Option<T> {
+        // Use Acquire ordering to establish happens-before with the store
+        if self.occupied.swap(false, Ordering::Acquire) {
+            Some(unsafe { *self.value.get() })
+        } else {
+            None
+        }
+    }
+}
 
 #[repr(C, align(64))]
-pub struct ProducerFieldsB<T: Send + 'static> {
+pub struct ProducerFieldsB<T: Copy + Send + Default + 'static> {
     write: AtomicUsize,
     limit: AtomicUsize,
     local_buffer: UnsafeCell<[MaybeUninit<T>; LOCAL_BATCH_SIZE]>,
@@ -25,18 +73,18 @@ struct ConsumerFieldsB {
 }
 
 #[repr(C, align(64))]
-pub struct BiffqQueue<T: Send + 'static> {
+pub struct BiffqQueue<T: Copy + Send + Default + 'static> {
     pub prod: ProducerFieldsB<T>,
     cons: ConsumerFieldsB,
     capacity: usize,
     mask: usize,
     h_mask: usize,
-    buffer: *mut UnsafeCell<MaybeUninit<Slot<T>>>,
+    buffer: *mut AtomicSlot<T>,
     owns_buffer: bool,
 }
 
-unsafe impl<T: Send> Send for BiffqQueue<T> {}
-unsafe impl<T: Send> Sync for BiffqQueue<T> {}
+unsafe impl<T: Copy + Send + Default> Send for BiffqQueue<T> {}
+unsafe impl<T: Copy + Send + Default> Sync for BiffqQueue<T> {}
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct BiffqPushError<T>(pub T);
@@ -44,7 +92,7 @@ pub struct BiffqPushError<T>(pub T);
 #[derive(Debug, PartialEq, Eq)]
 pub struct BiffqPopError;
 
-impl<T: Send + 'static> BiffqQueue<T> {
+impl<T: Copy + Send + Default + 'static> BiffqQueue<T> {
     pub fn with_capacity(capacity: usize) -> Self {
         assert!(
             capacity.is_power_of_two(),
@@ -60,12 +108,19 @@ impl<T: Send + 'static> BiffqQueue<T> {
             "Capacity must be at least 2 * H_PARTITION_SIZE."
         );
 
-        let mut buffer_mem: Vec<UnsafeCell<MaybeUninit<Slot<T>>>> = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            buffer_mem.push(UnsafeCell::new(MaybeUninit::new(None)));
-        }
-        let buffer_ptr = buffer_mem.as_mut_ptr();
-        mem::forget(buffer_mem);
+        // Allocate buffer with proper alignment
+        let layout = std::alloc::Layout::array::<AtomicSlot<T>>(capacity).unwrap();
+        let buffer_ptr = unsafe {
+            let ptr = std::alloc::alloc(layout) as *mut AtomicSlot<T>;
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            // Initialize all slots as unoccupied
+            for i in 0..capacity {
+                ptr::write(ptr.add(i), AtomicSlot::new(T::default()));
+            }
+            ptr
+        };
 
         let local_buf_uninit: [MaybeUninit<T>; LOCAL_BATCH_SIZE] =
             unsafe { MaybeUninit::uninit().assume_init() };
@@ -105,8 +160,7 @@ impl<T: Send + 'static> BiffqQueue<T> {
         );
 
         let layout = std::alloc::Layout::new::<Self>();
-        let buffer_layout =
-            std::alloc::Layout::array::<UnsafeCell<MaybeUninit<Slot<T>>>>(capacity).unwrap();
+        let buffer_layout = std::alloc::Layout::array::<AtomicSlot<T>>(capacity).unwrap();
         layout.extend(buffer_layout).unwrap().0.size()
     }
 
@@ -126,14 +180,11 @@ impl<T: Send + 'static> BiffqQueue<T> {
         );
 
         let queue_ptr = mem_ptr as *mut Self;
-        let buffer_data_ptr =
-            mem_ptr.add(std::mem::size_of::<Self>()) as *mut UnsafeCell<MaybeUninit<Slot<T>>>;
+        let buffer_data_ptr = mem_ptr.add(std::mem::size_of::<Self>()) as *mut AtomicSlot<T>;
 
+        // Initialize all slots as unoccupied
         for i in 0..capacity {
-            ptr::write(
-                buffer_data_ptr.add(i),
-                UnsafeCell::new(MaybeUninit::new(None)),
-            );
+            ptr::write(buffer_data_ptr.add(i), AtomicSlot::new(T::default()));
         }
 
         let local_buf_uninit: [MaybeUninit<T>; LOCAL_BATCH_SIZE] =
@@ -163,7 +214,7 @@ impl<T: Send + 'static> BiffqQueue<T> {
     }
 
     #[inline]
-    fn get_slot(&self, index: usize) -> &UnsafeCell<MaybeUninit<Slot<T>>> {
+    fn get_slot(&self, index: usize) -> &AtomicSlot<T> {
         unsafe { &*self.buffer.add(index & self.mask) }
     }
 
@@ -182,11 +233,14 @@ impl<T: Send + 'static> BiffqQueue<T> {
             if current_write == current_limit {
                 let next_limit_potential = current_limit.wrapping_add(H_PARTITION_SIZE);
                 let slot_to_check_idx = next_limit_potential & self.mask;
-                let slot_state =
-                    unsafe { (*self.get_slot(slot_to_check_idx).get()).assume_init_read() };
+                let slot_occupied = self.get_slot(slot_to_check_idx).is_occupied();
 
-                if slot_state.is_some() {
+                if slot_occupied {
+                    // Slot is not empty, can't proceed
+                    fence(Ordering::Release);
                     self.prod.write.store(current_write, Ordering::Release);
+
+                    // Copy remaining items back to the beginning of local buffer
                     unsafe {
                         let src = (*local_buf_ptr).as_ptr().add(i);
                         let dst = (*local_buf_ptr).as_mut_ptr();
@@ -208,14 +262,16 @@ impl<T: Send + 'static> BiffqQueue<T> {
             }
 
             let item_to_write = unsafe { ptr::read(&(*local_buf_ptr)[i]).assume_init() };
-            let shared_slot_ptr = self.get_slot(current_write).get();
-            unsafe {
-                ptr::write(shared_slot_ptr, MaybeUninit::new(Some(item_to_write)));
-            }
+            let slot = self.get_slot(current_write);
+
+            // Store value directly in the atomic slot
+            slot.store(item_to_write);
+
             current_write = current_write.wrapping_add(1);
             published_count += 1;
         }
 
+        fence(Ordering::Release);
         self.prod.write.store(current_write, Ordering::Release);
         self.prod.local_count.store(0, Ordering::Release);
         Ok(published_count)
@@ -223,15 +279,15 @@ impl<T: Send + 'static> BiffqQueue<T> {
 
     fn dequeue_internal(&self) -> Result<T, BiffqPopError> {
         let current_read = self.cons.read.load(Ordering::Relaxed);
-        let slot_ptr = self.get_slot(current_read).get();
+        let slot = self.get_slot(current_read);
 
-        let item_opt = unsafe { (*slot_ptr).assume_init_read() };
-
-        if let Some(item) = item_opt {
+        // Try to take the item atomically
+        if let Some(item) = slot.take() {
             self.cons
                 .read
                 .store(current_read.wrapping_add(1), Ordering::Release);
 
+            // Clear operation
             let current_clear = self.cons.clear.load(Ordering::Relaxed);
             let read_partition_start = current_read & !self.h_mask;
             let next_clear_target = read_partition_start.wrapping_sub(H_PARTITION_SIZE);
@@ -242,14 +298,7 @@ impl<T: Send + 'static> BiffqQueue<T> {
                 if temp_clear == self.cons.read.load(Ordering::Acquire) {
                     break;
                 }
-                let clear_slot_ptr = self.get_slot(temp_clear).get();
-                unsafe {
-                    if std::mem::needs_drop::<Slot<T>>() {
-                        let mu_slot = ptr::read(clear_slot_ptr);
-                        drop(mu_slot.assume_init());
-                    }
-                    ptr::write(clear_slot_ptr, MaybeUninit::new(None));
-                }
+                // Slots are already cleared by take() above, just advance pointer
                 temp_clear = temp_clear.wrapping_add(1);
                 advanced_clear = true;
             }
@@ -267,7 +316,7 @@ impl<T: Send + 'static> BiffqQueue<T> {
     }
 }
 
-impl<T: Send + 'static> SpscQueue<T> for BiffqQueue<T> {
+impl<T: Copy + Send + Default + 'static> SpscQueue<T> for BiffqQueue<T> {
     type PushError = BiffqPushError<T>;
     type PopError = BiffqPopError;
 
@@ -331,11 +380,7 @@ impl<T: Send + 'static> SpscQueue<T> for BiffqQueue<T> {
         }
         let next_limit_potential = limit.wrapping_add(H_PARTITION_SIZE);
         let slot_to_check_idx = next_limit_potential & self.mask;
-        unsafe {
-            (*self.get_slot(slot_to_check_idx).get())
-                .assume_init_read()
-                .is_none()
-        }
+        !self.get_slot(slot_to_check_idx).is_occupied()
     }
 
     #[inline]
@@ -346,12 +391,11 @@ impl<T: Send + 'static> SpscQueue<T> for BiffqQueue<T> {
         }
 
         let current_read = self.cons.read.load(Ordering::Acquire);
-        let slot_state = unsafe { (*self.get_slot(current_read).get()).assume_init_read() };
-        slot_state.is_none()
+        !self.get_slot(current_read).is_occupied()
     }
 }
 
-impl<T: Send + 'static> Drop for BiffqQueue<T> {
+impl<T: Copy + Send + Default + 'static> Drop for BiffqQueue<T> {
     fn drop(&mut self) {
         if self.owns_buffer {
             // Flush any items in local buffer
@@ -361,42 +405,27 @@ impl<T: Send + 'static> Drop for BiffqQueue<T> {
             }
 
             // Drop items still in local buffer after flush attempt
-            if std::mem::needs_drop::<T>() {
-                let remaining_local = *self.prod.local_count.get_mut();
-                if remaining_local > 0 {
-                    unsafe {
-                        let local_buf_ptr = (*self.prod.local_buffer.get_mut()).as_mut_ptr();
-                        for i in 0..remaining_local {
-                            ptr::drop_in_place(local_buf_ptr.add(i).cast::<T>());
-                        }
+            let remaining_local = *self.prod.local_count.get_mut();
+            if remaining_local > 0 {
+                unsafe {
+                    let local_buf_ptr = (*self.prod.local_buffer.get_mut()).as_mut_ptr();
+                    for i in 0..remaining_local {
+                        ptr::drop_in_place(local_buf_ptr.add(i).cast::<T>());
                     }
                 }
             }
 
-            // Drop items in the main buffer
-            if std::mem::needs_drop::<T>() {
-                let mut current_read = *self.cons.read.get_mut();
-                let current_write = *self.prod.write.get_mut();
-                while current_read != current_write {
-                    let slot_ptr = self.get_slot(current_read).get();
-                    unsafe {
-                        let mu_opt_t = ptr::read(slot_ptr);
-                        drop(mu_opt_t.assume_init());
-                    }
-                    current_read = current_read.wrapping_add(1);
-                }
-            }
-
-            // Free the buffer
+            // No need to drop items in slots since they're Copy types
+            // Just free the buffer
             unsafe {
-                let buffer_slice = std::slice::from_raw_parts_mut(self.buffer, self.capacity);
-                let _ = Box::from_raw(buffer_slice);
+                let layout = std::alloc::Layout::array::<AtomicSlot<T>>(self.capacity).unwrap();
+                std::alloc::dealloc(self.buffer as *mut u8, layout);
             }
         }
     }
 }
 
-impl<T: Send + fmt::Debug + 'static> fmt::Debug for BiffqQueue<T> {
+impl<T: Copy + Send + Default + fmt::Debug + 'static> fmt::Debug for BiffqQueue<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BiffqQueue")
             .field("capacity", &self.capacity)

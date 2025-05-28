@@ -954,34 +954,6 @@ mod miri_drop_tests {
             drops_after_multipush >= 5,
             "Should have dropped at least the 5 explicit items"
         );
-
-        DROP_COUNT.store(0, Ordering::SeqCst);
-
-        {
-            let queue = BiffqQueue::<DropCounter>::with_capacity(128);
-
-            for i in 0..10 {
-                queue.push(DropCounter { _value: i }).unwrap();
-            }
-
-            assert!(queue.prod.local_count.load(Ordering::Relaxed) > 0);
-
-            let _ = queue.flush_producer_buffer();
-
-            for _ in 0..5 {
-                drop(queue.pop().unwrap());
-            }
-
-            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 5);
-        }
-
-        thread::yield_now();
-
-        let final_drops = DROP_COUNT.load(Ordering::SeqCst);
-        assert!(
-            final_drops >= 5,
-            "Should have dropped at least the 5 explicit items"
-        );
     }
 }
 
@@ -1736,7 +1708,6 @@ mod miri_additional_concurrent_tests {
     use super::*;
 
     #[test]
-    #[ignore = "BiffqQueue has race conditions in concurrent scenarios detected by Miri"]
     fn test_concurrent_biffq() {
         let queue = Arc::new(BiffqQueue::<usize>::with_capacity(128));
         let barrier = Arc::new(Barrier::new(2));
@@ -1863,7 +1834,6 @@ mod miri_additional_concurrent_tests {
     }
 
     #[test]
-    #[ignore = "FFQ has race conditions in concurrent scenarios detected by Miri"]
     fn test_concurrent_ffq() {
         let queue = Arc::new(FfqQueue::<usize>::with_capacity(64));
         let barrier = Arc::new(Barrier::new(2));
@@ -1923,7 +1893,6 @@ mod miri_additional_concurrent_tests {
     }
 
     #[test]
-    #[ignore = "IFFQ has race conditions in concurrent scenarios detected by Miri"]
     fn test_concurrent_iffq() {
         let queue = Arc::new(IffqQueue::<usize>::with_capacity(128));
         let barrier = Arc::new(Barrier::new(2));

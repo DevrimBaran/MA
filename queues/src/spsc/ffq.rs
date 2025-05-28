@@ -4,7 +4,8 @@ use crate::SpscQueue;
 use core::{cell::UnsafeCell, fmt, mem::MaybeUninit, ptr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-// Atomic wrapper for the slot to prevent data races
+// In queues/src/spsc/ffq.rs
+
 #[repr(C)]
 pub struct AtomicSlot<T> {
     // Using AtomicUsize for the discriminant and UnsafeCell for the value
@@ -23,7 +24,6 @@ impl<T> AtomicSlot<T> {
 
     #[inline]
     pub fn is_some(&self) -> bool {
-        // Use Acquire for IPC visibility
         self.state.load(Ordering::Acquire) == 1
     }
 
@@ -32,22 +32,18 @@ impl<T> AtomicSlot<T> {
         unsafe {
             (*self.value.get()).write(value);
         }
-        // Use stronger ordering for IPC - SeqCst ensures visibility across processes
-        self.state.store(1, Ordering::SeqCst);
+        // Use Release ordering to ensure the value write happens-before state change
+        self.state.store(1, Ordering::Release);
     }
 
     #[inline]
     pub fn take(&self) -> Option<T> {
-        // Use compare_exchange with SeqCst for IPC
-        match self
-            .state
-            .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
-        {
-            Ok(_) => {
-                // We had Some, extract the value
-                Some(unsafe { (*self.value.get()).assume_init_read() })
-            }
-            Err(_) => None,
+        // Use swap instead of compare_exchange to atomically take ownership
+        if self.state.swap(0, Ordering::AcqRel) == 1 {
+            // We successfully took ownership (changed from 1 to 0)
+            Some(unsafe { (*self.value.get()).assume_init_read() })
+        } else {
+            None
         }
     }
 }

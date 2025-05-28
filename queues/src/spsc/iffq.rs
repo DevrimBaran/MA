@@ -40,22 +40,18 @@ impl<T> AtomicSlot<T> {
 
     #[inline]
     fn read(&self) -> Option<T> {
-        // Use compare_exchange for atomic read-and-clear
-        match self
-            .state
-            .compare_exchange(1, 0, Ordering::Acquire, Ordering::Relaxed)
-        {
-            Ok(_) => {
-                // We successfully took ownership
-                Some(unsafe { (*self.value.get()).assume_init_read() })
-            }
-            Err(_) => None,
+        // Use swap to atomically take ownership
+        if self.state.swap(0, Ordering::AcqRel) == 1 {
+            // We successfully took ownership (changed from 1 to 0)
+            Some(unsafe { (*self.value.get()).assume_init_read() })
+        } else {
+            None
         }
     }
 
     #[inline]
     fn clear(&self) {
-        // This might be redundant now since read() already clears
+        // This is now redundant since read() already clears
         self.state.store(0, Ordering::Release);
     }
 }

@@ -743,19 +743,15 @@ mod multipush_tests {
 mod unbounded_tests {
     use super::*;
 
-    // Helper function to allocate aligned memory
     fn allocate_aligned_memory(size: usize, alignment: usize) -> Vec<u8> {
-        // Allocate extra space to ensure we can align
         let total_size = size + alignment;
         let mut memory = vec![0u8; total_size];
 
-        // Get aligned pointer within the allocation
         let ptr = memory.as_mut_ptr();
         let addr = ptr as usize;
         let aligned_addr = (addr + alignment - 1) & !(alignment - 1);
         let offset = aligned_addr - addr;
 
-        // Create a new vector starting at the aligned offset
         let mut aligned_memory = Vec::with_capacity(size);
         unsafe {
             aligned_memory.set_len(size);
@@ -766,7 +762,6 @@ mod unbounded_tests {
             );
         }
 
-        // Verify alignment
         assert_eq!(
             aligned_memory.as_ptr() as usize % alignment,
             0,
@@ -777,7 +772,6 @@ mod unbounded_tests {
         aligned_memory
     }
 
-    // Alternative: Use Box with Layout
     fn allocate_aligned_box(size: usize, alignment: usize) -> Box<[u8]> {
         use std::alloc::{alloc_zeroed, Layout};
 
@@ -796,13 +790,12 @@ mod unbounded_tests {
     #[test]
     fn test_unbounded_basic() {
         let shared_size = UnboundedQueue::<usize>::shared_size(8192);
-        // UnboundedQueue has #[repr(C, align(128))]
+
         const ALIGNMENT: usize = 128;
 
         let memory = allocate_aligned_box(shared_size, ALIGNMENT);
         let mem_ptr = Box::leak(memory).as_mut_ptr();
 
-        // Verify alignment
         assert_eq!(
             mem_ptr as usize % ALIGNMENT,
             0,
@@ -816,7 +809,6 @@ mod unbounded_tests {
         assert_eq!(queue.pop().unwrap(), 42);
         assert!(queue.empty());
 
-        // Clean up
         unsafe {
             let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
         }
@@ -961,7 +953,6 @@ mod unbounded_tests {
             }
         }
 
-        // Clean up
         unsafe {
             use std::alloc::{dealloc, Layout};
             let layout = Layout::from_size_align(shared_size, 128).unwrap();
@@ -982,7 +973,6 @@ mod unbounded_tests {
                 panic!("Failed to allocate aligned memory");
             }
 
-            // Verify alignment
             assert_eq!(
                 ptr as usize % ALIGNMENT,
                 0,
@@ -1037,7 +1027,6 @@ mod unbounded_tests {
                 drop(queue.pop().unwrap());
             }
 
-            // Clean up
             unsafe {
                 use std::alloc::{dealloc, Layout};
                 let layout = Layout::from_size_align(shared_size, 128).unwrap();
@@ -1104,7 +1093,6 @@ mod unbounded_tests {
             }
         }
 
-        // Clean up
         unsafe {
             use std::alloc::{dealloc, Layout};
             let layout = Layout::from_size_align(shared_size, 128).unwrap();
@@ -1114,7 +1102,6 @@ mod unbounded_tests {
 
     #[test]
     fn test_unbounded_drop_implementation() {
-        // Helper function for aligned allocation
         fn allocate_aligned_memory(size: usize, alignment: usize) -> (*mut u8, usize) {
             use std::alloc::{alloc_zeroed, Layout};
 
@@ -1125,7 +1112,6 @@ mod unbounded_tests {
                     panic!("Failed to allocate aligned memory");
                 }
 
-                // Verify alignment
                 assert_eq!(
                     ptr as usize % alignment,
                     0,
@@ -1137,16 +1123,14 @@ mod unbounded_tests {
             }
         }
 
-        // Helper to deallocate aligned memory
         unsafe fn deallocate_aligned_memory(ptr: *mut u8, size: usize, alignment: usize) {
             use std::alloc::{dealloc, Layout};
             let layout = Layout::from_size_align(size, alignment).unwrap();
             dealloc(ptr, layout);
         }
 
-        const ALIGNMENT: usize = 128; // UnboundedQueue requires 128-byte alignment
+        const ALIGNMENT: usize = 128;
 
-        // Test 1: Unit type (no drop needed)
         {
             let shared_size = UnboundedQueue::<()>::shared_size(8192);
             let (mem_ptr, _) = allocate_aligned_memory(shared_size, ALIGNMENT);
@@ -1166,7 +1150,6 @@ mod unbounded_tests {
             }
         }
 
-        // Test 2: Vec<u8> (needs drop)
         {
             let shared_size = UnboundedQueue::<Vec<u8>>::shared_size(8192);
             let (mem_ptr, _) = allocate_aligned_memory(shared_size, ALIGNMENT);
@@ -1186,7 +1169,6 @@ mod unbounded_tests {
             }
         }
 
-        // Test 3: String (needs drop)
         {
             let shared_size = UnboundedQueue::<String>::shared_size(8192);
             let (mem_ptr, _) = allocate_aligned_memory(shared_size, ALIGNMENT);
@@ -1213,7 +1195,6 @@ mod unbounded_tests {
     fn test_unbounded_deallocate_segment_directly() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        // Helper function to create aligned memory
         fn allocate_aligned_box(size: usize, alignment: usize) -> Box<[u8]> {
             use std::alloc::{alloc_zeroed, Layout};
 
@@ -1229,7 +1210,6 @@ mod unbounded_tests {
             }
         }
 
-        // Test 1: deallocate null pointer
         {
             let shared_size = UnboundedQueue::<usize>::shared_size(8192);
             const ALIGNMENT: usize = 128;
@@ -1248,7 +1228,6 @@ mod unbounded_tests {
             }
         }
 
-        // Test 2: deallocate with size 0
         {
             let shared_size = UnboundedQueue::<usize>::shared_size(8192);
             const ALIGNMENT: usize = 128;
@@ -1275,7 +1254,6 @@ mod unbounded_tests {
             }
         }
 
-        // Test 3: fill and deallocate with String type
         {
             let shared_size = UnboundedQueue::<String>::shared_size(8192);
             const ALIGNMENT: usize = 128;
@@ -1302,7 +1280,6 @@ mod unbounded_tests {
             }
         }
 
-        // Test 4: drop counter test
         {
             static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -1353,7 +1330,6 @@ mod unbounded_tests {
             );
         }
 
-        // Test 5: Vec<u8> allocation and deallocation
         {
             let shared_size = UnboundedQueue::<Vec<u8>>::shared_size(8192);
             const ALIGNMENT: usize = 128;
@@ -1417,7 +1393,6 @@ mod unbounded_tests {
                 ptr
             };
 
-            // Verify alignment
             assert_eq!(mem_ptr as usize % ALIGNMENT, 0, "Memory not aligned");
 
             let queue = unsafe { UnboundedQueue::<DropTracker>::init_in_shared(mem_ptr, 8192) };
@@ -1736,13 +1711,10 @@ mod dehnavi_tests {
     }
 }
 
-// Update the create_aligned_memory_box function and test macro in shared_memory_tests module
-
 fn create_aligned_memory_box(size: usize, alignment: usize) -> Box<[u8]> {
     use std::alloc::{alloc_zeroed, Layout};
 
     unsafe {
-        // Create layout with requested size and alignment
         let layout = Layout::from_size_align(size, alignment).unwrap();
         let ptr = alloc_zeroed(layout);
         if ptr.is_null() {
@@ -1754,17 +1726,15 @@ fn create_aligned_memory_box(size: usize, alignment: usize) -> Box<[u8]> {
     }
 }
 
-// Updated test macro with alignment parameter
 macro_rules! test_shared_init {
     ($queue_type:ty, $capacity:expr, $alignment:expr, $test_name:ident) => {
         #[test]
         fn $test_name() {
             let shared_size = <$queue_type>::shared_size($capacity);
-            // Allocate with proper alignment
+
             let memory = create_aligned_memory_box(shared_size, $alignment);
             let mem_ptr = Box::leak(memory).as_mut_ptr();
 
-            // Verify alignment
             assert_eq!(
                 mem_ptr as usize % $alignment,
                 0,
@@ -1774,10 +1744,8 @@ macro_rules! test_shared_init {
 
             let queue = unsafe { <$queue_type>::init_in_shared(mem_ptr, $capacity) };
 
-            // Basic functionality test
             queue.push(123).unwrap();
 
-            // Handle special queue types that buffer items
             if stringify!($queue_type).contains("MultiPushQueue") {
                 if let Some(mp_queue) =
                     (queue as &dyn std::any::Any).downcast_ref::<MultiPushQueue<usize>>()
@@ -1795,7 +1763,6 @@ macro_rules! test_shared_init {
             assert_eq!(queue.pop().unwrap(), 123);
             assert!(queue.empty());
 
-            // Test capacity
             let mut pushed = 0;
             for i in 0..$capacity {
                 match queue.push(i) {
@@ -1806,7 +1773,6 @@ macro_rules! test_shared_init {
 
             assert!(pushed > 0);
 
-            // Flush buffered queues again
             if stringify!($queue_type).contains("MultiPushQueue") {
                 if let Some(mp_queue) = (queue as &dyn Any).downcast_ref::<MultiPushQueue<usize>>()
                 {
@@ -1818,14 +1784,12 @@ macro_rules! test_shared_init {
                 }
             }
 
-            // Pop items
             let mut popped = 0;
             let mut pop_attempts = 0;
             while popped < pushed && pop_attempts < pushed * 2 {
                 if queue.pop().is_ok() {
                     popped += 1;
                 } else {
-                    // Try flushing again for buffered queues
                     if stringify!($queue_type).contains("BiffqQueue") {
                         if let Some(biffq) = (queue as &dyn Any).downcast_ref::<BiffqQueue<usize>>()
                         {
@@ -1851,7 +1815,6 @@ macro_rules! test_shared_init {
                 assert_eq!(popped, pushed, "Should be able to pop all pushed items");
             }
 
-            // Don't leak memory
             unsafe {
                 let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
             }
@@ -1859,11 +1822,9 @@ macro_rules! test_shared_init {
     };
 }
 
-// Apply the macro with proper alignment values
 mod shared_memory_tests {
     use super::*;
 
-    // Most queues need 64-byte alignment
     test_shared_init!(LamportQueue<usize>, SMALL_CAPACITY, 64, test_lamport_shared);
     test_shared_init!(FfqQueue<usize>, MEDIUM_CAPACITY, 64, test_ffq_shared);
     test_shared_init!(BlqQueue<usize>, 128, 64, test_blq_shared);
@@ -1877,7 +1838,6 @@ mod shared_memory_tests {
         test_multipush_shared
     );
 
-    // Custom tests for special cases...
     #[test]
     fn test_dehnavi_shared() {
         let capacity = 10;
@@ -1891,7 +1851,6 @@ mod shared_memory_tests {
         assert_eq!(queue.pop().unwrap(), 123);
         assert!(queue.empty());
 
-        // Test Dehnavi's wait-free property
         let mut pushed = 0;
         for i in 0..capacity * 2 {
             queue.push(i).unwrap();
@@ -1983,7 +1942,7 @@ mod shared_memory_tests {
     #[test]
     fn test_dspsc_shared() {
         let shared_size = DynListQueue::<usize>::shared_size(8192);
-        let memory = create_aligned_memory_box(shared_size, 128); // DynListQueue uses 128-byte alignment
+        let memory = create_aligned_memory_box(shared_size, 128);
         let mem_ptr = Box::leak(memory).as_mut_ptr();
 
         let queue = unsafe { DynListQueue::<usize>::init_in_shared(mem_ptr, 8192) };
@@ -2009,7 +1968,7 @@ mod shared_memory_tests {
     #[test]
     fn test_unbounded_shared() {
         let shared_size = UnboundedQueue::<usize>::shared_size(8192);
-        let memory = create_aligned_memory_box(shared_size, 128); // UnboundedQueue uses 128-byte alignment
+        let memory = create_aligned_memory_box(shared_size, 128);
         let mem_ptr = Box::leak(memory).as_mut_ptr();
 
         let queue = unsafe { UnboundedQueue::<usize>::init_in_shared(mem_ptr, 8192) };
@@ -2149,16 +2108,12 @@ mod special_feature_tests {
         queue.blq_deq_publish();
     }
 
-    // In special_feature_tests module
-
     #[test]
     fn test_dspsc_shared_memory() {
         let shared_size = DynListQueue::<usize>::shared_size(8192);
 
-        // DynListQueue requires 128-byte alignment due to its Node structure
         const ALIGNMENT: usize = 128;
 
-        // Allocate memory with proper alignment
         use std::alloc::{alloc_zeroed, Layout};
 
         let layout =
@@ -2172,7 +2127,6 @@ mod special_feature_tests {
             ptr
         };
 
-        // Verify alignment
         assert_eq!(
             mem_ptr as usize % ALIGNMENT,
             0,
@@ -2182,12 +2136,10 @@ mod special_feature_tests {
 
         let queue = unsafe { DynListQueue::<usize>::init_in_shared(mem_ptr, 8192) };
 
-        // Test basic functionality
         queue.push(42).unwrap();
         assert_eq!(queue.pop().unwrap(), 42);
         assert!(queue.empty());
 
-        // Test multiple items
         for i in 0..100 {
             queue.push(i).unwrap();
         }
@@ -2198,7 +2150,6 @@ mod special_feature_tests {
 
         assert!(queue.empty());
 
-        // Test dynamic allocation beyond pre-allocated nodes
         for i in 0..20000 {
             queue.push(i).unwrap();
         }
@@ -2209,14 +2160,10 @@ mod special_feature_tests {
 
         assert!(queue.empty());
 
-        // Clean up
         unsafe {
             std::alloc::dealloc(mem_ptr, layout);
         }
     }
-
-    // Also check if there are other tests in special_feature_tests that might need fixing
-    // Here's a general fix for any other queue tests in that module:
 
     #[test]
     fn test_dspsc_dynamic_allocation() {
@@ -2453,28 +2400,22 @@ mod ipc_tests {
         ($queue_type:ty, $capacity:expr, $test_name:ident) => {
             #[test]
             fn $test_name() {
-                // Calculate sync structure size with proper alignment
                 const ATOMIC_BOOL_SIZE: usize = std::mem::size_of::<AtomicBool>();
                 const ATOMIC_USIZE_SIZE: usize = std::mem::size_of::<AtomicUsize>();
                 const ATOMIC_BOOL_ALIGN: usize = std::mem::align_of::<AtomicBool>();
                 const ATOMIC_USIZE_ALIGN: usize = std::mem::align_of::<AtomicUsize>();
 
-                // Layout: AtomicBool, padding, AtomicBool, padding, AtomicUsize
                 let mut sync_size = 0;
 
-                // First AtomicBool (producer_ready)
                 sync_size += ATOMIC_BOOL_SIZE;
 
-                // Padding for second AtomicBool
                 sync_size = (sync_size + ATOMIC_BOOL_ALIGN - 1) & !(ATOMIC_BOOL_ALIGN - 1);
                 sync_size += ATOMIC_BOOL_SIZE;
 
-                // Padding for AtomicUsize (ensure 8-byte alignment)
                 sync_size =
                     (sync_size + ATOMIC_USIZE_ALIGN.max(8) - 1) & !(ATOMIC_USIZE_ALIGN.max(8) - 1);
                 sync_size += ATOMIC_USIZE_SIZE;
 
-                // Align the whole sync area to cache line
                 sync_size = (sync_size + 63) & !63;
 
                 let shared_size = <$queue_type>::shared_size($capacity);
@@ -2482,7 +2423,6 @@ mod ipc_tests {
 
                 let shm_ptr = unsafe { map_shared(total_size) };
 
-                // Initialize sync variables with proper alignment
                 let producer_ready = unsafe { &*(shm_ptr as *const AtomicBool) };
 
                 let consumer_ready_offset =
@@ -2497,7 +2437,6 @@ mod ipc_tests {
                 let items_consumed =
                     unsafe { &*(shm_ptr.add(items_consumed_offset) as *const AtomicUsize) };
 
-                // Verify alignment
                 assert_eq!(
                     (producer_ready as *const _ as usize) % ATOMIC_BOOL_ALIGN,
                     0,
@@ -2525,15 +2464,12 @@ mod ipc_tests {
 
                 match unsafe { fork() } {
                     Ok(ForkResult::Child) => {
-                        // Producer process
                         producer_ready.store(true, Ordering::Release);
 
-                        // Wait for consumer to be ready
                         while !consumer_ready.load(Ordering::Acquire) {
                             std::hint::spin_loop();
                         }
 
-                        // Push items
                         for i in 0..NUM_ITEMS {
                             loop {
                                 match queue.push(i) {
@@ -2543,7 +2479,6 @@ mod ipc_tests {
                             }
                         }
 
-                        // Handle special queue types that buffer items
                         if let Some(mp_queue) =
                             (queue as &dyn std::any::Any).downcast_ref::<MultiPushQueue<usize>>()
                         {
@@ -2558,7 +2493,6 @@ mod ipc_tests {
                             }
 
                             if mp_queue.local_count.load(Ordering::Relaxed) > 0 {
-                                // Force flush by filling the buffer
                                 for _ in 0..16 {
                                     let _ = queue.push(999999);
                                 }
@@ -2582,9 +2516,6 @@ mod ipc_tests {
                         unsafe { libc::_exit(0) };
                     }
                     Ok(ForkResult::Parent { child }) => {
-                        // Consumer process
-
-                        // Wait for producer to be ready
                         while !producer_ready.load(Ordering::Acquire) {
                             std::hint::spin_loop();
                         }
@@ -2612,17 +2543,14 @@ mod ipc_tests {
 
                         items_consumed.store(received.len(), Ordering::SeqCst);
 
-                        // Wait for child process
                         waitpid(child, None).expect("waitpid failed");
 
-                        // Verify results
                         let consumed = items_consumed.load(Ordering::SeqCst);
                         assert_eq!(
                             consumed, NUM_ITEMS,
                             "Not all items were consumed in IPC test"
                         );
 
-                        // For MultiPushQueue, items might be out of order due to buffering
                         if stringify!($queue_type).contains("MultiPushQueue") {
                             let mut sorted_received = received.clone();
                             sorted_received.sort();
@@ -2635,7 +2563,6 @@ mod ipc_tests {
                                 );
                             }
                         } else {
-                            // For other queues, verify FIFO order
                             for (i, &item) in received.iter().enumerate() {
                                 assert_eq!(item, i, "Items received out of order");
                             }
@@ -2669,36 +2596,28 @@ mod ipc_tests {
         let capacity = 1024;
         let shared_size = LlqQueue::<usize>::llq_shared_size(capacity);
 
-        // Calculate sync structure size with proper alignment
         const ATOMIC_BOOL_SIZE: usize = std::mem::size_of::<AtomicBool>();
         const ATOMIC_USIZE_SIZE: usize = std::mem::size_of::<AtomicUsize>();
         const ATOMIC_BOOL_ALIGN: usize = std::mem::align_of::<AtomicBool>();
         const ATOMIC_USIZE_ALIGN: usize = std::mem::align_of::<AtomicUsize>();
 
-        // Layout: AtomicBool, padding, AtomicBool, padding, AtomicUsize
         let mut sync_size = 0;
 
-        // First AtomicBool (producer_ready)
         sync_size += ATOMIC_BOOL_SIZE;
 
-        // Padding for second AtomicBool
         sync_size = (sync_size + ATOMIC_BOOL_ALIGN - 1) & !(ATOMIC_BOOL_ALIGN - 1);
         sync_size += ATOMIC_BOOL_SIZE;
 
-        // Padding for AtomicUsize (ensure 8-byte alignment)
         sync_size = (sync_size + ATOMIC_USIZE_ALIGN.max(8) - 1) & !(ATOMIC_USIZE_ALIGN.max(8) - 1);
         sync_size += ATOMIC_USIZE_SIZE;
 
-        // Align the whole sync area to cache line
         sync_size = (sync_size + 63) & !63;
 
-        // Align queue to 64 bytes as well
         let queue_alignment = 64;
         let total_size = sync_size + shared_size + queue_alignment;
 
         let shm_ptr = unsafe { map_shared(total_size) };
 
-        // Initialize sync variables with proper alignment
         let producer_ready = unsafe { &*(shm_ptr as *const AtomicBool) };
 
         let consumer_ready_offset =
@@ -2712,7 +2631,6 @@ mod ipc_tests {
         let items_consumed =
             unsafe { &*(shm_ptr.add(items_consumed_offset) as *const AtomicUsize) };
 
-        // Verify alignment
         assert_eq!(
             (producer_ready as *const _ as usize) % ATOMIC_BOOL_ALIGN,
             0,
@@ -2733,7 +2651,6 @@ mod ipc_tests {
         consumer_ready.store(false, Ordering::SeqCst);
         items_consumed.store(0, Ordering::SeqCst);
 
-        // Align queue pointer to 64 bytes
         let queue_ptr = unsafe {
             let unaligned_ptr = shm_ptr.add(sync_size);
             let addr = unaligned_ptr as usize;
@@ -2741,7 +2658,6 @@ mod ipc_tests {
             aligned_addr as *mut u8
         };
 
-        // Verify queue alignment
         assert_eq!(
             queue_ptr as usize % queue_alignment,
             0,
@@ -2755,15 +2671,12 @@ mod ipc_tests {
 
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
-                // Producer process
                 producer_ready.store(true, Ordering::Release);
 
-                // Wait for consumer to be ready
                 while !consumer_ready.load(Ordering::Acquire) {
                     std::hint::spin_loop();
                 }
 
-                // Push items
                 for i in 0..NUM_ITEMS {
                     loop {
                         match queue.push(i) {
@@ -2776,9 +2689,6 @@ mod ipc_tests {
                 unsafe { libc::_exit(0) };
             }
             Ok(ForkResult::Parent { child }) => {
-                // Consumer process
-
-                // Wait for producer to be ready
                 while !producer_ready.load(Ordering::Acquire) {
                     std::hint::spin_loop();
                 }
@@ -2806,17 +2716,14 @@ mod ipc_tests {
 
                 items_consumed.store(received.len(), Ordering::SeqCst);
 
-                // Wait for child process
                 waitpid(child, None).expect("waitpid failed");
 
-                // Verify results
                 let consumed = items_consumed.load(Ordering::SeqCst);
                 assert_eq!(
                     consumed, NUM_ITEMS,
                     "Not all items were consumed in IPC test"
                 );
 
-                // Verify FIFO order
                 for (i, &item) in received.iter().enumerate() {
                     assert_eq!(item, i, "Items received out of order");
                 }
@@ -3000,36 +2907,28 @@ mod ipc_tests {
         let pool_capacity = 10000;
         let shared_size = SesdJpSpscBenchWrapper::<usize>::shared_size(pool_capacity);
 
-        // Calculate sync structure size with proper alignment
         const ATOMIC_BOOL_SIZE: usize = std::mem::size_of::<AtomicBool>();
         const ATOMIC_USIZE_SIZE: usize = std::mem::size_of::<AtomicUsize>();
         const ATOMIC_BOOL_ALIGN: usize = std::mem::align_of::<AtomicBool>();
         const ATOMIC_USIZE_ALIGN: usize = std::mem::align_of::<AtomicUsize>();
 
-        // Layout: AtomicBool, padding, AtomicBool, padding, AtomicUsize
         let mut sync_size = 0;
 
-        // First AtomicBool (producer_ready)
         sync_size += ATOMIC_BOOL_SIZE;
 
-        // Padding for second AtomicBool
         sync_size = (sync_size + ATOMIC_BOOL_ALIGN - 1) & !(ATOMIC_BOOL_ALIGN - 1);
         sync_size += ATOMIC_BOOL_SIZE;
 
-        // Padding for AtomicUsize (ensure 8-byte alignment)
         sync_size = (sync_size + ATOMIC_USIZE_ALIGN.max(8) - 1) & !(ATOMIC_USIZE_ALIGN.max(8) - 1);
         sync_size += ATOMIC_USIZE_SIZE;
 
-        // Align the whole sync area to cache line
         sync_size = (sync_size + 63) & !63;
 
-        // SesdJpSpscBenchWrapper might need special alignment
         let queue_alignment = 64;
         let total_size = sync_size + shared_size + queue_alignment;
 
         let shm_ptr = unsafe { map_shared(total_size) };
 
-        // Initialize sync variables with proper alignment
         let producer_ready = unsafe { &*(shm_ptr as *const AtomicBool) };
 
         let consumer_ready_offset =
@@ -3043,7 +2942,6 @@ mod ipc_tests {
         let items_consumed =
             unsafe { &*(shm_ptr.add(items_consumed_offset) as *const AtomicUsize) };
 
-        // Verify alignment of sync variables
         assert_eq!(
             (producer_ready as *const _ as usize) % ATOMIC_BOOL_ALIGN,
             0,
@@ -3064,7 +2962,6 @@ mod ipc_tests {
         consumer_ready.store(false, Ordering::SeqCst);
         items_consumed.store(0, Ordering::SeqCst);
 
-        // Align queue pointer to required alignment
         let queue_ptr = unsafe {
             let unaligned_ptr = shm_ptr.add(sync_size);
             let addr = unaligned_ptr as usize;
@@ -3072,7 +2969,6 @@ mod ipc_tests {
             aligned_addr as *mut u8
         };
 
-        // Verify queue alignment
         assert_eq!(
             queue_ptr as usize % queue_alignment,
             0,
@@ -3086,15 +2982,12 @@ mod ipc_tests {
 
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
-                // Producer process
                 producer_ready.store(true, Ordering::Release);
 
-                // Wait for consumer to be ready
                 while !consumer_ready.load(Ordering::Acquire) {
                     std::hint::spin_loop();
                 }
 
-                // Push items
                 for i in 0..NUM_ITEMS {
                     loop {
                         match queue.push(i) {
@@ -3107,9 +3000,6 @@ mod ipc_tests {
                 unsafe { libc::_exit(0) };
             }
             Ok(ForkResult::Parent { child }) => {
-                // Consumer process
-
-                // Wait for producer to be ready
                 while !producer_ready.load(Ordering::Acquire) {
                     std::hint::spin_loop();
                 }
@@ -3137,17 +3027,14 @@ mod ipc_tests {
 
                 items_consumed.store(received.len(), Ordering::SeqCst);
 
-                // Wait for child process
                 waitpid(child, None).expect("waitpid failed");
 
-                // Verify results
                 let consumed = items_consumed.load(Ordering::SeqCst);
                 assert_eq!(
                     consumed, NUM_ITEMS,
                     "Not all items were consumed in IPC test"
                 );
 
-                // Verify FIFO order
                 for (i, &item) in received.iter().enumerate() {
                     assert_eq!(item, i, "Items received out of order");
                 }

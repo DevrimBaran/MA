@@ -4,12 +4,10 @@ use queues::{mpsc::*, MpscQueue};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-// Smaller sizes for Miri performance
 const MIRI_PRODUCERS: usize = 2;
 const MIRI_ITEMS_PER_PRODUCER: usize = 50;
 const MIRI_NODE_POOL: usize = 200;
 
-// Helper for aligned allocation
 fn create_aligned_memory(size: usize, alignment: usize) -> Box<[u8]> {
     let layout = std::alloc::Layout::from_size_align(size, alignment).expect("Invalid layout");
 
@@ -34,14 +32,12 @@ mod miri_drescher_tests {
 
         let queue = unsafe { DrescherQueue::init_in_shared(mem_ptr, expected_nodes) };
 
-        // Basic operations
         assert!(queue.is_empty());
         queue.push(42).unwrap();
         assert!(!queue.is_empty());
         assert_eq!(queue.pop().unwrap(), 42);
         assert!(queue.is_empty());
 
-        // Multiple items
         for i in 0..10 {
             queue.push(i).unwrap();
         }
@@ -50,7 +46,6 @@ mod miri_drescher_tests {
             assert_eq!(queue.pop().unwrap(), i);
         }
 
-        // Clean up
         unsafe {
             let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
         }
@@ -65,7 +60,6 @@ mod miri_drescher_tests {
 
         let queue = unsafe { DrescherQueue::init_in_shared(mem_ptr, nodes) };
 
-        // Test node recycling
         for cycle in 0..3 {
             for i in 0..10 {
                 queue.push(format!("cycle_{}_item_{}", cycle, i)).unwrap();
@@ -96,7 +90,6 @@ mod miri_drescher_tests {
 
         let mut handles = vec![];
 
-        // Spawn producers
         for producer_id in 0..MIRI_PRODUCERS {
             let queue_clone = queue.clone();
             let barrier_clone = barrier.clone();
@@ -120,12 +113,10 @@ mod miri_drescher_tests {
 
         barrier.wait();
 
-        // Wait for producers
         for handle in handles {
             handle.join().unwrap();
         }
 
-        // Collect all items
         let mut items = Vec::new();
         while let Some(item) = queue.pop() {
             items.push(item);
@@ -163,7 +154,6 @@ mod miri_jayanti_petrovic_tests {
 
         assert!(queue.is_empty());
 
-        // Test producer-specific enqueue
         for producer_id in 0..num_producers {
             for i in 0..5 {
                 queue.enqueue(producer_id, producer_id * 10 + i).unwrap();
@@ -198,7 +188,6 @@ mod miri_jayanti_petrovic_tests {
             JayantiPetrovicMpscQueue::init_in_shared(mem_ptr, num_producers, node_pool_capacity)
         };
 
-        // Invalid producer IDs should fail
         assert!(queue.enqueue(num_producers, 42).is_err());
         assert!(queue.enqueue(num_producers + 1, 42).is_err());
 
@@ -236,13 +225,11 @@ mod miri_jiffy_tests {
 
         assert!(queue.is_empty());
 
-        // Basic push/pop
         queue.push(42).unwrap();
         assert!(!queue.is_empty());
         assert_eq!(queue.pop().unwrap(), 42);
         assert!(queue.is_empty());
 
-        // Test buffer transitions
         for i in 0..20 {
             queue.push(i).unwrap();
         }
@@ -272,7 +259,6 @@ mod miri_jiffy_tests {
         let queue = Arc::new(queue);
         let barrier = Arc::new(Barrier::new(3));
 
-        // Producer 1
         let q1 = queue.clone();
         let b1 = barrier.clone();
         let p1 = thread::spawn(move || {
@@ -288,7 +274,6 @@ mod miri_jiffy_tests {
             pushed
         });
 
-        // Producer 2
         let q2 = queue.clone();
         let b2 = barrier.clone();
         let p2 = thread::spawn(move || {
@@ -310,7 +295,6 @@ mod miri_jiffy_tests {
         let pushed2 = p2.join().unwrap();
         let total_pushed = pushed1 + pushed2;
 
-        // Collect items
         let mut items = Vec::new();
         while !queue.is_empty() && items.len() < total_pushed {
             if let Ok(item) = queue.pop() {
@@ -343,14 +327,12 @@ mod miri_dqueue_tests {
 
         assert!(queue.is_empty());
 
-        // Test producer-specific enqueue
         for producer_id in 0..num_producers {
             for i in 0..10 {
                 queue.enqueue(producer_id, producer_id * 100 + i).unwrap();
             }
         }
 
-        // Force flush from local buffers
         unsafe {
             for producer_id in 0..num_producers {
                 queue.dump_local_buffer(producer_id);
@@ -381,7 +363,6 @@ mod miri_dqueue_tests {
         let queue =
             unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
 
-        // Invalid producer IDs
         assert!(queue.enqueue(num_producers, 42).is_err());
         assert!(queue.enqueue(usize::MAX, 42).is_err());
 
@@ -391,7 +372,6 @@ mod miri_dqueue_tests {
     }
 }
 
-// Test drop semantics
 mod miri_drop_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -420,12 +400,10 @@ mod miri_drop_tests {
 
             let queue = unsafe { DrescherQueue::init_in_shared(mem_ptr, 50) };
 
-            // Push items
             for i in 0..10 {
                 queue.push(DropCounter { _value: i }).unwrap();
             }
 
-            // Pop half
             for _ in 0..5 {
                 drop(queue.pop().unwrap());
             }
@@ -436,8 +414,6 @@ mod miri_drop_tests {
                 let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
             }
         }
-
-        // Note: In Miri, we might not see all drops immediately
     }
 
     #[test]
@@ -468,7 +444,6 @@ mod miri_drop_tests {
     }
 }
 
-// Type safety tests
 mod miri_type_tests {
     use super::*;
 
@@ -514,7 +489,6 @@ mod miri_type_tests {
     }
 }
 
-// Test trait implementations
 mod miri_trait_tests {
     use super::*;
 
@@ -536,7 +510,6 @@ mod miri_trait_tests {
 
     #[test]
     fn test_trait_implementations() {
-        // Test DrescherQueue
         {
             let shared_size = DrescherQueue::<usize>::shared_size(50);
             let memory = create_aligned_memory(shared_size, 64);
@@ -548,7 +521,6 @@ mod miri_trait_tests {
             }
         }
 
-        // Test JiffyQueue
         {
             let shared_size = JiffyQueue::<usize>::shared_size(16, 5);
             let memory = create_aligned_memory(shared_size, 64);
@@ -569,7 +541,6 @@ mod miri_trait_tests {
         let mem_ptr = Box::leak(memory).as_mut_ptr();
         let queue = unsafe { DQueue::init_in_shared(mem_ptr, 2, 5) };
 
-        // This should panic
         queue.push(42).unwrap();
     }
 }

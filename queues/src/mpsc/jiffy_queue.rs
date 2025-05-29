@@ -27,14 +27,14 @@ impl<T> Node<T> {
 }
 
 #[repr(C)]
-struct BufferList<T> {
+pub struct BufferList<T> {
     curr_buffer: *mut Node<T>,
     capacity: usize,
     next: AtomicPtr<BufferList<T>>,
     prev: *mut BufferList<T>,
     consumer_head_idx: AtomicUsize,
-    position_in_queue: u64,
-    is_array_reclaimed: AtomicBool,
+    pub position_in_queue: u64,
+    pub is_array_reclaimed: AtomicBool,
     next_in_garbage: AtomicPtr<BufferList<T>>,
     next_free_meta: AtomicPtr<BufferList<T>>,
 }
@@ -293,8 +293,8 @@ impl<T: Send + 'static> SharedPools<T> {
 
 #[repr(C)]
 pub struct JiffyQueue<T: Send + 'static> {
-    head_of_queue: AtomicPtr<BufferList<T>>,
-    tail_of_queue: AtomicPtr<BufferList<T>>,
+    pub head_of_queue: AtomicPtr<BufferList<T>>,
+    pub tail_of_queue: AtomicPtr<BufferList<T>>,
     global_tail_location: AtomicU64,
     pools: *const SharedPools<T>,
     garbage_list_head: AtomicPtr<BufferList<T>>,
@@ -575,7 +575,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
         }
     }
 
-    unsafe fn attempt_fold_buffer(
+    pub unsafe fn attempt_fold_buffer(
         &self,
         bl_to_fold_ptr: *mut BufferList<T>,
     ) -> (*mut BufferList<T>, bool) {
@@ -645,7 +645,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
         }
     }
 
-    fn actual_process_garbage_list(&self, new_head_buffer_pos_threshold: u64) {
+    pub fn actual_process_garbage_list(&self, new_head_buffer_pos_threshold: u64) {
         let mut garbage_to_process_head = self
             .garbage_list_head
             .swap(ptr::null_mut(), Ordering::Acquire);

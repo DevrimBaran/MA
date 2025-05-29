@@ -48,7 +48,7 @@ pub struct DynListQueue<T: Send + 'static> {
     owns_all: bool,
 
     pub heap_allocs: AtomicUsize,
-    heap_frees: AtomicUsize,
+    pub heap_frees: AtomicUsize,
 }
 
 unsafe impl<T: Send> Send for DynListQueue<T> {}

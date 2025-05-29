@@ -43,7 +43,7 @@ pub struct UnboundedQueue<T: Send + 'static> {
     cache_head: AtomicUsize,
     cache_tail: AtomicUsize,
     transition_item: UnsafeCell<Option<T>>,
-    segment_count: AtomicUsize,
+    pub segment_count: AtomicUsize,
     initialized: AtomicBool,
 
     // NEW: Store the segment size

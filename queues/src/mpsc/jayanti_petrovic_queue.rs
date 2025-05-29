@@ -182,7 +182,7 @@ impl TreeNode {
     }
 
     #[inline]
-    unsafe fn update_min_info_value_in_slot(&self, new_value: MinInfo) {
+    pub unsafe fn update_min_info_value_in_slot(&self, new_value: MinInfo) {
         self.min_info.store(new_value.to_u64(), Ordering::Release);
     }
 }
@@ -332,12 +332,12 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
     }
 
     #[inline]
-    unsafe fn get_tree_node(&self, node_idx: usize) -> &TreeNode {
+    pub unsafe fn get_tree_node(&self, node_idx: usize) -> &TreeNode {
         &*self.tree_nodes_base.add(node_idx)
     }
 
     #[inline]
-    fn get_leaf_tree_node_idx(&self, producer_id: usize) -> usize {
+    pub fn get_leaf_tree_node_idx(&self, producer_id: usize) -> usize {
         (self.num_producers - 1) + producer_id
     }
 
@@ -369,7 +369,7 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
         )
     }
 
-    unsafe fn refresh(&self, u_idx: usize) {
+    pub unsafe fn refresh(&self, u_idx: usize) {
         let u_node = self.get_tree_node(u_idx);
 
         let (left_child_idx_opt, right_child_idx_opt) = self.get_children_indices(u_idx);

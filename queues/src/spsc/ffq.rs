@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[repr(C)]
 pub struct Slot<T> {
     // Atomic flag: false = empty, true = full
-    flag: AtomicBool,
+    pub flag: AtomicBool,
     // Padding to separate flag from data
     _pad: [u8; 64 - std::mem::size_of::<AtomicBool>()],
     // The actual data
@@ -141,7 +141,7 @@ impl<T: Send + 'static> FfqQueue<T> {
     }
 
     #[inline]
-    fn get_slot(&self, index: usize) -> &Slot<T> {
+    pub fn get_slot(&self, index: usize) -> &Slot<T> {
         unsafe { &*self.buffer.add(index & self.mask) }
     }
 }

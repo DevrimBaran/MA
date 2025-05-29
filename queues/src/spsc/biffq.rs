@@ -29,21 +29,21 @@ impl<T> Slot<T> {
 #[repr(C, align(64))]
 pub struct ProducerFieldsB<T: Send + 'static> {
     write: AtomicUsize,
-    limit: AtomicUsize,
+    pub limit: AtomicUsize,
     local_buffer: UnsafeCell<[MaybeUninit<T>; LOCAL_BATCH_SIZE]>,
     pub local_count: AtomicUsize,
 }
 
 #[repr(C, align(64))]
-struct ConsumerFieldsB {
+pub struct ConsumerFieldsB {
     read: AtomicUsize,
-    clear: AtomicUsize,
+    pub clear: AtomicUsize,
 }
 
 #[repr(C, align(64))]
 pub struct BiffqQueue<T: Send + 'static> {
     pub prod: ProducerFieldsB<T>,
-    cons: ConsumerFieldsB,
+    pub cons: ConsumerFieldsB,
     capacity: usize,
     mask: usize,
     h_mask: usize,
@@ -190,7 +190,7 @@ impl<T: Send + 'static> BiffqQueue<T> {
         unsafe { &*self.buffer.add(index & self.mask) }
     }
 
-    fn publish_batch_internal(&self) -> Result<usize, ()> {
+    pub fn publish_batch_internal(&self) -> Result<usize, ()> {
         let local_count = self.prod.local_count.load(Ordering::Relaxed);
         if local_count == 0 {
             return Ok(0);

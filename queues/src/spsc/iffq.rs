@@ -35,15 +35,15 @@ struct ProducerFields {
 }
 
 #[repr(C, align(64))]
-struct ConsumerFields {
+pub struct ConsumerFields {
     read: AtomicUsize,
-    clear: AtomicUsize,
+    pub clear: AtomicUsize,
 }
 
 #[repr(C, align(64))]
 pub struct IffqQueue<T: Send + 'static> {
     prod: ProducerFields,
-    cons: ConsumerFields,
+    pub cons: ConsumerFields,
     capacity: usize,
     mask: usize,
     h_mask: usize,

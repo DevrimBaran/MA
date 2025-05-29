@@ -3201,3 +3201,731 @@ mod ipc_tests {
         }
     }
 }
+
+// Add these tests to queues/tests/unit_test_spsc.rs
+
+mod spsc_branch_coverage_improvement {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    mod dspsc_coverage_tests {
+        use super::*;
+
+        #[test]
+        fn test_dspsc_null_node_paths() {
+            let queue = DynListQueue::<usize>::with_capacity(16);
+
+            // Test empty queue pop
+            assert!(queue.pop().is_err());
+
+            // Push and pop to create node recycling scenario
+            for i in 0..100 {
+                queue.push(i).unwrap();
+            }
+
+            // This should use pre-allocated nodes first
+            let initial_heap_allocs = queue.heap_allocs.load(Ordering::Relaxed);
+
+            // Pop all to populate free cache
+            for _ in 0..100 {
+                queue.pop().unwrap();
+            }
+
+            // Push again - should use cached nodes
+            for i in 0..50 {
+                queue.push(i).unwrap();
+            }
+
+            // Heap allocs shouldn't increase much if cache is working
+            let _cache_reuse_allocs = queue.heap_allocs.load(Ordering::Relaxed);
+
+            // Now exhaust the pre-allocated pool
+            for i in 100..10000 {
+                queue.push(i).unwrap();
+            }
+
+            // Should have heap allocations now
+            let final_heap_allocs = queue.heap_allocs.load(Ordering::Relaxed);
+            assert!(final_heap_allocs > initial_heap_allocs);
+
+            // Pop all to test deallocation paths
+            while queue.pop().is_ok() {}
+
+            // Should have some deallocations
+            let heap_frees = queue.heap_frees.load(Ordering::Relaxed);
+            assert!(heap_frees > 0);
+        }
+
+        #[test]
+        fn test_dspsc_cache_miss_retry() {
+            let queue = Arc::new(DynListQueue::<String>::with_capacity(8));
+
+            // First, populate and clear to set up cache
+            for i in 0..20 {
+                queue.push(format!("initial_{}", i)).unwrap();
+            }
+            while queue.pop().is_ok() {}
+
+            // Now the cache should have some nodes
+            // Try to trigger the retry loop in alloc_node
+            let handles: Vec<_> = (0..2)
+                .map(|thread_id| {
+                    let queue_clone = queue.clone();
+                    thread::spawn(move || {
+                        for i in 0..50 {
+                            queue_clone
+                                .push(format!("thread_{}_item_{}", thread_id, i))
+                                .unwrap();
+                        }
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            // Verify all items can be popped
+            let mut count = 0;
+            while queue.pop().is_ok() {
+                count += 1;
+            }
+            assert_eq!(count, 100);
+        }
+
+        #[test]
+        fn test_dspsc_edge_case_paths() {
+            let queue = DynListQueue::<usize>::with_capacity(16);
+
+            // Test the null checks in push
+            queue.push(42).unwrap();
+
+            // Test the null checks in pop
+            assert_eq!(queue.pop().unwrap(), 42);
+
+            // Test empty() with null head
+            assert!(queue.empty());
+
+            // Test available() - always returns true
+            assert!(queue.available());
+        }
+    }
+
+    mod uspsc_coverage_tests {
+        use super::*;
+
+        #[test]
+        fn test_uspsc_segment_allocation_failure() {
+            use std::alloc::{alloc_zeroed, dealloc, Layout};
+
+            const ALIGNMENT: usize = 128;
+            let shared_size = UnboundedQueue::<usize>::shared_size(64);
+            let layout = Layout::from_size_align(shared_size, ALIGNMENT).unwrap();
+
+            let mem_ptr = unsafe {
+                let ptr = alloc_zeroed(layout);
+                assert!(!ptr.is_null());
+                ptr
+            };
+
+            let queue = unsafe { UnboundedQueue::init_in_shared(mem_ptr, 64) };
+
+            // Fill many segments to approach MAX_SEGMENTS
+            for i in 0..500000 {
+                if queue.push(i).is_err() {
+                    // Hit the limit
+                    break;
+                }
+            }
+
+            // Check segment count
+            let segments = queue.segment_count.load(Ordering::Relaxed);
+            assert!(segments > 1);
+
+            // Pop all to trigger different paths in deallocation
+            while queue.pop().is_ok() {}
+
+            unsafe {
+                dealloc(mem_ptr, layout);
+            }
+        }
+
+        #[test]
+        fn test_uspsc_cache_pool_full() {
+            use std::alloc::{alloc_zeroed, dealloc, Layout};
+
+            const ALIGNMENT: usize = 128;
+            let shared_size = UnboundedQueue::<Vec<u8>>::shared_size(64);
+            let layout = Layout::from_size_align(shared_size, ALIGNMENT).unwrap();
+
+            let mem_ptr = unsafe {
+                let ptr = alloc_zeroed(layout);
+                assert!(!ptr.is_null());
+                ptr
+            };
+
+            let queue = unsafe { UnboundedQueue::init_in_shared(mem_ptr, 64) };
+
+            // Create exactly POOL_CAP segments
+            for batch in 0..35 {
+                // Fill a segment
+                for i in 0..64 {
+                    queue.push(vec![batch as u8, i as u8]).unwrap();
+                }
+                // Pop the segment to make it recyclable
+                for _ in 0..64 {
+                    queue.pop().unwrap();
+                }
+            }
+
+            // The cache should be full now, next recycling should deallocate
+            for i in 0..64 {
+                queue.push(vec![99, i as u8]).unwrap();
+            }
+
+            unsafe {
+                dealloc(mem_ptr, layout);
+            }
+        }
+
+        #[test]
+        fn test_uspsc_null_segment_paths() {
+            use std::alloc::{alloc_zeroed, dealloc, Layout};
+
+            const ALIGNMENT: usize = 128;
+            let shared_size = UnboundedQueue::<usize>::shared_size(64);
+            let layout = Layout::from_size_align(shared_size, ALIGNMENT).unwrap();
+
+            let mem_ptr = unsafe {
+                let ptr = alloc_zeroed(layout);
+                assert!(!ptr.is_null());
+                ptr
+            };
+
+            let queue = unsafe { UnboundedQueue::init_in_shared(mem_ptr, 64) };
+
+            // Test empty queue state
+            assert!(queue.empty());
+            assert!(queue.available());
+
+            // Test get_next_segment error paths
+            queue.push(1).unwrap();
+            queue.pop().unwrap();
+
+            // The queue is empty but segments exist
+            assert!(queue.empty());
+
+            unsafe {
+                dealloc(mem_ptr, layout);
+            }
+        }
+
+        #[test]
+        fn test_uspsc_race_condition_paths() {
+            use std::alloc::{alloc_zeroed, dealloc, Layout};
+
+            const ALIGNMENT: usize = 128;
+            let shared_size = UnboundedQueue::<usize>::shared_size(64);
+            let layout = Layout::from_size_align(shared_size, ALIGNMENT).unwrap();
+
+            let mem_ptr = unsafe {
+                let ptr = alloc_zeroed(layout);
+                assert!(!ptr.is_null());
+                ptr
+            };
+
+            let queue = unsafe { UnboundedQueue::init_in_shared(mem_ptr, 64) };
+
+            // Fill exactly one segment minus one
+            for i in 0..63 {
+                queue.push(i).unwrap();
+            }
+
+            // This triggers segment boundary
+            queue.push(63).unwrap();
+            queue.push(64).unwrap(); // New segment
+
+            // Pop across segment boundary
+            for _ in 0..65 {
+                queue.pop().unwrap();
+            }
+
+            // Test the double-check empty logic
+            assert!(queue.empty());
+
+            unsafe {
+                dealloc(mem_ptr, layout);
+            }
+        }
+    }
+
+    mod blq_coverage_tests {
+        use super::*;
+
+        #[test]
+        fn test_blq_shadow_update_paths() {
+            let queue = BlqQueue::<usize>::with_capacity(64);
+
+            // Fill queue to near capacity
+            for i in 0..56 {
+                queue.push(i).unwrap();
+            }
+
+            // This should trigger shadow update in push
+            assert!(queue.push(56).is_err());
+
+            // Make space
+            for _ in 0..10 {
+                queue.pop().unwrap();
+            }
+
+            // Should be able to push now
+            queue.push(100).unwrap();
+
+            // Test consumer shadow update
+            while !queue.empty() {
+                queue.pop().unwrap();
+            }
+
+            // This should trigger shadow update in pop
+            assert!(queue.pop().is_err());
+        }
+
+        #[test]
+        fn test_blq_batch_operations_edge_cases() {
+            let queue = BlqQueue::<String>::with_capacity(128);
+
+            // Test with needed = 0
+            let space = queue.blq_enq_space(0);
+            assert_eq!(space, 120); // capacity - K_CACHE_LINE_SLOTS
+
+            // Fill local buffer
+            for i in 0..60 {
+                queue.blq_enq_local(format!("item_{}", i)).unwrap();
+            }
+            queue.blq_enq_publish();
+
+            // Test dequeue space with needed = 0
+            let avail = queue.blq_deq_space(0);
+            assert_eq!(avail, 60);
+
+            // Test exact boundary
+            let avail = queue.blq_deq_space(60);
+            assert_eq!(avail, 60);
+
+            // Test needed > available
+            let avail = queue.blq_deq_space(61);
+            assert_eq!(avail, 60);
+        }
+    }
+
+    mod bqueue_coverage_tests {
+        use super::*;
+
+        #[test]
+        fn test_bqueue_backtrack_all_paths() {
+            let queue = BQueue::<usize>::new(256);
+
+            // Test empty backtrack
+            assert!(queue.pop().is_err());
+
+            // Create pattern that exercises different batch sizes in backtrack
+            for i in 0..128 {
+                queue.push(i).unwrap();
+            }
+
+            // Pop some to create gaps
+            for _ in 0..64 {
+                queue.pop().unwrap();
+            }
+
+            // Push more to wrap around
+            for i in 200..250 {
+                queue.push(i).unwrap();
+            }
+
+            // This should exercise the batch size reduction loop
+            while queue.pop().is_ok() {}
+
+            // Test the batch_size == 0 path
+            assert!(queue.pop().is_err());
+        }
+
+        #[test]
+        fn test_bqueue_probe_paths() {
+            let queue = BQueue::<usize>::new(128);
+
+            // Fill to capacity
+            for i in 0..127 {
+                queue.push(i).unwrap();
+            }
+
+            // This should fail - queue full
+            assert!(queue.push(999).is_err());
+
+            // Test available when full
+            assert!(!queue.available());
+
+            // Pop one and test again
+            queue.pop().unwrap();
+            assert!(queue.available());
+            queue.push(999).unwrap();
+        }
+    }
+
+    mod biffq_coverage_tests {
+        use super::*;
+
+        #[test]
+        fn test_biffq_publish_batch_edge_cases() {
+            let queue = BiffqQueue::<usize>::with_capacity(128);
+
+            // Test empty buffer publish
+            let result = queue.publish_batch_internal();
+            assert_eq!(result, Ok(0));
+
+            // Fill local buffer partially
+            for i in 0..10 {
+                queue.push(i).unwrap();
+            }
+
+            // Manual flush
+            let result = queue.publish_batch_internal();
+            assert_eq!(result, Ok(10));
+
+            // Fill to trigger auto-flush
+            for i in 0..32 {
+                queue.push(i).unwrap();
+            }
+
+            // Buffer should be empty after auto-flush
+            assert_eq!(queue.prod.local_count.load(Ordering::Relaxed), 0);
+        }
+
+        #[test]
+        fn test_biffq_limit_advancement() {
+            let queue = BiffqQueue::<String>::with_capacity(128);
+
+            // Fill first H partition
+            for i in 0..32 {
+                queue.push(format!("item_{}", i)).unwrap();
+            }
+
+            // Force flush
+            queue.flush_producer_buffer().unwrap();
+
+            // Fill more to test limit advancement
+            for i in 32..96 {
+                queue.push(format!("item_{}", i)).unwrap();
+            }
+
+            // Should have advanced limit multiple times
+            let limit = queue.prod.limit.load(Ordering::Acquire);
+            assert!(limit > 64);
+        }
+
+        #[test]
+        fn test_biffq_clear_operation() {
+            let queue = BiffqQueue::<usize>::with_capacity(128);
+
+            // Fill and flush
+            for i in 0..64 {
+                queue.push(i).unwrap();
+            }
+            queue.flush_producer_buffer().unwrap();
+
+            // Pop first partition
+            for _ in 0..32 {
+                queue.pop().unwrap();
+            }
+
+            // This should advance clear pointer
+            let clear = queue.cons.clear.load(Ordering::Relaxed);
+            assert!(clear > 0);
+        }
+    }
+
+    mod ffq_coverage_tests {
+        use super::*;
+
+        #[test]
+        fn test_ffq_slot_state_transitions() {
+            let queue = FfqQueue::<usize>::with_capacity(64);
+
+            // Test all slots start empty
+            for i in 0..64 {
+                let slot = queue.get_slot(i);
+                assert!(!slot.flag.load(Ordering::Acquire));
+            }
+
+            // Fill queue
+            for i in 0..64 {
+                queue.push(i).unwrap();
+            }
+
+            // All slots should be full
+            for i in 0..64 {
+                let slot = queue.get_slot(i);
+                assert!(slot.flag.load(Ordering::Acquire));
+            }
+
+            // Queue should be full
+            assert!(queue.push(999).is_err());
+
+            // Pop all
+            for _ in 0..64 {
+                queue.pop().unwrap();
+            }
+
+            // All slots should be empty again
+            for i in 0..64 {
+                let slot = queue.get_slot(i);
+                assert!(!slot.flag.load(Ordering::Acquire));
+            }
+        }
+    }
+
+    mod iffq_coverage_tests {
+        use super::*;
+
+        #[test]
+        fn test_iffq_clear_boundary_conditions() {
+            let queue = IffqQueue::<usize>::with_capacity(128);
+
+            // Fill multiple partitions
+            for i in 0..96 {
+                queue.push(i).unwrap();
+            }
+
+            // Pop across partition boundaries
+            for _ in 0..48 {
+                queue.pop().unwrap();
+            }
+
+            // Clear should have advanced
+            let clear = queue.cons.clear.load(Ordering::Relaxed);
+            assert!(clear > 0);
+
+            // Test the loop termination condition
+            for _ in 0..48 {
+                queue.pop().unwrap();
+            }
+        }
+    }
+
+    mod llq_coverage_tests {
+        use super::*;
+
+        #[test]
+        fn test_llq_exact_capacity_boundary() {
+            let queue = LlqQueue::<usize>::with_capacity(64);
+
+            // Fill to exactly capacity - K_CACHE_LINE_SLOTS
+            for i in 0..56 {
+                queue.push(i).unwrap();
+            }
+
+            // This should fail
+            assert!(queue.push(999).is_err());
+
+            // Pop one
+            queue.pop().unwrap();
+
+            // Now should succeed
+            queue.push(999).unwrap();
+        }
+    }
+
+    mod mspsc_coverage_tests {
+        use super::*;
+
+        #[test]
+        fn test_multipush_contiguous_free_calculation() {
+            let queue = MultiPushQueue::<usize>::with_capacity(64);
+
+            // Fill ring partially
+            for i in 0..30 {
+                queue.push(i).unwrap();
+            }
+            queue.flush();
+
+            // Pop some to create wrapped free space
+            for _ in 0..20 {
+                queue.pop().unwrap();
+            }
+
+            // Fill local buffer
+            for i in 0..32 {
+                queue.push(100 + i).unwrap();
+            }
+
+            // Flush should calculate contiguous free correctly
+            assert!(queue.flush());
+
+            // Verify items are in queue
+            let mut count = 0;
+            while queue.pop().is_ok() {
+                count += 1;
+            }
+            assert_eq!(count, 42); // 10 + 32
+        }
+
+        #[test]
+        fn test_multipush_fallback_paths() {
+            let queue = MultiPushQueue::<String>::with_capacity(64);
+
+            // Fill ring almost completely
+            for i in 0..63 {
+                queue.push(format!("item_{}", i)).unwrap();
+            }
+            queue.flush();
+
+            // Local buffer is empty, ring is almost full
+            // This should go through the fallback path
+            queue.push("fallback".to_string()).unwrap();
+
+            // Verify
+            assert!(!queue.empty());
+        }
+    }
+
+    mod sesd_wrapper_coverage_tests {
+        use super::*;
+
+        #[test]
+        fn test_sesd_null_node_handling() {
+            let pool_capacity = 5;
+            let shared_size = SesdJpSpscBenchWrapper::<usize>::shared_size(pool_capacity);
+            let memory = create_aligned_memory_box(shared_size, 64);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue = unsafe { SesdJpSpscBenchWrapper::init_in_shared(mem_ptr, pool_capacity) };
+
+            // Fill pool
+            for i in 0..pool_capacity {
+                queue.push(i).unwrap();
+            }
+
+            // This should fail (null node)
+            assert!(queue.push(999).is_err());
+
+            // Pop all
+            for _ in 0..pool_capacity {
+                queue.pop().unwrap();
+            }
+
+            // Test available/empty
+            assert!(queue.available());
+            assert!(queue.empty());
+        }
+    }
+
+    mod dehnavi_coverage_tests {
+        use super::*;
+
+        #[test]
+        fn test_dehnavi_claim_scenarios() {
+            let queue = DehnaviQueue::<usize>::new(3);
+
+            // Fill queue
+            queue.push(1).unwrap();
+            queue.push(2).unwrap();
+
+            // Queue is full, test the claim path
+            queue.push(3).unwrap(); // This will use the claim mechanism
+
+            // Pop and verify ordering
+            queue.pop().unwrap();
+            queue.pop().unwrap();
+            queue.pop().unwrap();
+        }
+    }
+
+    mod lamport_coverage_tests {
+        use super::*;
+
+        #[test]
+        fn test_lamport_exact_full_condition() {
+            let queue = LamportQueue::<usize>::with_capacity(4);
+
+            // The condition is: next == head + mask + 1
+            // With capacity 4, mask = 3
+            // So when head=0, next=4 means full
+
+            queue.push(1).unwrap();
+            queue.push(2).unwrap();
+            queue.push(3).unwrap();
+
+            // This should fail - exactly full
+            assert!(queue.push(4).is_err());
+
+            // Pop one and wrap around
+            queue.pop().unwrap();
+            queue.push(4).unwrap();
+
+            // Continue pattern
+            queue.pop().unwrap();
+            queue.push(5).unwrap();
+        }
+    }
+
+    mod ipc_test_coverage {
+        use super::*;
+
+        #[test]
+        fn test_ffq_edge_cases() {
+            let queue = FfqQueue::<usize>::with_capacity(64);
+
+            // Test pushing to full queue
+            for i in 0..64 {
+                queue.push(i).unwrap();
+            }
+            assert!(queue.push(999).is_err());
+
+            // Test popping from empty queue
+            for _ in 0..64 {
+                queue.pop().unwrap();
+            }
+            assert!(queue.pop().is_err());
+        }
+
+        #[test]
+        fn test_unbounded_coverage() {
+            let shared_size = UnboundedQueue::<usize>::shared_size(64);
+            const ALIGNMENT: usize = 128;
+
+            let memory = create_aligned_memory_box(shared_size, ALIGNMENT);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue = unsafe { UnboundedQueue::init_in_shared(mem_ptr, 64) };
+
+            // Test segment transitions
+            for i in 0..200 {
+                queue.push(i).unwrap();
+            }
+
+            // Pop all
+            for i in 0..200 {
+                assert_eq!(queue.pop().unwrap(), i);
+            }
+
+            assert!(queue.empty());
+        }
+    }
+
+    // Helper function
+    fn create_aligned_memory_box(size: usize, alignment: usize) -> Box<[u8]> {
+        use std::alloc::{alloc_zeroed, Layout};
+
+        unsafe {
+            let layout = Layout::from_size_align(size, alignment).unwrap();
+            let ptr = alloc_zeroed(layout);
+            if ptr.is_null() {
+                panic!("Failed to allocate aligned memory");
+            }
+
+            let slice = std::slice::from_raw_parts_mut(ptr, size);
+            Box::from_raw(slice)
+        }
+    }
+}

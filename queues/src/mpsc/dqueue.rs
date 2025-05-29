@@ -16,7 +16,7 @@ pub const N_SEGMENT_CAPACITY: usize = 64;
 pub const N_SEGMENT_CAPACITY: usize = 262144;
 
 #[repr(C, align(64))]
-struct Segment<T> {
+pub struct Segment<T> {
     id: u64,
     cells: *mut UnsafeCell<MaybeUninit<Option<T>>>,
     next: AtomicPtr<Segment<T>>,
@@ -63,9 +63,9 @@ impl<T> Producer<T> {
 pub struct DQueue<T: Send + Clone + 'static> {
     q_head: AtomicU64,
     q_tail: AtomicU64,
-    qseg: AtomicPtr<Segment<T>>,
+    pub qseg: AtomicPtr<Segment<T>>,
     producers_array: *mut Producer<T>,
-    num_producers: usize,
+    pub num_producers: usize,
     segment_pool_metadata: *mut Segment<T>,
     segment_cells_pool: *mut UnsafeCell<MaybeUninit<Option<T>>>,
     segment_pool_capacity: usize,
@@ -266,7 +266,11 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         self.alloc_segment_from_pool_raw(id, false)
     }
 
-    unsafe fn find_segment(&self, sp_cache: *mut Segment<T>, target_cid: u64) -> *mut Segment<T> {
+    pub unsafe fn find_segment(
+        &self,
+        sp_cache: *mut Segment<T>,
+        target_cid: u64,
+    ) -> *mut Segment<T> {
         let target_segment_id = target_cid / N_SEGMENT_CAPACITY as u64;
         let mut current_seg_ptr = if !sp_cache.is_null() && (*sp_cache).id <= target_segment_id {
             sp_cache
@@ -512,7 +516,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         local_head_atomic.store(current_local_h, Ordering::Release);
     }
 
-    unsafe fn help_enqueue(&self) {
+    pub unsafe fn help_enqueue(&self) {
         if self.num_producers == 0 {
             return;
         }

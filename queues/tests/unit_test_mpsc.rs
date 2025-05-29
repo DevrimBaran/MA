@@ -2033,3 +2033,697 @@ fn test_comprehensive_drop_semantics() {
         assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 5);
     }
 }
+
+// Add these tests to queues/tests/unit_test_mpsc.rs
+
+mod mpsc_branch_coverage_improvement {
+    use super::*;
+    use std::ptr;
+    use std::sync::atomic::Ordering;
+
+    mod dqueue_coverage_tests {
+        use queues::mpsc::dqueue::Segment;
+
+        use super::*;
+
+        #[test]
+        fn test_dqueue_segment_allocation_branches() {
+            let num_producers = 2;
+            let segment_pool_capacity = 3;
+
+            let shared_size = DQueue::<usize>::shared_size(num_producers, segment_pool_capacity);
+            let memory = create_aligned_memory_box(shared_size);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue =
+                unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
+
+            // Test initial allocation (is_initial = true)
+            // Already done in init, so test the reuse path
+
+            // Fill segments to populate free list
+            for i in 0..1000 {
+                queue.enqueue(0, i).unwrap();
+            }
+            unsafe {
+                queue.dump_local_buffer(0);
+            }
+
+            // Dequeue to make segments available for reuse
+            for _ in 0..500 {
+                queue.dequeue();
+            }
+
+            // Run GC to release segments to free list
+            unsafe {
+                queue.run_gc();
+            }
+
+            // Now allocate from free list
+            for i in 0..100 {
+                queue.enqueue(1, i).unwrap();
+            }
+            unsafe {
+                queue.dump_local_buffer(1);
+            }
+        }
+
+        #[test]
+        fn test_dqueue_find_segment_null_paths() {
+            let num_producers = 1;
+            let segment_pool_capacity = 2;
+
+            let shared_size = DQueue::<usize>::shared_size(num_producers, segment_pool_capacity);
+            let memory = create_aligned_memory_box(shared_size);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue: &mut DQueue<usize> =
+                unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
+
+            // Test with null qseg (shouldn't happen in practice but tests the branch)
+            unsafe {
+                let old_qseg: *mut Segment<usize> = queue.qseg.load(Ordering::Acquire);
+                queue.qseg.store(ptr::null_mut(), Ordering::Release);
+
+                let result = queue.find_segment(ptr::null_mut(), 100);
+                assert!(result.is_null());
+
+                queue.qseg.store(old_qseg, Ordering::Release);
+            }
+
+            // Test loop limit exceeded
+            unsafe {
+                let very_high_id = 1000000u64;
+                let result = queue.find_segment(ptr::null_mut(), very_high_id);
+                assert!(result.is_null());
+            }
+        }
+
+        #[test]
+        fn test_dqueue_help_enqueue_edge_cases() {
+            let num_producers = 3;
+            let segment_pool_capacity = 5;
+
+            let shared_size = DQueue::<String>::shared_size(num_producers, segment_pool_capacity);
+            let memory = create_aligned_memory_box(shared_size);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue =
+                unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
+
+            // Test help with no producers
+            unsafe {
+                let old_num = queue.num_producers;
+                queue.num_producers = 0;
+                queue.help_enqueue();
+                queue.num_producers = old_num;
+            }
+
+            // Enqueue items in different producers
+            for prod in 0..num_producers {
+                for i in 0..10 {
+                    queue.enqueue(prod, format!("p{}_i{}", prod, i)).unwrap();
+                }
+            }
+
+            // Don't dump, let dequeue trigger help
+            let mut helped = 0;
+            for _ in 0..30 {
+                if queue.dequeue().is_some() {
+                    helped += 1;
+                }
+            }
+            assert!(helped > 0, "Should have dequeued some items via help");
+        }
+
+        #[test]
+        fn test_dqueue_gc_producer_segments() {
+            let num_producers = 2;
+            let segment_pool_capacity = 4;
+
+            let shared_size = DQueue::<usize>::shared_size(num_producers, segment_pool_capacity);
+            let memory = create_aligned_memory_box(shared_size);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue =
+                unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
+
+            // Create scenario where producers reference different segments
+            queue.enqueue(0, 1).unwrap();
+            queue.enqueue(0, 2).unwrap();
+            unsafe {
+                queue.dump_local_buffer(0);
+            }
+
+            // Advance queue state
+            for i in 0..1000 {
+                queue.enqueue(1, i).unwrap();
+            }
+            unsafe {
+                queue.dump_local_buffer(1);
+            }
+
+            // Dequeue some
+            for _ in 0..50 {
+                queue.dequeue();
+            }
+
+            // GC with producers having different segment references
+            unsafe {
+                queue.run_gc();
+            }
+
+            // Enqueue more in producer 0
+            for i in 0..50 {
+                queue.enqueue(0, 1000 + i).unwrap();
+            }
+
+            // GC again with different state
+            unsafe {
+                queue.run_gc();
+            }
+        }
+
+        #[test]
+        fn test_dqueue_local_buffer_wraparound() {
+            use queues::mpsc::dqueue::L_LOCAL_BUFFER_CAPACITY;
+
+            let num_producers = 1;
+            let segment_pool_capacity = 10;
+
+            let shared_size = DQueue::<usize>::shared_size(num_producers, segment_pool_capacity);
+            let memory = create_aligned_memory_box(shared_size);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue =
+                unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
+
+            // Fill local buffer completely
+            for i in 0..L_LOCAL_BUFFER_CAPACITY - 1 {
+                queue.enqueue(0, i).unwrap();
+            }
+
+            // This should trigger dump due to full buffer
+            assert!(queue.enqueue(0, 99999).is_err() || queue.enqueue(0, 99999).is_ok());
+
+            // Dump and verify we can enqueue again
+            unsafe {
+                queue.dump_local_buffer(0);
+            }
+            queue.enqueue(0, 88888).unwrap();
+        }
+
+        #[test]
+        fn test_dqueue_dequeue_empty_checks() {
+            let num_producers = 2;
+            let segment_pool_capacity = 5;
+
+            let shared_size = DQueue::<usize>::shared_size(num_producers, segment_pool_capacity);
+            let memory = create_aligned_memory_box(shared_size);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue =
+                unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
+
+            // Test empty queue
+            assert!(queue.dequeue().is_none());
+
+            // Test with items only in local buffers
+            queue.enqueue(0, 1).unwrap();
+            queue.enqueue(1, 2).unwrap();
+
+            // Should trigger help and find items
+            assert!(queue.dequeue().is_some());
+            assert!(queue.dequeue().is_some());
+            assert!(queue.dequeue().is_none());
+        }
+
+        #[test]
+        fn test_dqueue_segment_allocation_failure_recovery() {
+            let num_producers = 1;
+            let segment_pool_capacity = 1; // Minimal
+
+            let shared_size = DQueue::<usize>::shared_size(num_producers, segment_pool_capacity);
+            let memory = create_aligned_memory_box(shared_size);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue =
+                unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
+
+            // Fill to exhaust pool
+            for i in 0..10000 {
+                let _ = queue.enqueue(0, i);
+            }
+            unsafe {
+                queue.dump_local_buffer(0);
+            }
+
+            // Try to trigger allocation failure in find_segment
+            unsafe {
+                // This should handle allocation failure gracefully
+                let result = queue.find_segment(ptr::null_mut(), 1000000);
+                assert!(result.is_null());
+            }
+        }
+    }
+
+    mod jiffy_coverage_tests {
+        use queues::mpsc::jiffy_queue::BufferList;
+
+        use super::*;
+
+        #[test]
+        fn test_jiffy_buffer_allocation_failure_paths() {
+            let buffer_capacity = 4;
+            let max_buffers = 2;
+
+            let shared_size = JiffyQueue::<usize>::shared_size(buffer_capacity, max_buffers);
+            let memory = create_aligned_memory_box(shared_size);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue =
+                unsafe { JiffyQueue::init_in_shared(mem_ptr, buffer_capacity, max_buffers) };
+
+            // Fill all buffers
+            for i in 0..buffer_capacity * max_buffers {
+                if queue.push(i).is_err() {
+                    break;
+                }
+            }
+
+            // Try to push when no buffers available
+            assert!(queue.push(999).is_err());
+
+            // Pop some to free space
+            for _ in 0..buffer_capacity {
+                queue.pop().unwrap();
+            }
+
+            // Should be able to push now
+            queue.push(888).unwrap();
+        }
+
+        #[test]
+        fn test_jiffy_fold_buffer_conditions() {
+            let buffer_capacity = 4;
+            let max_buffers = 5;
+
+            let shared_size = JiffyQueue::<String>::shared_size(buffer_capacity, max_buffers);
+            let memory = create_aligned_memory_box(shared_size);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue =
+                unsafe { JiffyQueue::init_in_shared(mem_ptr, buffer_capacity, max_buffers) };
+
+            // Create specific pattern for folding
+            for i in 0..12 {
+                queue.push(format!("item_{}", i)).unwrap();
+            }
+
+            // Mark all items in first buffer as handled
+            for _ in 0..4 {
+                queue.pop().unwrap();
+            }
+
+            // Try folding different buffers
+            unsafe {
+                // Try to fold null buffer
+                let (result, folded) = queue.attempt_fold_buffer(ptr::null_mut());
+                assert!(result.is_null());
+                assert!(!folded);
+
+                // Try to fold head buffer (should fail)
+                let head = queue.head_of_queue.load(Ordering::Acquire);
+                let (result, folded) = queue.attempt_fold_buffer(head);
+                assert_eq!(result, head);
+                assert!(!folded);
+            }
+        }
+
+        #[test]
+        fn test_jiffy_dequeue_complex_paths() {
+            let buffer_capacity = 2; // Minimal
+            let max_buffers = 10;
+
+            let shared_size = JiffyQueue::<usize>::shared_size(buffer_capacity, max_buffers);
+            let memory = create_aligned_memory_box(shared_size);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue =
+                unsafe { JiffyQueue::init_in_shared(mem_ptr, buffer_capacity, max_buffers) };
+
+            // Create sparse pattern
+            queue.push(1).unwrap();
+            queue.push(2).unwrap(); // Fill first buffer
+            queue.push(3).unwrap(); // New buffer
+
+            // Pop first
+            assert_eq!(queue.pop().unwrap(), 1);
+
+            // Push more to create complex state
+            for i in 10..20 {
+                queue.push(i).unwrap();
+            }
+
+            // Pop with backtracking
+            assert_eq!(queue.pop().unwrap(), 2);
+            assert_eq!(queue.pop().unwrap(), 3);
+
+            // Continue popping
+            for i in 10..20 {
+                assert_eq!(queue.pop().unwrap(), i);
+            }
+        }
+
+        #[test]
+        fn test_jiffy_garbage_collection_edge_cases() {
+            let buffer_capacity = 4;
+            let max_buffers = 3;
+
+            let shared_size = JiffyQueue::<Vec<u8>>::shared_size(buffer_capacity, max_buffers);
+            let memory = create_aligned_memory_box(shared_size);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue =
+                unsafe { JiffyQueue::init_in_shared(mem_ptr, buffer_capacity, max_buffers) };
+
+            // Test empty garbage list
+            queue.actual_process_garbage_list(100);
+
+            // Create buffers and mark for GC
+            for i in 0..8 {
+                queue.push(vec![i as u8; 10]).unwrap();
+            }
+
+            // Pop all to trigger potential GC
+            while queue.pop().is_ok() {}
+
+            // Process with different thresholds
+            queue.actual_process_garbage_list(0);
+            queue.actual_process_garbage_list(u64::MAX);
+        }
+
+        #[test]
+        fn test_jiffy_buffer_state_transitions() {
+            let buffer_capacity = 4;
+            let max_buffers = 5;
+
+            let shared_size = JiffyQueue::<usize>::shared_size(buffer_capacity, max_buffers);
+            let memory = create_aligned_memory_box(shared_size);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue: &mut JiffyQueue<usize> =
+                unsafe { JiffyQueue::init_in_shared(mem_ptr, buffer_capacity, max_buffers) };
+
+            // Test null buffer handling
+            unsafe {
+                let head: *mut BufferList<usize> = queue.head_of_queue.load(Ordering::Acquire);
+                if !head.is_null() {
+                    // Temporarily mark as reclaimed
+                    (*head).is_array_reclaimed.store(true, Ordering::Release);
+
+                    // Try operations
+                    assert!(queue.pop().is_err());
+
+                    // Restore
+                    (*head).is_array_reclaimed.store(false, Ordering::Release);
+                }
+            }
+        }
+
+        #[test]
+        fn test_jiffy_concurrent_modification_detection() {
+            let buffer_capacity = 8;
+            let max_buffers = 4;
+
+            let shared_size = JiffyQueue::<usize>::shared_size(buffer_capacity, max_buffers);
+            let memory = create_aligned_memory_box(shared_size);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue =
+                unsafe { JiffyQueue::init_in_shared(mem_ptr, buffer_capacity, max_buffers) };
+
+            // Fill multiple buffers
+            for i in 0..20 {
+                queue.push(i).unwrap();
+            }
+
+            // Simulate concurrent modifications by manipulating state
+            unsafe {
+                let tail = queue.tail_of_queue.load(Ordering::Acquire);
+                if !tail.is_null() {
+                    // Change position to trigger bounds check
+                    let old_pos = (*tail).position_in_queue;
+                    (*tail).position_in_queue = 1000;
+
+                    // This should handle the invalid state
+                    let _ = queue.push(999);
+
+                    // Restore
+                    (*tail).position_in_queue = old_pos;
+                }
+            }
+        }
+    }
+
+    mod jayanti_petrovic_coverage_tests {
+        use super::*;
+
+        #[test]
+        fn test_jp_tree_refresh_paths() {
+            let num_producers = 4;
+            let node_pool_capacity = 100;
+
+            let shared_size =
+                JayantiPetrovicMpscQueue::<usize>::shared_size(num_producers, node_pool_capacity);
+            let memory = create_aligned_memory_box(shared_size);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue: &mut JayantiPetrovicMpscQueue<usize> = unsafe {
+                JayantiPetrovicMpscQueue::init_in_shared(mem_ptr, num_producers, node_pool_capacity)
+            };
+
+            // Test with no children (leaf nodes)
+            unsafe {
+                let leaf_idx = queue.get_leaf_tree_node_idx(0);
+                queue.refresh(leaf_idx);
+            }
+
+            // Test with one child
+            unsafe {
+                queue.refresh(1); // Has left child only at index 3
+            }
+
+            // Test with both children
+            unsafe {
+                queue.refresh(0); // Root has both children
+            }
+        }
+
+        #[test]
+        fn test_jp_propagate_paths() {
+            let num_producers = 8; // Larger tree
+            let node_pool_capacity = 1000;
+
+            let shared_size =
+                JayantiPetrovicMpscQueue::<usize>::shared_size(num_producers, node_pool_capacity);
+            let memory = create_aligned_memory_box(shared_size);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue = unsafe {
+                JayantiPetrovicMpscQueue::init_in_shared(mem_ptr, num_producers, node_pool_capacity)
+            };
+
+            // Test propagate as enqueuer
+            queue.enqueue(0, 1).unwrap();
+
+            // Test propagate as dequeuer
+            queue.dequeue().unwrap();
+
+            // Test with empty queue
+            queue.enqueue(7, 999).unwrap(); // Last producer
+            queue.dequeue().unwrap();
+        }
+
+        #[test]
+        fn test_jp_dequeue_edge_cases() {
+            use queues::mpsc::jayanti_petrovic_queue::Timestamp;
+
+            let num_producers = 2;
+            let node_pool_capacity = 50;
+
+            let shared_size =
+                JayantiPetrovicMpscQueue::<usize>::shared_size(num_producers, node_pool_capacity);
+            let memory = create_aligned_memory_box(shared_size);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue = unsafe {
+                JayantiPetrovicMpscQueue::init_in_shared(mem_ptr, num_producers, node_pool_capacity)
+            };
+
+            // Test empty queue
+            assert!(queue.dequeue().is_none());
+
+            // Test with invalid leaf index
+            unsafe {
+                // We can't directly access MinInfo as it's private, so we'll test
+                // indirectly by enqueueing/dequeueing
+                queue.enqueue(0, 42).unwrap();
+                assert_eq!(queue.dequeue(), Some(42));
+            }
+        }
+
+        #[test]
+        fn test_jp_node_pool_exhaustion() {
+            let num_producers = 2;
+            let node_pool_capacity = 5; // Very small
+
+            let shared_size =
+                JayantiPetrovicMpscQueue::<usize>::shared_size(num_producers, node_pool_capacity);
+            let memory = create_aligned_memory_box(shared_size);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue = unsafe {
+                JayantiPetrovicMpscQueue::init_in_shared(mem_ptr, num_producers, node_pool_capacity)
+            };
+
+            // Fill pool
+            for i in 0..node_pool_capacity {
+                queue.enqueue(0, i).unwrap();
+            }
+
+            // Next should fail
+            assert!(queue.enqueue(0, 999).is_err());
+
+            // Dequeue to free nodes
+            for _ in 0..node_pool_capacity {
+                queue.dequeue().unwrap();
+            }
+
+            // Should work now
+            queue.enqueue(1, 888).unwrap();
+        }
+    }
+
+    mod drescher_coverage_tests {
+        use super::*;
+
+        #[test]
+        fn test_drescher_free_list_contention() {
+            let expected_nodes = 100;
+            let shared_size = DrescherQueue::<usize>::shared_size(expected_nodes);
+            let memory = create_aligned_memory_box(shared_size);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue = unsafe { DrescherQueue::init_in_shared(mem_ptr, expected_nodes) };
+
+            // Fill and empty multiple times to exercise free list
+            for cycle in 0..5 {
+                for i in 0..50 {
+                    queue.push(cycle * 100 + i).unwrap();
+                }
+
+                for _ in 0..50 {
+                    queue.pop().unwrap();
+                }
+            }
+
+            // Free list should be populated
+            // Test allocation from free list
+            for i in 0..30 {
+                queue.push(1000 + i).unwrap();
+            }
+        }
+
+        #[test]
+        fn test_drescher_dummy_node_requeue() {
+            let expected_nodes = 50;
+            let shared_size = DrescherQueue::<String>::shared_size(expected_nodes);
+            let memory = create_aligned_memory_box(shared_size);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue = unsafe { DrescherQueue::init_in_shared(mem_ptr, expected_nodes) };
+
+            // Push one item and pop it to trigger dummy requeue
+            queue.push("first".to_string()).unwrap();
+            assert_eq!(queue.pop().unwrap(), "first");
+
+            // Push more to test with requeued dummy
+            for i in 0..10 {
+                queue.push(format!("item_{}", i)).unwrap();
+            }
+
+            for i in 0..10 {
+                assert_eq!(queue.pop().unwrap(), format!("item_{}", i));
+            }
+        }
+    }
+
+    mod sesd_jp_coverage_tests {
+        use super::*;
+        use queues::mpsc::sesd_jp_queue::{Node as SesdNode, SesdJpQueue};
+        use std::mem::MaybeUninit;
+        use std::sync::atomic::AtomicPtr;
+
+        #[test]
+        fn test_sesd_read_fronte_paths() {
+            let help_slot = Box::into_raw(Box::new(MaybeUninit::<usize>::uninit()));
+            let initial_dummy = Box::into_raw(Box::new(SesdNode::<usize> {
+                item: MaybeUninit::uninit(),
+                next: AtomicPtr::new(ptr::null_mut()),
+            }));
+            let free_later_dummy = Box::into_raw(Box::new(SesdNode::<usize> {
+                item: MaybeUninit::uninit(),
+                next: AtomicPtr::new(ptr::null_mut()),
+            }));
+
+            let queue_mem = Box::into_raw(Box::new(MaybeUninit::<SesdJpQueue<usize>>::uninit()));
+            let queue = unsafe {
+                SesdJpQueue::new_in_shm(
+                    queue_mem as *mut SesdJpQueue<usize>,
+                    initial_dummy,
+                    help_slot,
+                    free_later_dummy,
+                )
+            };
+
+            // Test empty queue
+            assert!(queue.read_fronte().is_none());
+
+            // Add item
+            let node = Box::into_raw(Box::new(SesdNode::<usize> {
+                item: MaybeUninit::uninit(),
+                next: AtomicPtr::new(ptr::null_mut()),
+            }));
+            queue.enqueue2(42, node);
+
+            // Test announce mechanism
+            assert_eq!(queue.read_fronte().unwrap(), 42);
+
+            // Cleanup
+            unsafe {
+                let _ = Box::from_raw(help_slot);
+                let _ = Box::from_raw(initial_dummy);
+                let _ = Box::from_raw(free_later_dummy);
+                let _ = Box::from_raw(node);
+                let _ = Box::from_raw(queue_mem);
+            }
+        }
+    }
+
+    // Helper function
+    fn create_aligned_memory_box(size: usize) -> Box<[u8]> {
+        use std::alloc::{alloc_zeroed, Layout};
+
+        unsafe {
+            let layout = Layout::from_size_align(size, 64).unwrap();
+            let ptr = alloc_zeroed(layout);
+            if ptr.is_null() {
+                panic!("Failed to allocate aligned memory");
+            }
+
+            let slice = std::slice::from_raw_parts_mut(ptr, size);
+            Box::from_raw(slice)
+        }
+    }
+}

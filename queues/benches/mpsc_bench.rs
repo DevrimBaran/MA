@@ -481,8 +481,6 @@ criterion_group! {
     name = mpsc_benches;
     config = custom_criterion();
     targets =
-        bench_jayanti_petrovic_mpsc,
-        bench_jiffy_mpsc,
         bench_d_queue_mpsc,
 }
 criterion_main!(mpsc_benches);

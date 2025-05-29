@@ -5,7 +5,14 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use crate::MpscQueue;
 
+#[cfg(miri)]
+pub const L_LOCAL_BUFFER_CAPACITY: usize = 32;
+#[cfg(not(miri))]
 pub const L_LOCAL_BUFFER_CAPACITY: usize = 131072;
+
+#[cfg(miri)]
+pub const N_SEGMENT_CAPACITY: usize = 64;
+#[cfg(not(miri))]
 pub const N_SEGMENT_CAPACITY: usize = 262144;
 
 #[repr(C, align(64))]
@@ -735,7 +742,7 @@ impl<T: Send + Clone + 'static> MpscQueue<T> for DQueue<T> {
                         if (*p).local_head.load(Ordering::Relaxed)
                             != (*p).local_tail.load(Ordering::Relaxed)
                         {
-                            return false;
+                            return false; // Local buffer has items!
                         }
                     }
                 }

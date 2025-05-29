@@ -591,6 +591,13 @@ criterion_group! {
     name = benches;
     config = custom_criterion();
     targets =
+        bench_sesd_jp,
+        bench_lamport,
+        bench_bqueue,
+        bench_mp,
+        bench_unbounded,
+        bench_dspsc,
+        bench_dehnavi,
         bench_iffq,
         bench_biffq,
         bench_ffq,

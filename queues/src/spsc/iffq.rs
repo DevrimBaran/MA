@@ -1,58 +1,30 @@
 use crate::SpscQueue;
 use std::cell::UnsafeCell;
 use std::fmt;
-use std::mem::{self, MaybeUninit};
+use std::mem::MaybeUninit;
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const H_PARTITION_SIZE: usize = 32;
 
-// Atomic wrapper for the slot to prevent data races
+// Compact slot with atomic flag
 #[repr(C)]
-struct AtomicSlot<T> {
-    // Using AtomicUsize for the discriminant
-    // 0 = None, 1 = Some
-    state: AtomicUsize,
-    value: UnsafeCell<MaybeUninit<T>>,
+struct Slot<T> {
+    // Atomic flag: false = empty, true = full
+    flag: AtomicBool,
+    // Small padding to align data nicely (7 bytes on 64-bit systems)
+    _pad: [u8; 8 - std::mem::size_of::<AtomicBool>()],
+    // The actual data
+    data: UnsafeCell<MaybeUninit<T>>,
 }
 
-impl<T> AtomicSlot<T> {
-    fn new_none() -> Self {
+impl<T> Slot<T> {
+    fn new() -> Self {
         Self {
-            state: AtomicUsize::new(0),
-            value: UnsafeCell::new(MaybeUninit::uninit()),
+            flag: AtomicBool::new(false),
+            _pad: [0u8; 8 - std::mem::size_of::<AtomicBool>()],
+            data: UnsafeCell::new(MaybeUninit::uninit()),
         }
-    }
-
-    #[inline]
-    fn is_some(&self) -> bool {
-        self.state.load(Ordering::Acquire) == 1
-    }
-
-    #[inline]
-    fn write(&self, value: T) {
-        unsafe {
-            (*self.value.get()).write(value);
-        }
-        // Release ordering ensures the value write happens-before state change
-        self.state.store(1, Ordering::Release);
-    }
-
-    #[inline]
-    fn read(&self) -> Option<T> {
-        // Use swap to atomically take ownership
-        if self.state.swap(0, Ordering::AcqRel) == 1 {
-            // We successfully took ownership (changed from 1 to 0)
-            Some(unsafe { (*self.value.get()).assume_init_read() })
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn clear(&self) {
-        // This is now redundant since read() already clears
-        self.state.store(0, Ordering::Release);
     }
 }
 
@@ -75,7 +47,7 @@ pub struct IffqQueue<T: Send + 'static> {
     capacity: usize,
     mask: usize,
     h_mask: usize,
-    buffer: *mut AtomicSlot<T>,
+    buffer: *mut Slot<T>,
     owns_buffer: bool,
 }
 
@@ -105,15 +77,19 @@ impl<T: Send + 'static> IffqQueue<T> {
             "Capacity must be at least 2 * H_PARTITION_SIZE."
         );
 
-        let layout = std::alloc::Layout::array::<AtomicSlot<T>>(capacity).unwrap();
+        let layout = std::alloc::Layout::array::<Slot<T>>(capacity)
+            .unwrap()
+            .align_to(64)
+            .unwrap();
+
         let buffer_ptr = unsafe {
-            let ptr = std::alloc::alloc(layout) as *mut AtomicSlot<T>;
+            let ptr = std::alloc::alloc(layout) as *mut Slot<T>;
             if ptr.is_null() {
                 std::alloc::handle_alloc_error(layout);
             }
             // Initialize all slots
             for i in 0..capacity {
-                ptr::write(ptr.add(i), AtomicSlot::new_none());
+                ptr::write(ptr.add(i), Slot::new());
             }
             ptr
         };
@@ -151,7 +127,7 @@ impl<T: Send + 'static> IffqQueue<T> {
         );
 
         let layout = std::alloc::Layout::new::<Self>();
-        let buffer_layout = std::alloc::Layout::array::<AtomicSlot<T>>(capacity).unwrap();
+        let buffer_layout = std::alloc::Layout::array::<Slot<T>>(capacity).unwrap();
         layout.extend(buffer_layout).unwrap().0.size()
     }
 
@@ -171,10 +147,10 @@ impl<T: Send + 'static> IffqQueue<T> {
         );
 
         let queue_ptr = mem_ptr as *mut Self;
-        let buffer_data_ptr = mem_ptr.add(std::mem::size_of::<Self>()) as *mut AtomicSlot<T>;
+        let buffer_data_ptr = mem_ptr.add(std::mem::size_of::<Self>()) as *mut Slot<T>;
 
         for i in 0..capacity {
-            ptr::write(buffer_data_ptr.add(i), AtomicSlot::new_none());
+            ptr::write(buffer_data_ptr.add(i), Slot::new());
         }
 
         ptr::write(
@@ -199,7 +175,7 @@ impl<T: Send + 'static> IffqQueue<T> {
     }
 
     #[inline]
-    fn get_slot(&self, index: usize) -> &AtomicSlot<T> {
+    fn get_slot(&self, index: usize) -> &Slot<T> {
         unsafe { &*self.buffer.add(index & self.mask) }
     }
 
@@ -208,11 +184,13 @@ impl<T: Send + 'static> IffqQueue<T> {
         let mut current_limit = self.prod.limit.load(Ordering::Acquire);
 
         if current_write == current_limit {
+            // Check H slots ahead to see if we can advance the limit
             let next_limit_potential = current_limit.wrapping_add(H_PARTITION_SIZE);
             let slot_to_check_idx = next_limit_potential & self.mask;
 
             let slot = self.get_slot(slot_to_check_idx);
-            if slot.is_some() {
+            if slot.flag.load(Ordering::Acquire) {
+                // Slot is occupied, can't advance
                 return Err(IffqPushError(item));
             }
 
@@ -227,7 +205,14 @@ impl<T: Send + 'static> IffqQueue<T> {
         }
 
         let slot = self.get_slot(current_write);
-        slot.write(item);
+
+        // Write data first
+        unsafe {
+            (*slot.data.get()).write(item);
+        }
+
+        // Then set flag with Release ordering to ensure data write happens-before
+        slot.flag.store(true, Ordering::Release);
 
         self.prod
             .write
@@ -239,38 +224,43 @@ impl<T: Send + 'static> IffqQueue<T> {
         let current_read = self.cons.read.load(Ordering::Relaxed);
         let slot = self.get_slot(current_read);
 
-        if let Some(item) = slot.read() {
-            self.cons
-                .read
-                .store(current_read.wrapping_add(1), Ordering::Release);
-
-            // Clear operation might need adjustment since read() already clears
-            let current_clear = self.cons.clear.load(Ordering::Relaxed);
-            let read_partition_start = current_read & !self.h_mask;
-            let next_clear_target = read_partition_start.wrapping_sub(H_PARTITION_SIZE);
-
-            let mut temp_clear = current_clear;
-            let mut advanced_clear = false;
-            while temp_clear != next_clear_target {
-                if temp_clear == self.cons.read.load(Ordering::Acquire) {
-                    break;
-                }
-
-                // Skip the clear since read() already cleared
-                // let clear_slot = self.get_slot(temp_clear);
-                // clear_slot.clear();
-
-                temp_clear = temp_clear.wrapping_add(1);
-                advanced_clear = true;
-            }
-            if advanced_clear {
-                self.cons.clear.store(temp_clear, Ordering::Release);
-            }
-
-            Ok(item)
-        } else {
-            Err(IffqPopError)
+        // Check if slot is full
+        if !slot.flag.load(Ordering::Acquire) {
+            return Err(IffqPopError);
         }
+
+        // Read data
+        let item = unsafe { (*slot.data.get()).assume_init_read() };
+
+        // Clear flag atomically
+        slot.flag.store(false, Ordering::Release);
+
+        self.cons
+            .read
+            .store(current_read.wrapping_add(1), Ordering::Release);
+
+        // Lazy clear operation
+        let current_clear = self.cons.clear.load(Ordering::Relaxed);
+        let read_partition_start = current_read & !self.h_mask;
+        let next_clear_target = read_partition_start.wrapping_sub(H_PARTITION_SIZE);
+
+        let mut temp_clear = current_clear;
+        let mut advanced_clear = false;
+        while temp_clear != next_clear_target {
+            if temp_clear == self.cons.read.load(Ordering::Acquire) {
+                break;
+            }
+
+            // The slot is already cleared when we read it, so just advance
+            temp_clear = temp_clear.wrapping_add(1);
+            advanced_clear = true;
+        }
+
+        if advanced_clear {
+            self.cons.clear.store(temp_clear, Ordering::Release);
+        }
+
+        Ok(item)
     }
 }
 
@@ -297,13 +287,16 @@ impl<T: Send + 'static> SpscQueue<T> for IffqQueue<T> {
         }
         let next_limit_potential = limit.wrapping_add(H_PARTITION_SIZE);
         let slot_to_check_idx = next_limit_potential & self.mask;
-        !self.get_slot(slot_to_check_idx).is_some()
+        !self
+            .get_slot(slot_to_check_idx)
+            .flag
+            .load(Ordering::Acquire)
     }
 
     #[inline]
     fn empty(&self) -> bool {
         let current_read = self.cons.read.load(Ordering::Acquire);
-        !self.get_slot(current_read).is_some()
+        !self.get_slot(current_read).flag.load(Ordering::Acquire)
     }
 }
 
@@ -311,15 +304,20 @@ impl<T: Send + 'static> Drop for IffqQueue<T> {
     fn drop(&mut self) {
         if self.owns_buffer {
             unsafe {
-                // Clear any remaining items
+                // Drop any remaining items
                 if std::mem::needs_drop::<T>() {
                     for i in 0..self.capacity {
                         let slot = self.get_slot(i);
-                        slot.clear();
+                        if slot.flag.load(Ordering::Relaxed) {
+                            ptr::drop_in_place((*slot.data.get()).as_mut_ptr());
+                        }
                     }
                 }
 
-                let layout = std::alloc::Layout::array::<AtomicSlot<T>>(self.capacity).unwrap();
+                let layout = std::alloc::Layout::array::<Slot<T>>(self.capacity)
+                    .unwrap()
+                    .align_to(64)
+                    .unwrap();
                 std::alloc::dealloc(self.buffer as *mut u8, layout);
             }
         }

@@ -1837,11 +1837,12 @@ mod miri_integration_tests {
         let items = consumer.join().unwrap();
 
         assert_eq!(items.len(), 20);
-        items
+
+        let unique_count = items
             .into_iter()
             .collect::<std::collections::HashSet<_>>()
-            .len()
-            == 20
+            .len();
+        assert_eq!(unique_count, 20);
     }
 
     #[test]

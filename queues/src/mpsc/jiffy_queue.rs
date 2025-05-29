@@ -32,7 +32,7 @@ struct BufferList<T> {
     capacity: usize,
     next: AtomicPtr<BufferList<T>>,
     prev: *mut BufferList<T>,
-    consumer_head_idx: usize,
+    consumer_head_idx: AtomicUsize,
     position_in_queue: u64,
     is_array_reclaimed: AtomicBool,
     next_in_garbage: AtomicPtr<BufferList<T>>,
@@ -51,7 +51,7 @@ impl<T: Send + 'static> BufferList<T> {
         ptr::addr_of_mut!((*bl_meta_ptr).capacity).write(capacity);
         ptr::addr_of_mut!((*bl_meta_ptr).next).write(AtomicPtr::new(ptr::null_mut()));
         ptr::addr_of_mut!((*bl_meta_ptr).prev).write(prev_buffer);
-        ptr::addr_of_mut!((*bl_meta_ptr).consumer_head_idx).write(0);
+        ptr::addr_of_mut!((*bl_meta_ptr).consumer_head_idx).write(AtomicUsize::new(0));
         ptr::addr_of_mut!((*bl_meta_ptr).position_in_queue).write(position_in_queue);
         ptr::addr_of_mut!((*bl_meta_ptr).is_array_reclaimed).write(AtomicBool::new(false));
         ptr::addr_of_mut!((*bl_meta_ptr).next_in_garbage).write(AtomicPtr::new(ptr::null_mut()));
@@ -726,27 +726,30 @@ impl<T: Send + 'static> JiffyQueue<T> {
                 return None;
             }
 
-            let current_bl = unsafe { &mut *current_bl_ptr };
+            let current_bl = unsafe { &*current_bl_ptr }; // Now using immutable reference
 
-            while current_bl.consumer_head_idx < current_bl.capacity {
+            // Skip handled elements
+            while current_bl.consumer_head_idx.load(Ordering::Relaxed) < current_bl.capacity {
                 if current_bl.curr_buffer.is_null()
                     || current_bl.is_array_reclaimed.load(Ordering::Relaxed)
                 {
                     break;
                 }
-                let node_to_check_ptr =
-                    unsafe { current_bl.curr_buffer.add(current_bl.consumer_head_idx) };
+                let consumer_head_idx = current_bl.consumer_head_idx.load(Ordering::Relaxed);
+                let node_to_check_ptr = unsafe { current_bl.curr_buffer.add(consumer_head_idx) };
                 let node_to_check_state =
                     unsafe { (*node_to_check_ptr).is_set.load(Ordering::Acquire) };
 
                 if node_to_check_state == NodeState::Handled as usize {
-                    current_bl.consumer_head_idx += 1;
+                    current_bl.consumer_head_idx.fetch_add(1, Ordering::Relaxed);
                 } else {
                     break;
                 }
             }
 
-            if current_bl.consumer_head_idx >= current_bl.capacity
+            // Check if we need to move to next buffer
+            let consumer_head_idx = current_bl.consumer_head_idx.load(Ordering::Relaxed);
+            if consumer_head_idx >= current_bl.capacity
                 || current_bl.curr_buffer.is_null()
                 || current_bl.is_array_reclaimed.load(Ordering::Relaxed)
             {
@@ -782,18 +785,19 @@ impl<T: Send + 'static> JiffyQueue<T> {
                     }
                     unsafe {
                         let node_array_to_dealloc = current_bl.curr_buffer;
-                        current_bl.mark_items_dropped_and_array_reclaimable();
+                        let current_bl_mut = &mut *current_bl_ptr;
+                        current_bl_mut.mark_items_dropped_and_array_reclaimable();
                         if !node_array_to_dealloc.is_null() {
                             self.pools().dealloc_node_array_slice(node_array_to_dealloc);
                         }
-                        current_bl.curr_buffer = ptr::null_mut();
+                        current_bl_mut.curr_buffer = ptr::null_mut();
                         self.pools().dealloc_bl_meta_to_pool(current_bl_ptr);
                     }
                 }
                 continue 'retry_dequeue;
             }
 
-            let n_idx_in_buffer = current_bl.consumer_head_idx;
+            let n_idx_in_buffer = current_bl.consumer_head_idx.load(Ordering::Relaxed);
             if n_idx_in_buffer >= current_bl.capacity {
                 continue 'retry_dequeue;
             }
@@ -827,7 +831,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                     )
                     .is_ok()
                 {
-                    current_bl.consumer_head_idx += 1;
+                    current_bl.consumer_head_idx.fetch_add(1, Ordering::Relaxed);
                     let data = unsafe { ptr::read(&(*n_node_ref).data).assume_init() };
                     return Some(data);
                 } else {
@@ -845,26 +849,24 @@ impl<T: Send + 'static> JiffyQueue<T> {
                     if temp_n_scan_current_bl_ptr.is_null() {
                         return None;
                     }
-                    let search_bl_mut = unsafe { &mut *temp_n_scan_current_bl_ptr };
+                    let search_bl = unsafe { &*temp_n_scan_current_bl_ptr };
 
-                    if search_bl_mut.curr_buffer.is_null()
-                        || search_bl_mut.is_array_reclaimed.load(Ordering::Relaxed)
+                    if search_bl.curr_buffer.is_null()
+                        || search_bl.is_array_reclaimed.load(Ordering::Relaxed)
                     {
-                        temp_n_scan_current_bl_ptr = search_bl_mut.next.load(Ordering::Acquire);
+                        temp_n_scan_current_bl_ptr = search_bl.next.load(Ordering::Acquire);
                         temp_n_scan_current_idx = 0;
                         continue 'find_initial_temp_n;
                     }
 
                     let mut scan_idx = temp_n_scan_current_idx;
-                    let mut found_set_in_search_bl = false;
 
-                    while scan_idx < search_bl_mut.capacity {
-                        let candidate_node_ptr = unsafe { search_bl_mut.curr_buffer.add(scan_idx) };
+                    while scan_idx < search_bl.capacity {
+                        let candidate_node_ptr = unsafe { search_bl.curr_buffer.add(scan_idx) };
                         let candidate_node_state =
                             unsafe { (*candidate_node_ptr).is_set.load(Ordering::Acquire) };
 
                         if candidate_node_state == NodeState::Set as usize {
-                            found_set_in_search_bl = true;
                             let mut final_temp_n_bl_ptr = temp_n_scan_current_bl_ptr;
                             let mut final_temp_n_idx = scan_idx;
 
@@ -936,9 +938,10 @@ impl<T: Send + 'static> JiffyQueue<T> {
                                 .is_ok()
                             {
                                 if final_temp_n_bl_ptr == current_bl_ptr
-                                    && final_temp_n_idx == current_bl.consumer_head_idx
+                                    && final_temp_n_idx
+                                        == current_bl.consumer_head_idx.load(Ordering::Relaxed)
                                 {
-                                    current_bl.consumer_head_idx += 1;
+                                    current_bl.consumer_head_idx.fetch_add(1, Ordering::Relaxed);
                                 }
                                 let data = unsafe {
                                     ptr::read(&(*item_node_ref_for_cas).data).assume_init()
@@ -951,21 +954,23 @@ impl<T: Send + 'static> JiffyQueue<T> {
                         scan_idx += 1;
                     }
 
+                    // Reached end of buffer without finding a set element
                     let buffer_just_scanned_ptr = temp_n_scan_current_bl_ptr;
-                    let mut next_bl_for_scan = search_bl_mut.next.load(Ordering::Acquire);
+                    let next_bl_for_scan = search_bl.next.load(Ordering::Acquire);
 
-                    if !found_set_in_search_bl && buffer_just_scanned_ptr != current_bl_ptr {
+                    // Only attempt to fold if this isn't the current buffer
+                    if buffer_just_scanned_ptr != current_bl_ptr {
                         let mut is_fully_handled = true;
-                        if search_bl_mut.curr_buffer.is_null()
-                            || search_bl_mut.is_array_reclaimed.load(Ordering::Relaxed)
+                        if search_bl.curr_buffer.is_null()
+                            || search_bl.is_array_reclaimed.load(Ordering::Relaxed)
                         {
-                            if !search_bl_mut.is_array_reclaimed.load(Ordering::Relaxed) {
+                            if !search_bl.is_array_reclaimed.load(Ordering::Relaxed) {
                                 is_fully_handled = false;
                             }
                         } else {
-                            for i in 0..search_bl_mut.capacity {
+                            for i in 0..search_bl.capacity {
                                 if unsafe {
-                                    (*search_bl_mut.curr_buffer.add(i))
+                                    (*search_bl.curr_buffer.add(i))
                                         .is_set
                                         .load(Ordering::Acquire)
                                 } != NodeState::Handled as usize
@@ -984,6 +989,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                             }
                         }
                     }
+
                     temp_n_scan_current_bl_ptr = next_bl_for_scan;
                     temp_n_scan_current_idx = 0;
                 }
@@ -1017,7 +1023,7 @@ impl<T: Send + 'static> MpscQueue<T> for JiffyQueue<T> {
         let head_bl = unsafe { &*head_bl_ptr };
 
         let head_global_position = head_bl.position_in_queue * (self.buffer_capacity() as u64)
-            + (head_bl.consumer_head_idx as u64);
+            + (head_bl.consumer_head_idx.load(Ordering::Relaxed) as u64); // Changed to use load()
 
         head_global_position >= tail_location
     }

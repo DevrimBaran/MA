@@ -4,46 +4,26 @@ use crate::SpscQueue;
 use core::{cell::UnsafeCell, fmt, mem::MaybeUninit, ptr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-// In queues/src/spsc/ffq.rs
+// FastForward-inspired implementation for value types
+// Uses a separate atomic flag to indicate full/empty state
+// This avoids head/tail comparisons while supporting arbitrary types
 
 #[repr(C)]
-pub struct AtomicSlot<T> {
-    // Using AtomicUsize for the discriminant and UnsafeCell for the value
-    // 0 = None, 1 = Some
-    state: AtomicUsize,
-    value: UnsafeCell<MaybeUninit<T>>,
+pub struct Slot<T> {
+    // Atomic flag: false = empty, true = full
+    flag: AtomicBool,
+    // Padding to separate flag from data
+    _pad: [u8; 64 - std::mem::size_of::<AtomicBool>()],
+    // The actual data
+    data: UnsafeCell<MaybeUninit<T>>,
 }
 
-impl<T> AtomicSlot<T> {
-    pub fn new_none() -> Self {
+impl<T> Slot<T> {
+    fn new() -> Self {
         Self {
-            state: AtomicUsize::new(0),
-            value: UnsafeCell::new(MaybeUninit::uninit()),
-        }
-    }
-
-    #[inline]
-    pub fn is_some(&self) -> bool {
-        self.state.load(Ordering::Acquire) == 1
-    }
-
-    #[inline]
-    pub fn write(&self, value: T) {
-        unsafe {
-            (*self.value.get()).write(value);
-        }
-        // Use Release ordering to ensure the value write happens-before state change
-        self.state.store(1, Ordering::Release);
-    }
-
-    #[inline]
-    pub fn take(&self) -> Option<T> {
-        // Use swap instead of compare_exchange to atomically take ownership
-        if self.state.swap(0, Ordering::AcqRel) == 1 {
-            // We successfully took ownership (changed from 1 to 0)
-            Some(unsafe { (*self.value.get()).assume_init_read() })
-        } else {
-            None
+            flag: AtomicBool::new(false),
+            _pad: [0u8; 64 - std::mem::size_of::<AtomicBool>()],
+            data: UnsafeCell::new(MaybeUninit::uninit()),
         }
     }
 }
@@ -56,7 +36,7 @@ pub struct FfqQueue<T: Send + 'static> {
     _pad2: [u8; 64 - std::mem::size_of::<AtomicUsize>()],
     capacity: usize,
     pub mask: usize,
-    buffer: *mut AtomicSlot<T>,
+    buffer: *mut Slot<T>,
     owns_buffer: bool,
     initialized: AtomicBool,
 }
@@ -73,12 +53,12 @@ impl<T: Send + 'static> FfqQueue<T> {
     pub fn with_capacity(capacity: usize) -> Self {
         assert!(capacity.is_power_of_two() && capacity > 0);
 
-        let layout = std::alloc::Layout::array::<AtomicSlot<T>>(capacity)
+        let layout = std::alloc::Layout::array::<Slot<T>>(capacity)
             .unwrap()
             .align_to(64)
             .unwrap();
 
-        let ptr = unsafe { std::alloc::alloc(layout) as *mut AtomicSlot<T> };
+        let ptr = unsafe { std::alloc::alloc(layout) as *mut Slot<T> };
 
         if ptr.is_null() {
             panic!("Failed to allocate buffer");
@@ -86,7 +66,7 @@ impl<T: Send + 'static> FfqQueue<T> {
 
         unsafe {
             for i in 0..capacity {
-                ptr::write(ptr.add(i), AtomicSlot::new_none());
+                ptr::write(ptr.add(i), Slot::new());
             }
         }
 
@@ -106,7 +86,7 @@ impl<T: Send + 'static> FfqQueue<T> {
     pub fn shared_size(capacity: usize) -> usize {
         assert!(capacity.is_power_of_two() && capacity > 0);
         let self_layout = core::alloc::Layout::new::<Self>();
-        let buf_layout = core::alloc::Layout::array::<AtomicSlot<T>>(capacity).unwrap();
+        let buf_layout = core::alloc::Layout::array::<Slot<T>>(capacity).unwrap();
         let (layout, _) = self_layout.extend(buf_layout).unwrap();
         layout.size()
     }
@@ -122,19 +102,12 @@ impl<T: Send + 'static> FfqQueue<T> {
         std::sync::atomic::fence(Ordering::SeqCst);
 
         let queue_ptr = mem as *mut Self;
-        let buf_ptr = mem.add(std::mem::size_of::<Self>()) as *mut AtomicSlot<T>;
+        let buf_ptr = mem.add(std::mem::size_of::<Self>()) as *mut Slot<T>;
 
-        // Initialize each slot explicitly with empty state
+        // Initialize each slot
         for i in 0..capacity {
             let slot_ptr = buf_ptr.add(i);
-            // Write the entire slot structure
-            ptr::write(
-                slot_ptr,
-                AtomicSlot {
-                    state: AtomicUsize::new(0), // 0 = empty
-                    value: UnsafeCell::new(MaybeUninit::uninit()),
-                },
-            );
+            ptr::write(slot_ptr, Slot::new());
         }
 
         // Another barrier
@@ -160,16 +133,16 @@ impl<T: Send + 'static> FfqQueue<T> {
     }
 
     #[inline]
-    pub fn get_slot(&self, index: usize) -> &AtomicSlot<T> {
-        unsafe { &*self.buffer.add(index & self.mask) }
-    }
-
-    #[inline]
     fn ensure_initialized(&self) {
         assert!(
             self.initialized.load(Ordering::Acquire),
             "Queue not initialized"
         );
+    }
+
+    #[inline]
+    fn get_slot(&self, index: usize) -> &Slot<T> {
+        unsafe { &*self.buffer.add(index & self.mask) }
     }
 }
 
@@ -181,14 +154,23 @@ impl<T: Send + 'static> SpscQueue<T> for FfqQueue<T> {
     fn push(&self, item: T) -> Result<(), Self::PushError> {
         self.ensure_initialized();
 
-        let head = self.head.load(Ordering::Acquire);
+        let head = self.head.load(Ordering::Relaxed);
         let slot = self.get_slot(head);
 
-        if slot.is_some() {
+        // Check if slot is empty (following FastForward paper logic)
+        if slot.flag.load(Ordering::Acquire) {
             return Err(FfqPushError(item));
         }
 
-        slot.write(item);
+        // Write data
+        unsafe {
+            (*slot.data.get()).write(item);
+        }
+
+        // Mark slot as full - this is the linearization point
+        slot.flag.store(true, Ordering::Release);
+
+        // Advance head
         self.head.store(head.wrapping_add(1), Ordering::Release);
 
         Ok(())
@@ -198,34 +180,46 @@ impl<T: Send + 'static> SpscQueue<T> for FfqQueue<T> {
     fn pop(&self) -> Result<T, Self::PopError> {
         self.ensure_initialized();
 
-        let tail = self.tail.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Relaxed);
         let slot = self.get_slot(tail);
 
-        match slot.take() {
-            Some(val) => {
-                self.tail.store(tail.wrapping_add(1), Ordering::Release);
-                Ok(val)
-            }
-            None => Err(FfqPopError),
+        // Check if slot is full
+        if !slot.flag.load(Ordering::Acquire) {
+            return Err(FfqPopError);
         }
+
+        // Read data
+        let data = unsafe { (*slot.data.get()).assume_init_read() };
+
+        // Mark slot as empty - this is the linearization point
+        slot.flag.store(false, Ordering::Release);
+
+        // Advance tail
+        self.tail.store(tail.wrapping_add(1), Ordering::Release);
+
+        Ok(data)
     }
 
     #[inline]
     fn available(&self) -> bool {
         self.ensure_initialized();
 
-        let head = self.head.load(Ordering::Acquire);
+        let head = self.head.load(Ordering::Relaxed);
         let slot = self.get_slot(head);
-        !slot.is_some()
+
+        // Slot is available if it's empty
+        !slot.flag.load(Ordering::Acquire)
     }
 
     #[inline]
     fn empty(&self) -> bool {
         self.ensure_initialized();
 
-        let tail = self.tail.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Relaxed);
         let slot = self.get_slot(tail);
-        !slot.is_some()
+
+        // Queue is empty if next slot to dequeue is empty
+        !slot.flag.load(Ordering::Acquire)
     }
 }
 
@@ -237,11 +231,14 @@ impl<T: Send + 'static> Drop for FfqQueue<T> {
                 if core::mem::needs_drop::<T>() {
                     for i in 0..self.capacity {
                         let slot = self.get_slot(i);
-                        drop(slot.take());
+                        if slot.flag.load(Ordering::Relaxed) {
+                            // Drop the item
+                            ptr::drop_in_place((*slot.data.get()).as_mut_ptr());
+                        }
                     }
                 }
 
-                let layout = std::alloc::Layout::array::<AtomicSlot<T>>(self.capacity)
+                let layout = std::alloc::Layout::array::<Slot<T>>(self.capacity)
                     .unwrap()
                     .align_to(64)
                     .unwrap();

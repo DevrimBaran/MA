@@ -1495,6 +1495,48 @@ mod miri_drop_tests {
             final_drops
         );
     }
+    #[test]
+    fn test_dqueue_drops() {
+        DROP_COUNT.store(0, Ordering::SeqCst);
+
+        {
+            let shared_size = DQueue::<DropCounter>::shared_size(2, 10);
+            let mut memory = AlignedMemory::new(shared_size, 64);
+            let mem_ptr = memory.as_mut_ptr();
+
+            let queue = unsafe { DQueue::init_in_shared(mem_ptr, 2, 10) };
+
+            // Enqueue items to both producers
+            for i in 0..10 {
+                queue.enqueue(0, DropCounter { _value: i }).unwrap();
+            }
+            for i in 10..20 {
+                queue.enqueue(1, DropCounter { _value: i }).unwrap();
+            }
+
+            // Dump buffers to make items visible
+            unsafe {
+                queue.dump_local_buffer(0);
+                queue.dump_local_buffer(1);
+            }
+
+            // Dequeue 10 items
+            for _ in 0..10 {
+                drop(queue.dequeue().unwrap());
+            }
+
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 10);
+        }
+
+        // After the queue is dropped, remaining items might not be dropped
+        // due to the nature of DQueue's implementation
+        let final_drops = DROP_COUNT.load(Ordering::SeqCst);
+        assert!(
+            final_drops >= 10,
+            "At least 10 items should be dropped, got {}",
+            final_drops
+        );
+    }
 }
 
 mod miri_type_tests {

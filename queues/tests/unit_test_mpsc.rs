@@ -1043,6 +1043,149 @@ mod edge_cases {
 
         assert!(DROP_COUNT.load(Ordering::SeqCst) >= 5);
     }
+    #[test]
+    fn test_single_item_queues() {
+        // Test with minimal queue sizes
+        let size = JiffyQueue::<usize>::shared_size(1, 1);
+        let memory = create_aligned_memory_box(size);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue = unsafe { JiffyQueue::init_in_shared(mem_ptr, 1, 1) };
+
+        queue.push(42).unwrap();
+        assert_eq!(queue.pop().unwrap(), 42);
+        assert!(queue.is_empty());
+
+        // Test DrescherQueue with minimal nodes
+        let size = DrescherQueue::<usize>::shared_size(2); // Need at least 2 nodes
+        let memory = create_aligned_memory_box(size);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue = unsafe { DrescherQueue::init_in_shared(mem_ptr, 2) };
+
+        // With 2 nodes, we can push 1 item (1 for dummy, 1 for data)
+        queue.push(42).unwrap();
+        assert_eq!(queue.pop().unwrap(), 42);
+        assert!(queue.is_empty());
+
+        // After popping, we should be able to push again due to node recycling
+        queue.push(43).unwrap();
+        assert_eq!(queue.pop().unwrap(), 43);
+    }
+
+    #[test]
+    fn test_option_values() {
+        // Test with None values
+        let num_producers = 1;
+        let segment_pool = 10;
+
+        let shared_size = DQueue::<Option<usize>>::shared_size(num_producers, segment_pool);
+        let memory = create_aligned_memory_box(shared_size);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+        let queue = unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool) };
+
+        // Test with None values
+        queue.enqueue(0, None).unwrap();
+        queue.enqueue(0, Some(42)).unwrap();
+        queue.enqueue(0, None).unwrap();
+        queue.enqueue(0, Some(100)).unwrap();
+
+        unsafe {
+            queue.dump_local_buffer(0);
+        }
+
+        assert_eq!(queue.dequeue(), Some(None));
+        assert_eq!(queue.dequeue(), Some(Some(42)));
+        assert_eq!(queue.dequeue(), Some(None));
+        assert_eq!(queue.dequeue(), Some(Some(100)));
+        assert_eq!(queue.dequeue(), None);
+    }
+
+    #[test]
+    fn test_comprehensive_drop_semantics() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone, Debug)]
+        struct DropCounter {
+            _value: usize,
+        }
+
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        // Test DrescherQueue drops
+        {
+            DROP_COUNT.store(0, Ordering::SeqCst);
+
+            let shared_size = DrescherQueue::<DropCounter>::shared_size(50);
+            let memory = create_aligned_memory_box(shared_size);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue = unsafe { DrescherQueue::init_in_shared(mem_ptr, 50) };
+
+            for i in 0..10 {
+                queue.push(DropCounter { _value: i }).unwrap();
+            }
+
+            for _ in 0..5 {
+                drop(queue.pop().unwrap());
+            }
+
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 5);
+
+            // Queue still has 5 items that haven't been dropped
+            // Unlike in Miri tests, we can't easily drop the queue itself
+            // since we used Box::leak
+        }
+
+        // Test JayantiPetrovicMpscQueue drops
+        {
+            DROP_COUNT.store(0, Ordering::SeqCst);
+
+            let shared_size = JayantiPetrovicMpscQueue::<DropCounter>::shared_size(2, 50);
+            let memory = create_aligned_memory_box(shared_size);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue = unsafe { JayantiPetrovicMpscQueue::init_in_shared(mem_ptr, 2, 50) };
+
+            for i in 0..10 {
+                queue.enqueue(0, DropCounter { _value: i }).unwrap();
+            }
+
+            // Dequeue 5 items
+            for _ in 0..5 {
+                drop(queue.dequeue().unwrap());
+            }
+
+            let drops = DROP_COUNT.load(Ordering::SeqCst);
+            assert!(drops >= 5, "Should have at least 5 drops, got {}", drops);
+        }
+
+        // Test JiffyQueue drops
+        {
+            DROP_COUNT.store(0, Ordering::SeqCst);
+
+            let shared_size = JiffyQueue::<DropCounter>::shared_size(16, 5);
+            let memory = create_aligned_memory_box(shared_size);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue = unsafe { JiffyQueue::init_in_shared(mem_ptr, 16, 5) };
+
+            for i in 0..10 {
+                queue.push(DropCounter { _value: i }).unwrap();
+            }
+
+            for _ in 0..5 {
+                drop(queue.pop().unwrap());
+            }
+
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 5);
+        }
+    }
 }
 
 mod memory_tests {
@@ -1468,6 +1611,218 @@ mod comprehensive_tests {
 
         assert!(queue.pop().is_err(), "Pop should fail on empty queue");
     }
+    #[test]
+    fn test_dqueue_wraparound() {
+        let num_producers = 2;
+        let segment_pool = 4;
+
+        let shared_size = DQueue::<usize>::shared_size(num_producers, segment_pool);
+        let memory = create_aligned_memory_box(shared_size);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+        let queue = unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool) };
+
+        // Multiple cycles of enqueue/dequeue to test wraparound
+        for cycle in 0..3 {
+            for producer_id in 0..num_producers {
+                for i in 0..10 {
+                    queue
+                        .enqueue(producer_id, cycle * 1000 + producer_id * 100 + i)
+                        .unwrap();
+                }
+                unsafe {
+                    queue.dump_local_buffer(producer_id);
+                }
+            }
+
+            // Dequeue all
+            for _ in 0..(num_producers * 10) {
+                assert!(queue.dequeue().is_some());
+            }
+
+            // Run GC between cycles
+            unsafe {
+                queue.run_gc();
+            }
+        }
+
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_dqueue_producer_fairness() {
+        let num_producers = 3;
+        let segment_pool = 5;
+
+        let shared_size = DQueue::<usize>::shared_size(num_producers, segment_pool);
+        let memory = create_aligned_memory_box(shared_size);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+        let queue = unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool) };
+
+        // Each producer adds items with different timestamps
+        for round in 0..5 {
+            for producer_id in 0..num_producers {
+                queue
+                    .enqueue(producer_id, producer_id * 1000 + round)
+                    .unwrap();
+            }
+        }
+
+        // Dump all buffers
+        for producer_id in 0..num_producers {
+            unsafe {
+                queue.dump_local_buffer(producer_id);
+            }
+        }
+
+        // Items should come out in timestamp order
+        let mut items = Vec::new();
+        while let Some(item) = queue.dequeue() {
+            items.push(item);
+        }
+
+        // Verify fairness - items should be interleaved by timestamp
+        assert_eq!(items.len(), num_producers * 5);
+
+        // Check that we got all items from all producers
+        for producer_id in 0..num_producers {
+            let producer_items: Vec<_> =
+                items.iter().filter(|&&x| x / 1000 == producer_id).collect();
+            assert_eq!(producer_items.len(), 5);
+        }
+    }
+
+    #[test]
+    fn test_dqueue_mixed_operations() {
+        let num_producers = 2;
+        let segment_pool = 5;
+
+        let shared_size = DQueue::<usize>::shared_size(num_producers, segment_pool);
+        let memory = create_aligned_memory_box(shared_size);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+        let queue = unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool) };
+
+        // Interleave enqueues, dumps, and dequeues
+        queue.enqueue(0, 1).unwrap();
+        queue.enqueue(1, 2).unwrap();
+
+        unsafe {
+            queue.dump_local_buffer(0);
+        }
+        assert_eq!(queue.dequeue(), Some(1));
+
+        queue.enqueue(0, 3).unwrap();
+        unsafe {
+            queue.dump_local_buffer(1);
+        }
+
+        assert_eq!(queue.dequeue(), Some(2));
+
+        queue.enqueue(1, 4).unwrap();
+        unsafe {
+            queue.dump_local_buffer(0);
+            queue.dump_local_buffer(1);
+        }
+
+        assert_eq!(queue.dequeue(), Some(3));
+        assert_eq!(queue.dequeue(), Some(4));
+        assert!(queue.dequeue().is_none());
+    }
+
+    #[test]
+    fn test_string_types() {
+        let shared_size = DrescherQueue::<String>::shared_size(20);
+        let memory = create_aligned_memory_box(shared_size);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+        let queue = unsafe { DrescherQueue::init_in_shared(mem_ptr, 20) };
+
+        for i in 0..10 {
+            queue.push(format!("test_string_{}", i)).unwrap();
+        }
+
+        for i in 0..10 {
+            assert_eq!(queue.pop().unwrap(), format!("test_string_{}", i));
+        }
+    }
+
+    #[test]
+    fn test_queue_reuse() {
+        // Test that queues can be emptied and reused
+        let shared_size = DrescherQueue::<usize>::shared_size(50);
+        let memory = create_aligned_memory_box(shared_size);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+        let queue = unsafe { DrescherQueue::init_in_shared(mem_ptr, 50) };
+
+        for cycle in 0..3 {
+            // Fill
+            for i in 0..10 {
+                queue.push(cycle * 100 + i).unwrap();
+            }
+
+            // Empty
+            for _ in 0..10 {
+                assert!(queue.pop().is_some());
+            }
+
+            assert!(queue.is_empty());
+        }
+    }
+
+    // In integration_tests module, add:
+
+    #[test]
+    fn test_producer_consumer_pattern() {
+        // Simplified version of mixed workload
+        let shared_size = JiffyQueue::<usize>::shared_size(64, 10);
+        let memory = create_aligned_memory_box(shared_size);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+        let queue = unsafe { JiffyQueue::init_in_shared(mem_ptr, 64, 10) };
+        let queue = Arc::new(queue);
+
+        // Producer
+        let q1 = queue.clone();
+        let producer = thread::spawn(move || {
+            for i in 0..100 {
+                q1.push(i).unwrap();
+            }
+        });
+
+        // Consumer
+        let q2 = queue.clone();
+        let consumer = thread::spawn(move || {
+            let mut items = Vec::new();
+            let mut retries = 0;
+            while items.len() < 100 && retries < 1000 {
+                match q2.pop() {
+                    Ok(item) => {
+                        items.push(item);
+                        retries = 0;
+                    }
+                    Err(_) => {
+                        retries += 1;
+                        thread::yield_now();
+                    }
+                }
+            }
+            items
+        });
+
+        producer.join().unwrap();
+        let items = consumer.join().unwrap();
+
+        assert_eq!(items.len(), 100);
+
+        let unique_count = items
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        assert_eq!(unique_count, 100);
+    }
 }
 
 mod integration_tests {
@@ -1566,5 +1921,115 @@ mod integration_tests {
         assert!(steady_count > 0);
         assert!(burst_count > 0);
         assert!(random_count > 0);
+    }
+}
+
+#[test]
+fn test_comprehensive_drop_semantics() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Clone, Debug)]
+    struct DropCounter {
+        _value: usize,
+    }
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // Test DrescherQueue drops
+    {
+        DROP_COUNT.store(0, Ordering::SeqCst);
+
+        let shared_size = DrescherQueue::<DropCounter>::shared_size(50);
+        let memory = create_aligned_memory_box(shared_size);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+        let queue = unsafe { DrescherQueue::init_in_shared(mem_ptr, 50) };
+
+        for i in 0..10 {
+            queue.push(DropCounter { _value: i }).unwrap();
+        }
+
+        for _ in 0..5 {
+            drop(queue.pop().unwrap());
+        }
+
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 5);
+    }
+
+    // Test JayantiPetrovicMpscQueue drops
+    {
+        DROP_COUNT.store(0, Ordering::SeqCst);
+
+        let shared_size = JayantiPetrovicMpscQueue::<DropCounter>::shared_size(2, 50);
+        let memory = create_aligned_memory_box(shared_size);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+        let queue = unsafe { JayantiPetrovicMpscQueue::init_in_shared(mem_ptr, 2, 50) };
+
+        for i in 0..10 {
+            queue.enqueue(0, DropCounter { _value: i }).unwrap();
+        }
+
+        // Dequeue 5 items
+        for _ in 0..5 {
+            drop(queue.dequeue().unwrap());
+        }
+
+        let drops = DROP_COUNT.load(Ordering::SeqCst);
+        assert!(drops >= 5, "Should have at least 5 drops, got {}", drops);
+    }
+
+    // Test JiffyQueue drops
+    {
+        DROP_COUNT.store(0, Ordering::SeqCst);
+
+        let shared_size = JiffyQueue::<DropCounter>::shared_size(16, 5);
+        let memory = create_aligned_memory_box(shared_size);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+        let queue = unsafe { JiffyQueue::init_in_shared(mem_ptr, 16, 5) };
+
+        for i in 0..10 {
+            queue.push(DropCounter { _value: i }).unwrap();
+        }
+
+        for _ in 0..5 {
+            drop(queue.pop().unwrap());
+        }
+
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 5);
+    }
+
+    // Test DQueue drops
+    {
+        DROP_COUNT.store(0, Ordering::SeqCst);
+
+        let shared_size = DQueue::<DropCounter>::shared_size(2, 10);
+        let memory = create_aligned_memory_box(shared_size);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+        let queue = unsafe { DQueue::init_in_shared(mem_ptr, 2, 10) };
+
+        // Enqueue items
+        for i in 0..10 {
+            queue.enqueue(0, DropCounter { _value: i }).unwrap();
+        }
+
+        unsafe {
+            queue.dump_local_buffer(0);
+        }
+
+        // Dequeue 5 items
+        for _ in 0..5 {
+            drop(queue.dequeue().unwrap());
+        }
+
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 5);
     }
 }

@@ -1,7 +1,7 @@
-use std::cmp::Ordering as CmpOrdering;
+use std::cell::UnsafeCell;
 use std::mem::{self, MaybeUninit};
 use std::ptr;
-use std::sync::atomic::{fence, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use super::sesd_jp_queue::{Node as SesdNode, SesdJpQueue};
 use crate::MpscQueue as MpscQueueTrait;
@@ -66,27 +66,28 @@ impl<T: Send + Clone + 'static> ShmBumpPool<T> {
 
         loop {
             let current_ptr_val = self.current.load(Ordering::Relaxed);
-            let mut alloc_ptr_usize = current_ptr_val as usize;
 
-            let remainder = alloc_ptr_usize % align;
-            if remainder != 0 {
-                alloc_ptr_usize += align - remainder;
-            }
+            // Calculate alignment using pointer arithmetic
+            let current_addr = current_ptr_val as usize;
+            let aligned_addr = (current_addr + align - 1) & !(align - 1);
+            let padding = aligned_addr - current_addr;
 
-            let next_ptr_val_after_alloc = alloc_ptr_usize + size;
+            // Use pointer arithmetic to preserve provenance
+            let aligned_ptr = current_ptr_val.add(padding);
+            let next_ptr = aligned_ptr.add(size);
 
-            if next_ptr_val_after_alloc > self.end as usize {
+            if next_ptr as usize > self.end as usize {
                 return ptr::null_mut();
             }
 
             match self.current.compare_exchange(
                 current_ptr_val,
-                next_ptr_val_after_alloc as *mut u8,
+                next_ptr,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    let allocated_node_ptr = alloc_ptr_usize as *mut SesdNode<(T, Timestamp)>;
+                    let allocated_node_ptr = aligned_ptr as *mut SesdNode<(T, Timestamp)>;
                     SesdNode::init_dummy(allocated_node_ptr);
                     return allocated_node_ptr;
                 }
@@ -98,18 +99,19 @@ impl<T: Send + Clone + 'static> ShmBumpPool<T> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timestamp {
-    val: u64,
-    pid: usize,
+    // Use u32 for value and u16 for pid to fit in 64 bits total
+    val: u32,
+    pid: u16,
 }
 
 impl PartialOrd for Timestamp {
-    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for Timestamp {
-    fn cmp(&self, other: &Self) -> CmpOrdering {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.val
             .cmp(&other.val)
             .then_with(|| self.pid.cmp(&other.pid))
@@ -117,56 +119,71 @@ impl Ord for Timestamp {
 }
 
 pub const INFINITY_TS: Timestamp = Timestamp {
-    val: u64::MAX,
-    pid: usize::MAX,
+    val: u32::MAX,
+    pid: u16::MAX,
 };
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct MinInfo {
     ts: Timestamp,
-    leaf_idx: usize,
+    leaf_idx: u16,
 }
 
 impl MinInfo {
+    fn to_u64(self) -> u64 {
+        ((self.ts.val as u64) << 32) | ((self.ts.pid as u64) << 16) | (self.leaf_idx as u64)
+    }
+
+    fn from_u64(val: u64) -> Self {
+        MinInfo {
+            ts: Timestamp {
+                val: (val >> 32) as u32,
+                pid: ((val >> 16) & 0xFFFF) as u16,
+            },
+            leaf_idx: (val & 0xFFFF) as u16,
+        }
+    }
+
     fn infinite() -> Self {
         MinInfo {
             ts: INFINITY_TS,
-            leaf_idx: usize::MAX,
+            leaf_idx: u16::MAX,
         }
     }
+
     fn new(ts: Timestamp, leaf_idx: usize) -> Self {
-        MinInfo { ts, leaf_idx }
+        MinInfo {
+            ts,
+            leaf_idx: leaf_idx as u16,
+        }
     }
 }
 
 #[repr(C)]
 struct TreeNode {
-    min_info_ptr: AtomicPtr<MinInfo>,
+    // Store MinInfo as a single atomic u64
+    min_info: AtomicU64,
 }
 
 impl TreeNode {
-    unsafe fn init_in_shm(node_ptr: *mut Self, initial_min_info_instance_ptr: *mut MinInfo) {
-        ptr::addr_of_mut!((*initial_min_info_instance_ptr)).write(MinInfo::infinite());
+    unsafe fn init_in_shm(node_ptr: *mut Self) {
         ptr::write(
             node_ptr,
             TreeNode {
-                min_info_ptr: AtomicPtr::new(initial_min_info_instance_ptr),
+                min_info: AtomicU64::new(MinInfo::infinite().to_u64()),
             },
         );
     }
 
     #[inline]
     unsafe fn read_min_info(&self) -> MinInfo {
-        let ptr = self.min_info_ptr.load(Ordering::Acquire);
-        *ptr
+        MinInfo::from_u64(self.min_info.load(Ordering::Acquire))
     }
 
     #[inline]
     unsafe fn update_min_info_value_in_slot(&self, new_value: MinInfo) {
-        let slot_ptr = self.min_info_ptr.load(Ordering::Relaxed);
-        slot_ptr.write(new_value);
-        fence(Ordering::Release);
+        self.min_info.store(new_value.to_u64(), Ordering::Release);
     }
 }
 
@@ -176,7 +193,6 @@ pub struct JayantiPetrovicMpscQueue<T: Send + Clone + 'static> {
     num_producers: usize,
     local_queues_base: *mut SesdJpQueue<(T, Timestamp)>,
     tree_nodes_base: *mut TreeNode,
-    min_info_slots_base: *mut MinInfo,
     sesd_initial_dummies_base: *mut SesdNode<(T, Timestamp)>,
     sesd_help_slots_base: *mut MaybeUninit<(T, Timestamp)>,
     sesd_free_later_dummies_base: *mut SesdNode<(T, Timestamp)>,
@@ -196,7 +212,6 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
         let self_size = mem::size_of::<Self>();
         let lq_structs_size = num_producers * mem::size_of::<SesdJpQueue<(T, Timestamp)>>();
         let tree_node_structs_size = tree_node_count * mem::size_of::<TreeNode>();
-        let min_info_slots_size = tree_node_count * mem::size_of::<MinInfo>();
         let sesd_initial_dummies_size = num_producers * mem::size_of::<SesdNode<(T, Timestamp)>>();
         let sesd_help_slots_size = num_producers * mem::size_of::<MaybeUninit<(T, Timestamp)>>();
         let sesd_free_later_dummies_size =
@@ -212,7 +227,6 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
         total_size = align_offset(total_size, mem::align_of::<SesdJpQueue<(T, Timestamp)>>())
             + lq_structs_size;
         total_size = align_offset(total_size, mem::align_of::<TreeNode>()) + tree_node_structs_size;
-        total_size = align_offset(total_size, mem::align_of::<MinInfo>()) + min_info_slots_size;
         total_size = align_offset(total_size, mem::align_of::<SesdNode<(T, Timestamp)>>())
             + sesd_initial_dummies_size;
         total_size = align_offset(total_size, mem::align_of::<MaybeUninit<(T, Timestamp)>>())
@@ -230,6 +244,10 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
         sesd_node_pool_capacity: usize,
     ) -> &'static mut Self {
         assert!(num_producers > 0, "Number of producers must be > 0");
+        assert!(
+            num_producers <= u16::MAX as usize,
+            "Number of producers must fit in u16"
+        );
 
         let tree_node_count = 2 * num_producers - 1;
         let mut current_offset = 0usize;
@@ -251,10 +269,6 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
         current_offset = align_offset(current_offset, mem::align_of::<TreeNode>());
         let tree_base_ptr = mem_ptr.add(current_offset) as *mut TreeNode;
         current_offset += tree_node_count * mem::size_of::<TreeNode>();
-
-        current_offset = align_offset(current_offset, mem::align_of::<MinInfo>());
-        let min_info_slots_ptr = mem_ptr.add(current_offset) as *mut MinInfo;
-        current_offset += tree_node_count * mem::size_of::<MinInfo>();
 
         current_offset = align_offset(current_offset, mem::align_of::<SesdNode<(T, Timestamp)>>());
         let sesd_initial_dummies_ptr = mem_ptr.add(current_offset) as *mut SesdNode<(T, Timestamp)>;
@@ -284,7 +298,6 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
                 num_producers,
                 local_queues_base: lq_base_ptr,
                 tree_nodes_base: tree_base_ptr,
-                min_info_slots_base: min_info_slots_ptr,
                 sesd_initial_dummies_base: sesd_initial_dummies_ptr,
                 sesd_help_slots_base: sesd_help_slots_ptr,
                 sesd_free_later_dummies_base: sesd_free_later_dummies_ptr,
@@ -299,8 +312,7 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
 
         for i in 0..tree_node_count {
             let tree_node_raw_ptr = queue_ref.tree_nodes_base.add(i);
-            let min_info_instance_raw_ptr = queue_ref.min_info_slots_base.add(i);
-            TreeNode::init_in_shm(tree_node_raw_ptr, min_info_instance_raw_ptr);
+            TreeNode::init_in_shm(tree_node_raw_ptr);
         }
 
         for i in 0..num_producers {
@@ -359,9 +371,6 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
 
     unsafe fn refresh(&self, u_idx: usize) {
         let u_node = self.get_tree_node(u_idx);
-        let u_min_info_slot_ptr = u_node.min_info_ptr.load(Ordering::Relaxed);
-
-        let old_min_info_val_at_u = *u_min_info_slot_ptr;
 
         let (left_child_idx_opt, right_child_idx_opt) = self.get_children_indices(u_idx);
 
@@ -380,12 +389,7 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
             right_ts_info
         };
 
-        if old_min_info_val_at_u.ts != new_min_info_val_for_u.ts
-            || old_min_info_val_at_u.leaf_idx != new_min_info_val_for_u.leaf_idx
-        {
-            u_min_info_slot_ptr.write(new_min_info_val_for_u);
-            fence(Ordering::Release);
-        }
+        u_node.update_min_info_value_in_slot(new_min_info_val_for_u);
     }
 
     unsafe fn propagate(&self, producer_id: usize, is_enqueuer: bool) {
@@ -425,10 +429,10 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
         if producer_id >= self.num_producers {
             return Err(());
         }
-        let tok = self.counter.fetch_add(1, Ordering::Relaxed);
+        let tok = self.counter.fetch_add(1, Ordering::Relaxed) as u32;
         let ts = Timestamp {
             val: tok,
-            pid: producer_id,
+            pid: producer_id as u16,
         };
 
         unsafe {
@@ -455,13 +459,13 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
                 return None;
             }
 
-            let target_producer_id = min_info_at_root.leaf_idx;
-            if target_producer_id >= self.num_producers || target_producer_id == usize::MAX {
+            let target_producer_id = min_info_at_root.leaf_idx as usize;
+            if target_producer_id >= self.num_producers || target_producer_id == u16::MAX as usize {
                 self.refresh(0);
                 let min_info_at_root_retry = root_node.read_min_info();
                 if min_info_at_root_retry.ts == INFINITY_TS
-                    || min_info_at_root_retry.leaf_idx >= self.num_producers
-                    || min_info_at_root_retry.leaf_idx == usize::MAX
+                    || min_info_at_root_retry.leaf_idx as usize >= self.num_producers
+                    || min_info_at_root_retry.leaf_idx == u16::MAX
                 {
                     return None;
                 }

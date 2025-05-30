@@ -1005,7 +1005,7 @@ mod dehnavi_tests {
     }
 
     #[test]
-    fn test_dehnavi_wait_free_property() {
+    fn test_dehnavi() {
         let queue = Arc::new(DehnaviQueue::<usize>::new(4));
         let barrier = Arc::new(Barrier::new(2));
 

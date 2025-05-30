@@ -2029,3 +2029,392 @@ fn test_different_types() {
         assert_eq!(q_opt.pop().unwrap(), None);
     }
 }
+
+mod shared_memory_init_tests {
+    use super::*;
+
+    #[test]
+    fn test_shared_memory_alignment_all_queues() {
+        // Test that all queue types properly handle different alignments
+        struct AlignmentTest {
+            queue_type: &'static str,
+            min_align: usize,
+            test_fn: fn(usize),
+        }
+
+        let tests = vec![
+            AlignmentTest {
+                queue_type: "LamportQueue",
+                min_align: 64,
+                test_fn: |align| {
+                    let size = LamportQueue::<usize>::shared_size(64);
+                    let mut mem = AlignedMemory::new(size + align, align);
+                    let ptr = mem.as_mut_ptr();
+
+                    // Test with different offsets
+                    for offset in [0, 8, 16, 32].iter() {
+                        if *offset < align {
+                            let test_ptr = unsafe { ptr.add(*offset) };
+                            if test_ptr as usize % align == 0 {
+                                let queue = unsafe { LamportQueue::init_in_shared(test_ptr, 64) };
+                                queue.push(42).unwrap();
+                                assert_eq!(queue.pop().unwrap(), 42);
+                            }
+                        }
+                    }
+                },
+            },
+            AlignmentTest {
+                queue_type: "UnboundedQueue",
+                min_align: 128,
+                test_fn: |align| {
+                    let size = UnboundedQueue::<usize>::shared_size(64);
+                    let mut mem = AlignedMemory::new(size, align);
+                    let queue = unsafe { UnboundedQueue::init_in_shared(mem.as_mut_ptr(), 64) };
+                    queue.push(42).unwrap();
+                    assert_eq!(queue.pop().unwrap(), 42);
+                },
+            },
+        ];
+
+        for test in tests {
+            for align in [test.min_align, 256, 512] {
+                (test.test_fn)(align);
+            }
+        }
+    }
+
+    #[test]
+    fn test_shared_memory_reinitialization() {
+        // Test that queues can be safely reinitialized in the same memory
+        let size = LamportQueue::<usize>::shared_size(64);
+        let mut memory = AlignedMemory::new(size, 64);
+        let mem_ptr = memory.as_mut_ptr();
+
+        // First initialization
+        {
+            let queue = unsafe { LamportQueue::init_in_shared(mem_ptr, 64) };
+            for i in 0..10 {
+                queue.push(i).unwrap();
+            }
+            // Don't pop - leave items in queue
+        }
+
+        // Zero memory
+        unsafe {
+            std::ptr::write_bytes(mem_ptr, 0, size);
+        }
+
+        // Reinitialize
+        {
+            let queue = unsafe { LamportQueue::init_in_shared(mem_ptr, 64) };
+            assert!(queue.empty()); // Should be empty after reinitialization
+
+            queue.push(100).unwrap();
+            assert_eq!(queue.pop().unwrap(), 100);
+        }
+    }
+
+    #[test]
+    fn test_shared_memory_partial_writes() {
+        // Test queues handle partially initialized memory correctly
+        let size = BiffqQueue::<String>::shared_size(128);
+        let mut memory = AlignedMemory::new(size, 64);
+        let mem_ptr = memory.as_mut_ptr();
+
+        // Partially initialize with garbage
+        unsafe {
+            let garbage: Vec<u8> = (0..size / 2).map(|i| (i % 256) as u8).collect();
+            std::ptr::copy_nonoverlapping(garbage.as_ptr(), mem_ptr, size / 2);
+        }
+
+        // Should still initialize correctly
+        let queue = unsafe { BiffqQueue::init_in_shared(mem_ptr, 128) };
+
+        queue.push("test".to_string()).unwrap();
+        let _ = queue.flush_producer_buffer();
+        assert_eq!(queue.pop().unwrap(), "test");
+    }
+
+    #[test]
+    fn test_shared_memory_size_calculations() {
+        // Verify shared_size calculations are sufficient
+
+        // Test LamportQueue with different types
+        {
+            let size_u8 = LamportQueue::<u8>::shared_size(64);
+            let size_u64 = LamportQueue::<u64>::shared_size(64);
+            let size_large = LamportQueue::<[u8; 128]>::shared_size(64);
+
+            // Larger types should require more space
+            assert!(size_u64 >= size_u8);
+            assert!(size_large > size_u64);
+
+            // Test initialization at exact size works
+            let mut memory = AlignedMemory::new(size_u8, 64);
+            let queue = unsafe { LamportQueue::<u8>::init_in_shared(memory.as_mut_ptr(), 64) };
+            queue.push(42).unwrap();
+            assert_eq!(queue.pop().unwrap(), 42);
+        }
+
+        // Test FfqQueue with different types
+        {
+            let size_u8 = FfqQueue::<u8>::shared_size(64);
+            let size_string = FfqQueue::<String>::shared_size(64);
+
+            assert!(size_string >= size_u8);
+
+            let mut memory = AlignedMemory::new(size_string, 64);
+            let queue = unsafe { FfqQueue::<String>::init_in_shared(memory.as_mut_ptr(), 64) };
+            queue.push("test".to_string()).unwrap();
+            assert_eq!(queue.pop().unwrap(), "test");
+        }
+
+        // Test that insufficient memory would cause issues
+        {
+            let proper_size = BlqQueue::<usize>::shared_size(128);
+            let too_small = proper_size / 2;
+
+            // This should panic or cause undefined behavior if we try to use it
+            let result = std::panic::catch_unwind(|| {
+                let mut memory = AlignedMemory::new(too_small, 64);
+                let queue = unsafe { BlqQueue::<usize>::init_in_shared(memory.as_mut_ptr(), 128) };
+                // Try to use the queue with insufficient memory
+                for i in 0..128 {
+                    queue.push(i).unwrap();
+                }
+            });
+
+            // Note: This might not always catch the error in unsafe code
+            // but it's worth testing
+        }
+
+        // Test each queue type reports consistent sizes
+        {
+            // Test that shared_size is consistent for same parameters
+            let size1 = IffqQueue::<usize>::shared_size(256);
+            let size2 = IffqQueue::<usize>::shared_size(256);
+            assert_eq!(size1, size2, "Same parameters should give same size");
+
+            // Test that larger capacity means larger size
+            let small = BiffqQueue::<usize>::shared_size(64);
+            let large = BiffqQueue::<usize>::shared_size(1024);
+            assert!(large > small, "Larger capacity should need more memory");
+        }
+
+        // Test special queue types with extra parameters
+        {
+            // MultiPushQueue
+            let size = MultiPushQueue::<usize>::shared_size(128);
+            let mut memory = AlignedMemory::new(size, 64);
+            let queue =
+                unsafe { MultiPushQueue::<usize>::init_in_shared(memory.as_mut_ptr(), 128) };
+            queue.push(42).unwrap();
+            queue.flush();
+            assert_eq!(queue.pop().unwrap(), 42);
+
+            // SesdJpSpscBenchWrapper
+            let size = SesdJpSpscBenchWrapper::<usize>::shared_size(100);
+            let mut memory = AlignedMemory::new(size, 64);
+            let queue = unsafe {
+                SesdJpSpscBenchWrapper::<usize>::init_in_shared(memory.as_mut_ptr(), 100)
+            };
+            queue.push(42).unwrap();
+            assert_eq!(queue.pop().unwrap(), 42);
+
+            // UnboundedQueue
+            let size = UnboundedQueue::<usize>::shared_size(64);
+            let mut memory = AlignedMemory::new(size, 128);
+            let queue = unsafe { UnboundedQueue::<usize>::init_in_shared(memory.as_mut_ptr(), 64) };
+            queue.push(42).unwrap();
+            assert_eq!(queue.pop().unwrap(), 42);
+        }
+    }
+
+    #[test]
+    fn test_shared_memory_concurrent_init_safety() {
+        // Test initialization is safe even with concurrent access patterns
+        let size = MultiPushQueue::<usize>::shared_size(128);
+        let mut memory = AlignedMemory::new(size, 64);
+        let mem_ptr = memory.as_mut_ptr();
+
+        let queue = unsafe { MultiPushQueue::init_in_shared(mem_ptr, 128) };
+
+        // Simulate concurrent-like access patterns
+        for i in 0..32 {
+            queue.push(i).unwrap();
+        }
+
+        // Force flush (would happen automatically at 32)
+        assert!(queue.flush());
+
+        // Verify state is consistent
+        assert_eq!(queue.local_count.load(Ordering::Relaxed), 0);
+
+        for i in 0..32 {
+            assert_eq!(queue.pop().unwrap(), i);
+        }
+    }
+
+    #[test]
+    fn test_unbounded_shared_memory_pool_limits() {
+        // Test UnboundedQueue's pre-allocated segment pool
+        let size = UnboundedQueue::<usize>::shared_size(64);
+        let mut memory = AlignedMemory::new(size, 128);
+        let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 64) };
+
+        // Try to exhaust the pre-allocated pool
+        let mut total_pushed = 0;
+        for i in 0..1000000 {
+            match queue.push(i) {
+                Ok(_) => total_pushed += 1,
+                Err(_) => break,
+            }
+        }
+
+        println!(
+            "UnboundedQueue pushed {} items before exhaustion",
+            total_pushed
+        );
+        assert!(total_pushed >= 64, "Should push at least one segment");
+
+        // Verify we can pop what we pushed
+        for i in 0..total_pushed.min(64) {
+            assert_eq!(queue.pop().unwrap(), i);
+        }
+    }
+}
+
+#[cfg(miri)]
+mod unbounded_edge_cases {
+    use super::*;
+
+    #[test]
+    fn test_unbounded_segment_boundary_edge_cases() {
+        let shared_size = UnboundedQueue::<usize>::shared_size(64);
+        let mut memory = AlignedMemory::new(shared_size, 128);
+        let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 64) };
+
+        // Test pushing exactly at segment boundary
+        for i in 0..64 {
+            queue.push(i).unwrap();
+        }
+
+        // This should trigger segment allocation
+        queue.push(64).unwrap();
+        assert!(queue.segment_count.load(Ordering::Relaxed) > 1);
+
+        // Pop first segment completely
+        for i in 0..64 {
+            assert_eq!(queue.pop().unwrap(), i);
+        }
+
+        // Should still have second segment active
+        assert_eq!(queue.pop().unwrap(), 64);
+    }
+
+    #[test]
+    fn test_unbounded_rapid_segment_cycling() {
+        let shared_size = UnboundedQueue::<usize>::shared_size(64);
+        let mut memory = AlignedMemory::new(shared_size, 128);
+        let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 64) };
+
+        // Rapidly cycle through segments
+        for cycle in 0..3 {
+            // Fill segment
+            for i in 0..60 {
+                queue.push(cycle * 1000 + i).unwrap();
+            }
+
+            // Empty segment
+            for i in 0..60 {
+                assert_eq!(queue.pop().unwrap(), cycle * 1000 + i);
+            }
+
+            assert!(queue.empty());
+        }
+    }
+
+    #[test]
+    fn test_unbounded_partial_segment_operations() {
+        let shared_size = UnboundedQueue::<usize>::shared_size(64);
+        let mut memory = AlignedMemory::new(shared_size, 128);
+        let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 64) };
+
+        // Push partial segment
+        for i in 0..30 {
+            queue.push(i).unwrap();
+        }
+
+        // Pop some but not all
+        for i in 0..15 {
+            assert_eq!(queue.pop().unwrap(), i);
+        }
+
+        // Push more to potentially trigger new segment
+        for i in 30..80 {
+            match queue.push(i) {
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        // Verify we can still pop remaining items
+        let mut next_expected = 15;
+        while let Ok(val) = queue.pop() {
+            assert!(val >= next_expected);
+            if val == next_expected {
+                next_expected += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn test_unbounded_empty_checks_across_segments() {
+        let shared_size = UnboundedQueue::<usize>::shared_size(64);
+        let mut memory = AlignedMemory::new(shared_size, 128);
+        let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 64) };
+
+        assert!(queue.empty());
+        assert!(queue.available());
+
+        // Fill first segment
+        for i in 0..64 {
+            queue.push(i).unwrap();
+            assert!(!queue.empty());
+            assert!(queue.available());
+        }
+
+        // Start second segment
+        queue.push(64).unwrap();
+        assert!(!queue.empty());
+
+        // Empty completely
+        for _ in 0..65 {
+            assert!(!queue.empty());
+            queue.pop().unwrap();
+        }
+
+        assert!(queue.empty());
+        assert!(queue.available());
+    }
+
+    #[test]
+    fn test_unbounded_with_zero_sized_types() {
+        #[derive(Debug, PartialEq)]
+        struct ZeroSized;
+
+        let shared_size = UnboundedQueue::<ZeroSized>::shared_size(64);
+        let mut memory = AlignedMemory::new(shared_size, 128);
+        let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 64) };
+
+        // Push many ZSTs to test segment handling
+        for _ in 0..100 {
+            queue.push(ZeroSized).unwrap();
+        }
+
+        for _ in 0..100 {
+            assert_eq!(queue.pop().unwrap(), ZeroSized);
+        }
+    }
+}

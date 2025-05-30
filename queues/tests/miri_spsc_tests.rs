@@ -6,12 +6,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-// Miri-friendly capacities (smaller than unit tests due to performance)
 const MIRI_SMALL_CAPACITY: usize = 64;
 const MIRI_MEDIUM_CAPACITY: usize = 256;
 const MIRI_LARGE_CAPACITY: usize = 1024;
 
-// Helper for aligned memory allocation
 struct AlignedMemory {
     ptr: *mut u8,
     layout: std::alloc::Layout,
@@ -1266,17 +1264,6 @@ mod unbounded_tests {
         assert!(queue.available());
         assert!(queue.empty());
     }
-
-    #[test]
-    fn test_unbounded_paperlike_limitations() {
-        // Document the limitations of the paperlike implementation:
-        // 1. Pre-allocated segments only (no dynamic allocation)
-        // 2. Limited total capacity (MAX_SEGMENTS * segment_size)
-        // 3. Known issue with cross-segment boundaries in shared memory
-        //
-        // These limitations are acceptable for testing purposes
-        // but would need to be addressed for production use
-    }
 }
 
 mod sesd_wrapper_tests {
@@ -1994,56 +1981,6 @@ mod special_feature_tests {
     }
 }
 
-// Tests demonstrating Miri limitations
-mod miri_limitations {
-    use super::*;
-
-    #[test]
-    fn test_ipc_limitations() {
-        // IPC (Inter-Process Communication) tests cannot run under Miri because:
-        // 1. fork() is a system call that creates a new process
-        // 2. Miri runs in a sandboxed environment without system call support
-        // 3. Shared memory between processes requires OS support
-        //
-        // What IPC tests verify in the unit tests:
-        // - Queue correctness across process boundaries
-        // - Memory synchronization between processes
-        // - Atomic operations in truly shared memory
-        // - No data races between separate processes
-        //
-        // These are critical for production use but require real OS support
-    }
-
-    #[test]
-    fn test_mmap_limitations() {
-        // mmap (memory-mapped files) cannot be used under Miri because:
-        // 1. mmap is a system call for mapping files/anonymous memory
-        // 2. Miri doesn't support system calls
-        // 3. UnboundedQueue fundamentally relies on mmap for:
-        //    - Dynamic segment allocation
-        //    - Shared memory regions
-        //    - Growing beyond initial capacity
-        //
-        // Without mmap, UnboundedQueue cannot function as designed
-    }
-
-    #[test]
-    fn test_performance_limitations() {
-        // Performance tests are limited under Miri because:
-        // 1. Miri runs much slower than native code
-        // 2. Large item counts (millions) are impractical
-        // 3. Timing measurements are meaningless
-        //
-        // Unit tests verify performance characteristics like:
-        // - Throughput with millions of operations
-        // - Latency measurements
-        // - Cache efficiency
-        // - Contention behavior
-        //
-        // Miri focuses on correctness, not performance
-    }
-}
-
 // Additional tests that mirror unit tests
 #[test]
 fn test_multiple_queues() {
@@ -2092,24 +2029,3 @@ fn test_different_types() {
         assert_eq!(q_opt.pop().unwrap(), None);
     }
 }
-
-// Summary comment about test coverage
-//
-// This Miri test suite provides comprehensive coverage for memory safety
-// and correctness of all SPSC queue implementations, with the following
-// exceptions due to Miri limitations:
-//
-// 1. UnboundedQueue: Cannot test because it requires mmap system calls
-// 2. IPC tests: Cannot test because fork() is not supported
-// 3. Large-scale stress tests: Limited to smaller data sizes
-// 4. Performance measurements: Not meaningful under Miri
-//
-// Despite these limitations, the Miri tests catch:
-// - Use-after-free bugs
-// - Data races
-// - Uninitialized memory access
-// - Invalid memory access
-// - Incorrect synchronization
-// - Memory leaks (with limitations)
-//
-// For full test coverage including the above features, see unit_test_spsc.rs

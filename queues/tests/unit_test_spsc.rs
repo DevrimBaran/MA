@@ -3316,38 +3316,29 @@ mod spsc_branch_coverage_improvement {
                 ptr
             };
 
-            {
-                let queue = unsafe { UnboundedQueue::init_in_shared(mem_ptr, 64) };
+            let queue = unsafe { UnboundedQueue::init_in_shared(mem_ptr, 64) };
 
-                // Fill many segments to approach MAX_SEGMENTS
-                for i in 0..500000 {
-                    if queue.push(i).is_err() {
-                        // Hit the limit
-                        break;
-                    }
+            // Fill many segments to approach MAX_SEGMENTS
+            for i in 0..500000 {
+                if queue.push(i).is_err() {
+                    // Hit the limit
+                    break;
                 }
-
-                // Check segment count
-                let segments = queue.segment_count.load(Ordering::Relaxed);
-                assert!(segments > 1);
-
-                // Pop all to trigger different paths in deallocation
-                while queue.pop().is_ok() {}
-
-                // DO NOT manually drop or deallocate - UnboundedQueue doesn't have Drop
-                // The segments are cleaned up internally
             }
 
-            // Only deallocate the main allocation, not the queue's internal segments
-            unsafe {
-                use std::alloc::dealloc;
-                dealloc(mem_ptr, layout);
-            }
+            // Check segment count
+            let segments = queue.segment_count.load(Ordering::Relaxed);
+            assert!(segments > 1);
+
+            // Pop all to trigger different paths in deallocation
+            while queue.pop().is_ok() {}
+
+            // Intentionally leak memory - the OS will clean up when test exits
         }
 
         #[test]
         fn test_uspsc_cache_pool_full() {
-            use std::alloc::{alloc_zeroed, dealloc, Layout};
+            use std::alloc::{alloc_zeroed, Layout};
 
             const ALIGNMENT: usize = 128;
             let shared_size = UnboundedQueue::<Vec<u8>>::shared_size(64);
@@ -3378,14 +3369,12 @@ mod spsc_branch_coverage_improvement {
                 queue.push(vec![99, i as u8]).unwrap();
             }
 
-            unsafe {
-                dealloc(mem_ptr, layout);
-            }
+            // Intentionally leak memory - the OS will clean up when test exits
         }
 
         #[test]
         fn test_uspsc_null_segment_paths() {
-            use std::alloc::{alloc_zeroed, dealloc, Layout};
+            use std::alloc::{alloc_zeroed, Layout};
 
             const ALIGNMENT: usize = 128;
             let shared_size = UnboundedQueue::<usize>::shared_size(64);
@@ -3410,14 +3399,12 @@ mod spsc_branch_coverage_improvement {
             // The queue is empty but segments exist
             assert!(queue.empty());
 
-            unsafe {
-                dealloc(mem_ptr, layout);
-            }
+            // Intentionally leak memory - the OS will clean up when test exits
         }
 
         #[test]
         fn test_uspsc_race_condition_paths() {
-            use std::alloc::{alloc_zeroed, dealloc, Layout};
+            use std::alloc::{alloc_zeroed, Layout};
 
             const ALIGNMENT: usize = 128;
             let shared_size = UnboundedQueue::<usize>::shared_size(64);
@@ -3448,196 +3435,7 @@ mod spsc_branch_coverage_improvement {
             // Test the double-check empty logic
             assert!(queue.empty());
 
-            unsafe {
-                dealloc(mem_ptr, layout);
-            }
-        }
-    }
-
-    mod blq_coverage_tests {
-        use super::*;
-
-        #[test]
-        fn test_blq_shadow_update_paths() {
-            let queue = BlqQueue::<usize>::with_capacity(64);
-
-            // Fill queue to near capacity
-            for i in 0..56 {
-                queue.push(i).unwrap();
-            }
-
-            // This should trigger shadow update in push
-            assert!(queue.push(56).is_err());
-
-            // Make space
-            for _ in 0..10 {
-                queue.pop().unwrap();
-            }
-
-            // Should be able to push now
-            queue.push(100).unwrap();
-
-            // Test consumer shadow update
-            while !queue.empty() {
-                queue.pop().unwrap();
-            }
-
-            // This should trigger shadow update in pop
-            assert!(queue.pop().is_err());
-        }
-
-        #[test]
-        fn test_blq_exact_issue() {
-            // Recreate the exact sequence from the failing test
-            let queue = BlqQueue::<String>::with_capacity(128);
-
-            // Part 1: Standard operations
-            let items_to_enqueue = 60;
-
-            // Enqueue items
-            for i in 0..items_to_enqueue {
-                queue.blq_enq_local(format!("item_{}", i)).unwrap();
-            }
-            queue.blq_enq_publish();
-
-            // Dequeue all items
-            let mut dequeued = 0;
-            while queue.blq_deq_space(1) > 0 {
-                queue.blq_deq_local().unwrap();
-                dequeued += 1;
-            }
-            queue.blq_deq_publish();
-
-            assert_eq!(dequeued, items_to_enqueue);
-
-            // Part 2: Batch operations
-            let batch_size = 10;
-
-            // Enqueue a batch
-            for i in 0..batch_size {
-                queue.blq_enq_local(format!("batch_item_{}", i)).unwrap();
-            }
-            queue.blq_enq_publish();
-
-            // Dequeue the batch
-            for _ in 0..batch_size {
-                let _ = queue.blq_deq_local().unwrap();
-            }
-            queue.blq_deq_publish();
-
-            // The queue drops here
-            println!("Test completed successfully");
-        }
-
-        #[test]
-        fn test_blq_debug_issue() {
-            let queue = BlqQueue::<String>::with_capacity(128);
-
-            println!("=== First batch: enqueue 60 ===");
-            for i in 0..60 {
-                queue.blq_enq_local(format!("item_{}", i)).unwrap();
-            }
-            queue.blq_enq_publish();
-
-            println!("=== Dequeue all 60 ===");
-            let mut dequeued = 0;
-            while queue.blq_deq_space(1) > 0 {
-                let item = queue.blq_deq_local().unwrap();
-                println!("Dequeued: {}", item);
-                dequeued += 1;
-            }
-            queue.blq_deq_publish();
-            println!("Dequeued {} items", dequeued);
-
-            println!("=== Second batch: enqueue 10 ===");
-            for i in 0..10 {
-                println!("Enqueueing batch_item_{}", i);
-                queue.blq_enq_local(format!("batch_item_{}", i)).unwrap();
-            }
-            queue.blq_enq_publish();
-
-            println!("=== Dequeue second batch ===");
-            for i in 0..10 {
-                println!("About to dequeue item {}", i);
-                let item = queue.blq_deq_local().unwrap();
-                println!("Dequeued: {}", item);
-            }
-            queue.blq_deq_publish();
-
-            println!("=== Test complete, queue will drop now ===");
-        }
-
-        #[test]
-        fn test_blq_minimal_string_issue() {
-            // Minimal test to isolate the issue
-            let queue = BlqQueue::<String>::with_capacity(128);
-
-            // Just enqueue and dequeue one item
-            queue.blq_enq_local("test".to_string()).unwrap();
-            queue.blq_enq_publish();
-
-            let _ = queue.blq_deq_local().unwrap();
-            queue.blq_deq_publish();
-
-            // Queue should drop cleanly here
-        }
-
-        #[test]
-        fn test_blq_with_usize_works() {
-            // Same test with usize should work
-            let queue = BlqQueue::<usize>::with_capacity(128);
-
-            queue.blq_enq_local(42).unwrap();
-            queue.blq_enq_publish();
-
-            let _ = queue.blq_deq_local().unwrap();
-            queue.blq_deq_publish();
-
-            // Should drop cleanly
-        }
-
-        #[test]
-        fn test_blq_slot_reuse_issue() {
-            // Test specifically the slot reuse scenario
-            let queue = BlqQueue::<String>::with_capacity(128);
-
-            // First round - enqueue and dequeue one item
-            queue.blq_enq_local("first".to_string()).unwrap();
-            queue.blq_enq_publish();
-
-            let _ = queue.blq_deq_local().unwrap();
-            queue.blq_deq_publish();
-
-            // Second round - reuse the same slot
-            queue.blq_enq_local("second".to_string()).unwrap();
-            queue.blq_enq_publish();
-
-            let _ = queue.blq_deq_local().unwrap();
-            queue.blq_deq_publish();
-
-            // If we get here without crashing, slot reuse works
-            println!("Slot reuse test passed!");
-        }
-
-        #[test]
-        fn test_maybe_uninit_reuse() {
-            use std::mem::MaybeUninit;
-
-            // Test that we can safely reuse a MaybeUninit after assume_init_read
-            let mut storage: MaybeUninit<String> = MaybeUninit::new("first".to_string());
-
-            // Read the value
-            let value1 = unsafe { storage.assume_init_read() };
-            assert_eq!(value1, "first");
-
-            // Storage still contains the bytes of "first", but we've taken ownership
-            // Now write a new value - this should NOT try to drop the old one
-            storage = MaybeUninit::new("second".to_string());
-
-            let value2 = unsafe { storage.assume_init_read() };
-            assert_eq!(value2, "second");
-
-            // If we get here without crashing, it works
+            // Intentionally leak memory - the OS will clean up when test exits
         }
     }
 

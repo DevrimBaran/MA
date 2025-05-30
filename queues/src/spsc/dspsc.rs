@@ -1,3 +1,4 @@
+// nearly 6 times slower then uspsc like paper says
 use crate::spsc::lamport::LamportQueue;
 use crate::SpscQueue;
 use std::{

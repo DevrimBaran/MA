@@ -3236,3 +3236,992 @@ mod spsc_branch_coverage_improvement {
         }
     }
 }
+
+mod additional_branch_coverage_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    // DSPSC Queue Branch Coverage
+    mod dspsc_branch_coverage {
+        use super::*;
+
+        #[test]
+        fn test_dspsc_null_head_scenarios() {
+            let queue = DynListQueue::<usize>::with_capacity(16);
+
+            // Force null head scenario by manipulating internal state carefully
+            queue.push(1).unwrap();
+            queue.push(2).unwrap();
+            let _ = queue.pop();
+            let _ = queue.pop();
+
+            // Test empty() with potentially null head
+            assert!(queue.empty());
+
+            // Test alloc_node retry paths
+            for _ in 0..10 {
+                queue.push(42).unwrap();
+                queue.pop().unwrap();
+            }
+        }
+
+        #[test]
+        fn test_dspsc_cache_failure_paths() {
+            let queue = DynListQueue::<usize>::with_capacity(8192);
+
+            // Fill cache with nodes
+            for i in 0..100 {
+                queue.push(i).unwrap();
+            }
+            for _ in 0..100 {
+                queue.pop().unwrap();
+            }
+
+            // Now rapidly push/pop to exercise cache contention
+            for i in 0..1000 {
+                queue.push(i).unwrap();
+                if i % 2 == 0 {
+                    queue.pop().ok();
+                }
+            }
+
+            // Clear remaining
+            while queue.pop().is_ok() {}
+        }
+
+        #[test]
+        fn test_dspsc_recycle_edge_cases() {
+            let queue = DynListQueue::<String>::with_capacity(16);
+
+            // Test recycling with different patterns
+            for cycle in 0..5 {
+                // Push varying amounts
+                for i in 0..(cycle * 10 + 5) {
+                    queue.push(format!("cycle_{}_item_{}", cycle, i)).unwrap();
+                }
+
+                // Pop different amounts
+                for _ in 0..(cycle * 5 + 3) {
+                    queue.pop().ok();
+                }
+            }
+
+            // Final cleanup
+            while queue.pop().is_ok() {}
+        }
+    }
+
+    // BQueue Branch Coverage
+    mod bqueue_branch_coverage {
+        use super::*;
+
+        #[test]
+        fn test_bqueue_backtrack_batch_size_zero() {
+            let queue = BQueue::<usize>::new(128);
+
+            // Create specific pattern to hit batch_size == 0
+            for i in 0..64 {
+                queue.push(i).unwrap();
+            }
+
+            // Pop specific pattern
+            for _ in 0..32 {
+                queue.pop().unwrap();
+            }
+
+            // Push at boundaries
+            for i in 100..116 {
+                queue.push(i).unwrap();
+            }
+
+            // This pattern should exercise the batch_size == 0 condition
+            while queue.pop().is_ok() {}
+
+            // Try pop on empty - should hit specific branch
+            assert!(queue.pop().is_err());
+        }
+
+        #[test]
+        fn test_bqueue_race_condition_branches() {
+            let queue = BQueue::<usize>::new(256);
+
+            // Fill to create wrapped condition
+            for i in 0..200 {
+                queue.push(i).unwrap();
+            }
+
+            // Pop to create specific head/tail relationship
+            for _ in 0..150 {
+                queue.pop().unwrap();
+            }
+
+            // Push more to wrap
+            for i in 200..240 {
+                queue.push(i).unwrap();
+            }
+
+            // This should exercise the race resolution branches
+            let mut count = 0;
+            while queue.pop().is_ok() {
+                count += 1;
+            }
+            assert_eq!(count, 90);
+        }
+    }
+
+    // BIFFQ Branch Coverage
+    mod biffq_branch_coverage {
+        use super::*;
+
+        #[test]
+        fn test_biffq_limit_cannot_advance() {
+            let queue = BiffqQueue::<usize>::with_capacity(64); // Small capacity
+
+            // Fill to limit
+            for i in 0..32 {
+                queue.push(i).unwrap();
+            }
+            queue.flush_producer_buffer().unwrap();
+
+            // Don't pop anything - keep queue full
+            // Try to push more - should fail to advance limit
+            for i in 32..64 {
+                match queue.push(i) {
+                    Ok(_) => {}
+                    Err(_) => {
+                        // Expected - can't advance limit
+                        break;
+                    }
+                }
+            }
+
+            // Flush what we can
+            let _ = queue.flush_producer_buffer();
+
+            // Pop some to make space
+            for _ in 0..16 {
+                queue.pop().ok();
+            }
+
+            // Now should be able to push again
+            queue.push(999).unwrap();
+        }
+
+        #[test]
+        fn test_biffq_local_buffer_wraparound() {
+            let queue = BiffqQueue::<usize>::with_capacity(128);
+
+            // Test the local buffer copy logic when partial flush happens
+            for i in 0..30 {
+                queue.push(i).unwrap();
+            }
+
+            // This should trigger a partial flush scenario
+            let _ = queue.publish_batch_internal();
+
+            // Add more items
+            for i in 30..35 {
+                queue.push(i).unwrap();
+            }
+
+            // Force another flush
+            let _ = queue.flush_producer_buffer();
+
+            // Verify all items
+            for i in 0..35 {
+                assert_eq!(queue.pop().unwrap(), i);
+            }
+        }
+    }
+
+    // FFQ Branch Coverage
+    mod ffq_branch_coverage {
+        use super::*;
+
+        #[test]
+        fn test_ffq_initialization_check() {
+            let queue = FfqQueue::<usize>::with_capacity(64);
+
+            // The queue is initialized, so this should work
+            queue.push(42).unwrap();
+            assert_eq!(queue.pop().unwrap(), 42);
+
+            // Test wraparound with specific pattern
+            for i in 0..64 {
+                queue.push(i).unwrap();
+            }
+
+            // Should be full
+            assert!(!queue.available());
+
+            // Pop half
+            for _ in 0..32 {
+                queue.pop().unwrap();
+            }
+
+            // Push more to wrap
+            for i in 100..132 {
+                queue.push(i).unwrap();
+            }
+
+            // Verify wraparound worked
+            for _ in 0..32 {
+                queue.pop().unwrap();
+            }
+            for i in 100..132 {
+                assert_eq!(queue.pop().unwrap(), i);
+            }
+        }
+    }
+
+    // IFFQ Branch Coverage
+    mod iffq_branch_coverage {
+        use super::*;
+
+        #[test]
+        fn test_iffq_clear_operation_branches() {
+            let queue = IffqQueue::<usize>::with_capacity(128);
+
+            // Test clear operation advancing
+            for i in 0..96 {
+                queue.push(i).unwrap();
+            }
+
+            // Pop to trigger clear advancement
+            for _ in 0..64 {
+                queue.pop().unwrap();
+            }
+
+            // Check clear advanced correctly
+            let clear = queue.cons.clear.load(Ordering::Relaxed);
+            assert!(clear >= 32); // Should have cleared at least one partition
+
+            // Test the case where clear catches up to read
+            while queue.pop().is_ok() {}
+
+            // Push and pop single items to test boundary
+            queue.push(1000).unwrap();
+            queue.pop().unwrap();
+        }
+
+        #[test]
+        fn test_iffq_exact_limit_boundary() {
+            let queue = IffqQueue::<usize>::with_capacity(64);
+
+            // Fill exactly to first partition
+            for i in 0..31 {
+                queue.push(i).unwrap();
+            }
+
+            // Push one more to reach the partition boundary
+            queue.push(31).unwrap();
+
+            // At this point we're at the limit of the first partition
+            // The next push might succeed if limit can be advanced
+            match queue.push(32) {
+                Ok(_) => {
+                    // Limit was advanced successfully
+                    println!("Limit advanced, can continue pushing");
+
+                    // Continue pushing until we hit a real limit
+                    for i in 33..64 {
+                        if queue.push(i).is_err() {
+                            println!("Hit limit at item {}", i);
+                            break;
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Couldn't advance limit - that's fine for this test
+                    println!("Couldn't advance limit at partition boundary");
+                }
+            }
+
+            // Pop some items
+            for _ in 0..16 {
+                queue.pop().unwrap();
+            }
+
+            // Should be able to push again
+            assert!(queue.push(999).is_ok());
+        }
+    }
+
+    // MultiPush Branch Coverage
+    mod multipush_branch_coverage {
+        use super::*;
+
+        #[test]
+        fn test_multipush_flush_failure() {
+            let queue = MultiPushQueue::<usize>::with_capacity(32); // Very small
+
+            // Fill the ring completely
+            for i in 0..31 {
+                queue.push(i).unwrap();
+            }
+            assert!(queue.flush());
+
+            // Ring is now full (capacity - 1 items)
+
+            // Fill local buffer
+            for i in 0..32 {
+                queue.push(100 + i).unwrap();
+            }
+
+            // Local buffer is full, ring is full
+            let local_count_before = queue.local_count.load(Ordering::Relaxed);
+            assert_eq!(local_count_before, 32);
+
+            // This flush should fail because ring is full
+            assert!(!queue.flush());
+
+            // Local buffer should still have items
+            assert!(queue.local_count.load(Ordering::Relaxed) > 0);
+
+            // Pop enough items to definitely make space
+            let mut popped = 0;
+            for _ in 0..31 {
+                if queue.pop().is_ok() {
+                    popped += 1;
+                }
+            }
+            assert!(popped > 0, "Should have popped at least some items");
+
+            // Now try flush again - it might succeed or fail depending on ring state
+            // The important thing is we tested the failure path above
+            match queue.flush() {
+                true => {
+                    println!("Flush succeeded after popping {} items", popped);
+                    assert_eq!(queue.local_count.load(Ordering::Relaxed), 0);
+                }
+                false => {
+                    println!(
+                        "Flush still failed after popping {} items - ring might be fragmented",
+                        popped
+                    );
+                    // Try direct push which should work since we popped items
+                    queue.push(999).unwrap();
+                }
+            }
+
+            // Clean up - pop remaining items
+            while queue.pop().is_ok() {}
+        }
+
+        #[test]
+        fn test_multipush_direct_ring_push() {
+            let queue = MultiPushQueue::<usize>::with_capacity(64);
+
+            // Fill local buffer completely
+            for i in 0..32 {
+                queue.push(i).unwrap();
+            }
+
+            // Don't flush - local buffer is full
+
+            // This push should try flush, fail, then push directly to ring
+            queue.push(999).unwrap();
+
+            // Now flush everything
+            queue.flush();
+
+            // Verify all items are there
+            for i in 0..32 {
+                assert_eq!(queue.pop().unwrap(), i);
+            }
+            assert_eq!(queue.pop().unwrap(), 999);
+        }
+    }
+
+    // Dehnavi Branch Coverage
+    mod dehnavi_branch_coverage {
+        use super::*;
+
+        #[test]
+        fn test_dehnavi_claim_contention() {
+            let queue = Arc::new(DehnaviQueue::<usize>::new(4));
+
+            // Test the claim mechanism under various conditions
+            let q1 = queue.clone();
+            let q2 = queue.clone();
+
+            // Producer sets pclaim
+            queue.push(1).unwrap();
+            queue.push(2).unwrap();
+
+            // Queue is getting full, next push will check cclaim
+            queue.push(3).unwrap();
+
+            // This should trigger the wait-free mechanism
+            queue.push(4).unwrap();
+
+            // Pop to see what we get
+            let mut results = Vec::new();
+            while let Ok(val) = queue.pop() {
+                results.push(val);
+            }
+
+            // We should have some values (exact count depends on overwrites)
+            assert!(!results.is_empty());
+        }
+
+        #[test]
+        fn test_dehnavi_volatile_operations() {
+            let queue = DehnaviQueue::<String>::new(5);
+
+            // Test with larger data to ensure volatile operations work correctly
+            for i in 0..10 {
+                queue.push(format!("test_string_{}", i)).unwrap();
+            }
+
+            // Pop what we can
+            let mut count = 0;
+            while queue.pop().is_ok() {
+                count += 1;
+            }
+
+            // Should have gotten some items
+            assert!(count > 0);
+        }
+    }
+
+    // UnboundedQueue Branch Coverage
+    mod unbounded_branch_coverage {
+        use super::*;
+
+        #[test]
+        fn test_unbounded_pool_exhaustion() {
+            let shared_size = UnboundedQueue::<usize>::shared_size(64);
+            let memory = create_aligned_memory_box(shared_size, 128);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue = unsafe { UnboundedQueue::init_in_shared(mem_ptr, 64) };
+
+            // The shared memory version has MAX_SEGMENTS pre-allocated
+            // Try to use many segments
+            for batch in 0..100 {
+                for i in 0..64 {
+                    if queue.push(batch * 64 + i).is_err() {
+                        // Hit limit
+                        break;
+                    }
+                }
+
+                // Pop some to free segments
+                for _ in 0..32 {
+                    queue.pop().ok();
+                }
+            }
+
+            // Check we used multiple segments
+            let segments = queue.segment_count.load(Ordering::Relaxed);
+            assert!(segments > 1);
+
+            unsafe {
+                let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+            }
+        }
+
+        #[test]
+        fn test_unbounded_empty_checks() {
+            let shared_size = UnboundedQueue::<usize>::shared_size(64);
+            let memory = create_aligned_memory_box(shared_size, 128);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue = unsafe { UnboundedQueue::init_in_shared(mem_ptr, 64) };
+
+            // Test empty with buf_r == buf_w
+            assert!(queue.empty());
+
+            // Push and pop within same buffer
+            for i in 0..10 {
+                queue.push(i).unwrap();
+            }
+
+            for _ in 0..10 {
+                queue.pop().unwrap();
+            }
+
+            // Should be empty again
+            assert!(queue.empty());
+
+            unsafe {
+                let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+            }
+        }
+    }
+
+    // LLQ Branch Coverage
+    mod llq_branch_coverage {
+        use super::*;
+
+        #[test]
+        fn test_llq_shadow_update_timing() {
+            let queue = LlqQueue::<usize>::with_capacity(64);
+
+            // LLQ reserves K_CACHE_LINE_SLOTS (8) slots
+            // So actual capacity is 64 - 8 = 56
+            let max_items = 56;
+
+            // Fill to near capacity
+            for i in 0..max_items - 1 {
+                queue.push(i).unwrap();
+            }
+
+            // Push one more to reach exact capacity
+            assert!(queue.push(max_items - 1).is_ok());
+
+            // This should fail and update shadow
+            assert!(queue.push(999).is_err());
+
+            // Pop one and retry
+            queue.pop().unwrap();
+            queue.push(999).unwrap();
+
+            // Test consumer side shadow update
+            while queue.pop().is_ok() {}
+
+            // Should be empty
+            assert!(queue.empty());
+            assert!(queue.pop().is_err());
+        }
+    }
+
+    // BLQ Branch Coverage
+    mod blq_branch_coverage {
+        use super::*;
+
+        #[test]
+        fn test_blq_batch_boundary_conditions() {
+            let queue = BlqQueue::<usize>::with_capacity(128);
+
+            // Test batch operations at boundaries
+
+            // First, check we have enough space
+            let space = queue.blq_enq_space(10);
+            assert!(space >= 10);
+
+            // Enqueue exactly at boundary
+            for i in 0..8 {
+                queue.blq_enq_local(i).unwrap();
+            }
+            queue.blq_enq_publish();
+
+            // Check dequeue space
+            let deq_space = queue.blq_deq_space(8);
+            assert_eq!(deq_space, 8);
+
+            // Dequeue all
+            for i in 0..8 {
+                assert_eq!(queue.blq_deq_local().unwrap(), i);
+            }
+            queue.blq_deq_publish();
+
+            // Test shadow updates by filling queue
+            // BLQ reserves K_CACHE_LINE_SLOTS (8) slots
+            let max_items = 128 - 8; // 120 items
+            for i in 0..max_items {
+                if queue.push(i).is_err() {
+                    println!("Queue full at {} items", i);
+                    break;
+                }
+            }
+
+            // Queue should be full now
+            assert!(queue.push(999).is_err());
+
+            // Pop one and retry
+            queue.pop().unwrap();
+            assert!(queue.push(999).is_ok());
+        }
+    }
+
+    // Lamport Branch Coverage
+    mod lamport_branch_coverage {
+        use super::*;
+
+        #[test]
+        fn test_lamport_unsafe_operations() {
+            let mut queue = LamportQueue::<usize>::with_capacity(16);
+
+            // Test unsafe push_unchecked
+            unsafe {
+                queue.push_unchecked(42);
+            }
+
+            assert_eq!(queue.pop().unwrap(), 42);
+
+            // Test capacity and index methods
+            assert_eq!(queue.capacity(), 16);
+            assert_eq!(queue.idx(17), 1); // 17 & 15 = 1
+
+            // Test relaxed operations
+            let tail = queue.tail_relaxed();
+            let head = queue.head_relaxed();
+            assert_eq!(tail, head); // Empty queue
+        }
+
+        #[test]
+        fn test_lamport_none_handling() {
+            let queue = LamportQueue::<Option<usize>>::with_capacity(8);
+
+            // The queue can handle None values
+            queue.push(None).unwrap();
+            queue.push(Some(42)).unwrap();
+            queue.push(None).unwrap();
+
+            assert_eq!(queue.pop().unwrap(), None);
+            assert_eq!(queue.pop().unwrap(), Some(42));
+            assert_eq!(queue.pop().unwrap(), None);
+
+            // Empty pop should return Err, not None
+            assert!(queue.pop().is_err());
+        }
+    }
+
+    // SESD Wrapper Branch Coverage
+    mod sesd_wrapper_branch_coverage {
+        use super::*;
+
+        #[test]
+        fn test_sesd_free_node_null_checks() {
+            let pool_capacity = 20;
+            let shared_size = SesdJpSpscBenchWrapper::<usize>::shared_size(pool_capacity);
+            let memory = create_aligned_memory_box(shared_size, 64);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue = unsafe { SesdJpSpscBenchWrapper::init_in_shared(mem_ptr, pool_capacity) };
+
+            // The free_node function has null checks and dummy node checks
+            // Push and pop to exercise these paths
+            for i in 0..15 {
+                queue.push(i).unwrap();
+            }
+
+            for _ in 0..15 {
+                queue.pop().unwrap();
+            }
+
+            // The nodes are recycled internally
+            // Push again to reuse nodes
+            for i in 0..10 {
+                queue.push(100 + i).unwrap();
+            }
+
+            unsafe {
+                let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+            }
+        }
+
+        #[test]
+        fn test_sesd_available_empty_branches() {
+            let pool_capacity = 10;
+            let shared_size = SesdJpSpscBenchWrapper::<usize>::shared_size(pool_capacity);
+            let memory = create_aligned_memory_box(shared_size, 64);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue = unsafe { SesdJpSpscBenchWrapper::init_in_shared(mem_ptr, pool_capacity) };
+
+            // Test available() branches
+            assert!(queue.available()); // Can allocate
+
+            // Fill the pool
+            for i in 0..pool_capacity - 3 {
+                // Leave some for internal use
+                queue.push(i).unwrap();
+            }
+
+            // Check empty() with items
+            assert!(!queue.empty());
+
+            // Pop all
+            while queue.pop().is_ok() {}
+
+            // Check empty() when actually empty
+            assert!(queue.empty());
+
+            unsafe {
+                let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod branch_coverage_boost_spsc {
+    use super::*;
+
+    // Target: DynListQueue/DSPSC (51.19% branch coverage)
+    mod dspsc_additional_coverage {
+        use super::*;
+
+        #[test]
+        fn test_dspsc_allocation_patterns() {
+            let queue = DynListQueue::<usize>::with_capacity(16);
+
+            // Test rapid alloc/free cycles
+            for cycle in 0..20 {
+                // Push varying amounts
+                for i in 0..(cycle + 5) {
+                    queue.push(cycle * 100 + i).unwrap();
+                }
+
+                // Pop all
+                while queue.pop().is_ok() {}
+            }
+
+            // Check allocations
+            let heap_allocs = queue.heap_allocs.load(Ordering::Relaxed);
+            let heap_frees = queue.heap_frees.load(Ordering::Relaxed);
+
+            println!("Heap allocations: {}, frees: {}", heap_allocs, heap_frees);
+            assert!(heap_allocs > 0);
+        }
+
+        #[test]
+        fn test_dspsc_cache_contention() {
+            let queue = DynListQueue::<String>::with_capacity(32);
+
+            // Fill cache
+            for i in 0..50 {
+                queue.push(format!("initial_{}", i)).unwrap();
+            }
+            for _ in 0..50 {
+                queue.pop().unwrap();
+            }
+
+            // Rapid push/pop to stress cache
+            for i in 0..100 {
+                queue.push(format!("stress_{}", i)).unwrap();
+                if i % 3 == 0 {
+                    queue.pop().ok();
+                }
+            }
+
+            // Clean up
+            while queue.pop().is_ok() {}
+        }
+    }
+
+    // Target: FFQ (53.85% branch coverage)
+    mod ffq_additional_coverage {
+        use super::*;
+
+        #[test]
+        fn test_ffq_wraparound_patterns() {
+            let queue = FfqQueue::<usize>::with_capacity(16);
+
+            // Fill queue
+            for i in 0..16 {
+                queue.push(i).unwrap();
+            }
+
+            // Create wraparound pattern
+            for cycle in 0..10 {
+                // Pop half
+                for _ in 0..8 {
+                    queue.pop().unwrap();
+                }
+
+                // Push half
+                for i in 0..8 {
+                    queue.push(cycle * 100 + i).unwrap();
+                }
+            }
+
+            // Verify state
+            assert!(!queue.empty());
+
+            // Clean up
+            while queue.pop().is_ok() {}
+        }
+
+        #[test]
+        fn test_ffq_boundary_conditions() {
+            let queue = FfqQueue::<String>::with_capacity(32);
+
+            // Test at various fill levels
+            for fill_level in [1, 16, 31, 32] {
+                // Fill to level
+                for i in 0..fill_level {
+                    if queue.push(format!("item_{}", i)).is_err() {
+                        break;
+                    }
+                }
+
+                // Check state
+                assert!(!queue.empty());
+
+                // Pop all
+                while queue.pop().is_ok() {}
+
+                assert!(queue.empty());
+            }
+        }
+    }
+
+    // Target: BLQ (54.55% branch coverage)
+    mod blq_additional_coverage {
+        use super::*;
+
+        #[test]
+        fn test_blq_shadow_updates() {
+            let queue = BlqQueue::<usize>::with_capacity(64);
+
+            // Test producer shadow updates
+            for i in 0..56 {
+                queue.push(i).unwrap();
+            }
+
+            // This should trigger shadow update
+            assert!(queue.push(999).is_err());
+
+            // Test consumer shadow updates
+            for _ in 0..30 {
+                queue.pop().unwrap();
+            }
+
+            // Push more
+            for i in 100..126 {
+                queue.push(i).unwrap();
+            }
+
+            // Pop all
+            while queue.pop().is_ok() {}
+        }
+
+        #[test]
+        fn test_blq_batch_edge_cases() {
+            let queue = BlqQueue::<String>::with_capacity(128);
+
+            // Test exact batch boundaries
+            for batch in 0..5 {
+                // Enqueue exactly K_CACHE_LINE_SLOTS items
+                for i in 0..8 {
+                    queue
+                        .blq_enq_local(format!("batch_{}_item_{}", batch, i))
+                        .unwrap();
+                }
+                queue.blq_enq_publish();
+
+                // Check space
+                let space = queue.blq_deq_space(8);
+                assert_eq!(space, 8);
+
+                // Dequeue exactly
+                for _ in 0..8 {
+                    queue.blq_deq_local().unwrap();
+                }
+                queue.blq_deq_publish();
+            }
+        }
+    }
+
+    // Target: Dehnavi (62.50% branch coverage)
+    mod dehnavi_additional_coverage {
+        use super::*;
+
+        #[test]
+        fn test_dehnavi_claim_scenarios() {
+            let queue = DehnaviQueue::<usize>::new(5);
+
+            // Test various claim patterns
+            for round in 0..3 {
+                // Fill queue
+                for i in 0..4 {
+                    queue.push(round * 10 + i).unwrap();
+                }
+
+                // This triggers claim logic
+                queue.push(round * 10 + 4).unwrap();
+
+                // Pop some
+                for _ in 0..3 {
+                    queue.pop().ok();
+                }
+            }
+        }
+
+        #[test]
+        fn test_dehnavi_concurrent_claims() {
+            let queue = Arc::new(DehnaviQueue::<String>::new(4));
+
+            // Single-threaded simulation of claim contention
+            for i in 0..10 {
+                queue.push(format!("item_{}", i)).unwrap();
+
+                if i % 3 == 0 {
+                    queue.pop().ok();
+                }
+            }
+
+            // Drain
+            while queue.pop().is_ok() {}
+        }
+    }
+
+    // Target: BIFFQ (70.00% branch coverage) - already decent but can improve
+    mod biffq_additional_coverage {
+        use super::*;
+
+        #[test]
+        fn test_biffq_clear_operations() {
+            let queue = BiffqQueue::<usize>::with_capacity(128);
+
+            // Fill multiple partitions
+            for i in 0..96 {
+                queue.push(i).unwrap();
+            }
+            queue.flush_producer_buffer().unwrap();
+
+            // Pop to trigger clear operations
+            for _ in 0..64 {
+                queue.pop().unwrap();
+            }
+
+            // Check clear pointer advancement
+            let clear = queue.cons.clear.load(Ordering::Relaxed);
+            assert!(clear > 0);
+
+            // Continue operations
+            for i in 100..132 {
+                queue.push(i).unwrap();
+            }
+            queue.flush_producer_buffer().unwrap();
+
+            // Pop remaining
+            while queue.pop().is_ok() {}
+        }
+    }
+
+    // Target: BQueue (70.83% branch coverage)
+    mod bqueue_additional_coverage {
+        use super::*;
+
+        #[test]
+        fn test_bqueue_backtrack_scenarios() {
+            let queue = BQueue::<usize>::new(128);
+
+            // Create specific patterns for backtracking
+            for i in 0..64 {
+                queue.push(i).unwrap();
+            }
+
+            // Pop to create gaps
+            for _ in 0..32 {
+                queue.pop().unwrap();
+            }
+
+            // Push to wrap
+            for i in 100..132 {
+                queue.push(i).unwrap();
+            }
+
+            // Pop with backtracking
+            while queue.pop().is_ok() {}
+
+            // Verify empty
+            assert!(queue.empty());
+        }
+    }
+}

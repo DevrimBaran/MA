@@ -51,6 +51,11 @@ impl<T: Send> LamportQueue<T> {
         let header = mem as *mut Self;
         let buf_ptr = mem.add(std::mem::size_of::<Self>()) as *mut UnsafeCell<Option<T>>;
 
+        // Initialize all slots to None before creating the slice
+        for i in 0..cap {
+            buf_ptr.add(i).write(UnsafeCell::new(None));
+        }
+
         let slice = std::slice::from_raw_parts_mut(buf_ptr, cap);
         let boxed = Box::from_raw(slice);
 

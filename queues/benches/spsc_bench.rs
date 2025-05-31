@@ -1,3 +1,4 @@
+// TODO: FIX DSPSC
 // spinloops are just there so that producer and consumer can start at the same time and handling temporary empty/full queues
 // Since the algorithms are wait-free, the spinloops will not affect the wait-free synchronization between producer and consumer
 #![allow(clippy::cast_possible_truncation)]
@@ -623,7 +624,7 @@ where
 // Criterion setup with same parameters as your old benchmark
 fn custom_criterion() -> Criterion {
     Criterion::default()
-        .warm_up_time(Duration::from_secs(10))
+        .warm_up_time(Duration::from_secs(5))
         .measurement_time(Duration::from_secs(15))
         .sample_size(10)
 }
@@ -632,6 +633,7 @@ criterion_group! {
     name = benches;
     config = custom_criterion();
     targets =
+        bench_unbounded,
         bench_dspsc,
         bench_dehnavi,
         bench_iffq,

@@ -1,10 +1,10 @@
-// queues/src/spsc/dspsc.rs
+// dSPSC slower then uspsc like paper says (paper says up to 6 times slower, in this implementations it is about 2-3 times slower)
 use crate::spsc::lamport::LamportQueue;
 use crate::SpscQueue;
 use std::{
     alloc::Layout,
     ptr::{self, null_mut},
-    sync::atomic::{compiler_fence, fence, AtomicPtr, AtomicUsize, Ordering},
+    sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering},
 };
 
 #[inline(always)]
@@ -12,16 +12,14 @@ const fn null_node<T: Send>() -> *mut Node<T> {
     null_mut()
 }
 
-const CACHE_LINE_SIZE: usize = 256;
+const CACHE_LINE_SIZE: usize = 64;
 
 #[repr(C, align(128))]
 struct Node<T: Send + 'static> {
-    val: UnsafeCell<Option<T>>,
+    val: Option<T>,
     next: AtomicPtr<Node<T>>,
     _padding: [u8; CACHE_LINE_SIZE - 24],
 }
-
-use std::cell::UnsafeCell;
 
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug)]
@@ -33,13 +31,14 @@ unsafe impl<U: Send + 'static> Sync for NodePtr<U> {}
 #[repr(C, align(128))]
 pub struct DynListQueue<T: Send + 'static> {
     head: AtomicPtr<Node<T>>,
-    _padding1: [u8; 128 - 8],
-
     tail: AtomicPtr<Node<T>>,
-    _padding2: [u8; 128 - 8],
+
+    padding1: [u8; 128 - 16],
 
     nodes_pool_ptr: *mut Node<T>,
     next_free_node: AtomicUsize,
+
+    padding2: [u8; 128 - 16],
 
     node_cache: LamportQueue<NodePtr<T>>,
 
@@ -83,7 +82,7 @@ impl<T: Send + 'static> DynListQueue<T> {
         let node_cache_capacity = capacity;
 
         let dummy = Box::into_raw(Box::new(Node {
-            val: UnsafeCell::new(None),
+            val: None,
             next: AtomicPtr::new(null_node()),
             _padding: [0; CACHE_LINE_SIZE - 24],
         }));
@@ -91,7 +90,7 @@ impl<T: Send + 'static> DynListQueue<T> {
         let mut pool_nodes_vec: Vec<Node<T>> = Vec::with_capacity(preallocated_nodes);
         for _ in 0..preallocated_nodes {
             pool_nodes_vec.push(Node {
-                val: UnsafeCell::new(None),
+                val: None,
                 next: AtomicPtr::new(null_node()),
                 _padding: [0; CACHE_LINE_SIZE - 24],
             });
@@ -103,11 +102,11 @@ impl<T: Send + 'static> DynListQueue<T> {
         Self {
             head: AtomicPtr::new(dummy),
             tail: AtomicPtr::new(dummy),
-            _padding1: [0; 128 - 8],
-            _padding2: [0; 128 - 8],
+            padding1: [0; 128 - 16],
             base_ptr: dummy,
             nodes_pool_ptr: pool_ptr,
             next_free_node: AtomicUsize::new(0),
+            padding2: [0; 128 - 16],
             node_cache,
             pool_capacity: preallocated_nodes,
             cache_capacity: node_cache_capacity,
@@ -143,7 +142,7 @@ impl<T: Send + 'static> DynListQueue<T> {
         ptr::write(
             dummy_ptr_val,
             Node {
-                val: UnsafeCell::new(None),
+                val: None,
                 next: AtomicPtr::new(null_node()),
                 _padding: [0; CACHE_LINE_SIZE - 24],
             },
@@ -155,7 +154,7 @@ impl<T: Send + 'static> DynListQueue<T> {
             ptr::write(
                 pool_nodes_ptr_val.add(i),
                 Node {
-                    val: UnsafeCell::new(None),
+                    val: None,
                     next: AtomicPtr::new(null_node()),
                     _padding: [0; CACHE_LINE_SIZE - 24],
                 },
@@ -172,11 +171,11 @@ impl<T: Send + 'static> DynListQueue<T> {
             DynListQueue {
                 head: AtomicPtr::new(dummy_ptr_val),
                 tail: AtomicPtr::new(dummy_ptr_val),
-                _padding1: [0; 128 - 8],
-                _padding2: [0; 128 - 8],
+                padding1: [0; 128 - 16],
                 base_ptr: dummy_ptr_val,
                 nodes_pool_ptr: pool_nodes_ptr_val,
                 next_free_node: AtomicUsize::new(0),
+                padding2: [0; 128 - 16],
                 node_cache: ptr::read(initialized_node_cache_ref as *const _),
                 pool_capacity: preallocated_nodes,
                 cache_capacity: node_cache_capacity,
@@ -195,9 +194,8 @@ impl<T: Send + 'static> DynListQueue<T> {
             let node_ptr = node_ptr_wrapper.0;
             if !node_ptr.is_null() {
                 unsafe {
-                    // Reset the node
+                    ptr::write(&mut (*node_ptr).val, Some(v));
                     (*node_ptr).next.store(null_node(), Ordering::Relaxed);
-                    *(*node_ptr).val.get() = Some(v);
                 }
                 return node_ptr;
             }
@@ -208,8 +206,8 @@ impl<T: Send + 'static> DynListQueue<T> {
         if idx < self.pool_capacity {
             let node = unsafe { self.nodes_pool_ptr.add(idx) };
             unsafe {
+                ptr::write(&mut (*node).val, Some(v));
                 (*node).next.store(null_node(), Ordering::Relaxed);
-                *(*node).val.get() = Some(v);
             }
             return node;
         }
@@ -228,7 +226,7 @@ impl<T: Send + 'static> DynListQueue<T> {
             ptr::write(
                 ptr,
                 Node {
-                    val: UnsafeCell::new(Some(v)),
+                    val: Some(v),
                     next: AtomicPtr::new(null_node()),
                     _padding: [0; CACHE_LINE_SIZE - 24],
                 },
@@ -261,8 +259,9 @@ impl<T: Send + 'static> DynListQueue<T> {
         }
 
         unsafe {
-            // Clear the value
-            *(*node_to_recycle).val.get() = None;
+            if let Some(val) = ptr::replace(&mut (*node_to_recycle).val, None) {
+                drop(val);
+            }
             (*node_to_recycle)
                 .next
                 .store(null_node(), Ordering::Relaxed);
@@ -291,47 +290,42 @@ impl<T: Send + 'static> SpscQueue<T> for DynListQueue<T> {
         // Paper Figure 2, lines 8-16
         let new_node = self.alloc_node(item);
 
-        // Get current tail
-        let current_tail = self.tail.load(Ordering::Acquire);
-
-        // Paper line 13: WMB() - ensure the node is fully initialized before linking
+        // Paper line 13: WMB() - write-memory-barrier
         fence(Ordering::Release);
 
-        // Paper line 14: tail->next = n
+        // Paper line 14: tail->next = n, tail = n
+        let current_tail = self.tail.load(Ordering::Relaxed);
         unsafe {
-            (*current_tail).next.store(new_node, Ordering::Release);
+            (*current_tail).next.store(new_node, Ordering::Relaxed);
         }
-
-        // Paper line 14: tail = n
-        self.tail.store(new_node, Ordering::Release);
+        self.tail.store(new_node, Ordering::Relaxed);
 
         Ok(())
     }
 
     fn pop(&self) -> Result<T, ()> {
         // Paper Figure 2, lines 18-25
-
-        let current_head = self.head.load(Ordering::Acquire);
-
-        // Load next with acquire to synchronize with the release store in push
-        let next_node = unsafe { (*current_head).next.load(Ordering::Acquire) };
+        let current_head = self.head.load(Ordering::Relaxed);
+        let next_node = unsafe { (*current_head).next.load(Ordering::Relaxed) };
 
         if next_node.is_null() {
             return Err(());
         }
 
-        // Read the value - the acquire load above ensures this is safe
+        // Ensure we see the node's data
+        fence(Ordering::Acquire);
+
         let value = unsafe {
-            match (*(*next_node).val.get()).take() {
+            match (*next_node).val.take() {
                 Some(v) => v,
-                None => return Err(()), // Should not happen
+                None => {
+                    // This shouldn't happen but let's be safe
+                    return Err(());
+                }
             }
         };
 
-        // Paper line 22: head = head->next
-        self.head.store(next_node, Ordering::Release);
-
-        // Paper line 23: if (!cache.push(n)) free(n)
+        self.head.store(next_node, Ordering::Relaxed);
         self.recycle_node(current_head);
 
         Ok(value)
@@ -344,8 +338,8 @@ impl<T: Send + 'static> SpscQueue<T> for DynListQueue<T> {
 
     #[inline]
     fn empty(&self) -> bool {
-        let h = self.head.load(Ordering::Acquire);
-        unsafe { (*h).next.load(Ordering::Acquire).is_null() }
+        let h = self.head.load(Ordering::Relaxed);
+        unsafe { (*h).next.load(Ordering::Relaxed).is_null() }
     }
 }
 

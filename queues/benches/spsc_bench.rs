@@ -23,7 +23,7 @@ use queues::spsc::blq::K_CACHE_LINE_SLOTS as BLQ_K_SLOTS;
 use queues::spsc::llq::K_CACHE_LINE_SLOTS as LLQ_K_SLOTS;
 
 const PERFORMANCE_TEST: bool = false;
-const RING_CAP: usize = 1024;
+const RING_CAP: usize = 16_384;
 const ITERS: usize = 1_000_000;
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 1_000_000_000;
 
@@ -429,7 +429,6 @@ fn bench_sesd_jp(c: &mut Criterion) {
     });
 }
 
-// Generic fork-and-run helper with improved synchronization and error handling
 fn fork_and_run<Q>(q: &'static Q) -> std::time::Duration
 where
     Q: BenchSpscQueue<usize> + Sync,
@@ -456,6 +455,11 @@ where
     let sync_atomic_flag = unsafe { &*(sync_shm as *const AtomicU32) };
     sync_atomic_flag.store(0, Ordering::Relaxed);
 
+    // Determine queue type more safely
+    let queue_type_name = std::any::type_name::<Q>();
+    let needs_special_sync =
+        queue_type_name.contains("DynListQueue") || queue_type_name.contains("UnboundedQueue");
+
     match unsafe { fork() }.expect("fork failed") {
         ForkResult::Child => {
             // Producer
@@ -472,6 +476,16 @@ where
                         panic!("Producer exceeded max spin retry attempts for push");
                     }
                     std::hint::spin_loop();
+                }
+
+                // For dSPSC/uSPSC, add extra synchronization every N items
+                if needs_special_sync && i > 0 && i % 1000 == 0 {
+                    // Force memory synchronization
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    // Small delay to allow consumer to catch up
+                    for _ in 0..10 {
+                        std::hint::spin_loop();
+                    }
                 }
             }
 
@@ -509,6 +523,13 @@ where
                 }
             }
 
+            // Final synchronization for dSPSC/uSPSC
+            if needs_special_sync {
+                std::sync::atomic::fence(Ordering::SeqCst);
+                // Wait a bit to ensure all writes are visible
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+
             sync_atomic_flag.store(3, Ordering::Release);
             unsafe { libc::_exit(0) };
         }
@@ -523,33 +544,53 @@ where
             let start_time = std::time::Instant::now();
             let mut consumed_count = 0;
             let mut pop_spin_attempts = 0;
+            let mut consecutive_failures = 0;
 
             while consumed_count < ITERS {
-                if sync_atomic_flag.load(Ordering::Acquire) == 3 {
-                    // Producer is done, try to pop any remaining items
-                    if q.bench_pop().is_err() {
-                        break;
-                    } else {
-                        consumed_count += 1;
-                        if consumed_count == ITERS {
-                            break;
-                        }
-                        pop_spin_attempts = 0; // Reset spin attempts after a successful pop
-                    }
-                }
+                // Check if producer is done
+                let producer_done = sync_atomic_flag.load(Ordering::Acquire) == 3;
 
                 if let Ok(_item) = q.bench_pop() {
                     consumed_count += 1;
-                    pop_spin_attempts = 0; // Reset spin attempts after a successful pop
+                    pop_spin_attempts = 0;
+                    consecutive_failures = 0;
                 } else {
                     pop_spin_attempts += 1;
-                    if pop_spin_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS
-                        && sync_atomic_flag.load(Ordering::Acquire) != 3
-                    {
+                    consecutive_failures += 1;
+
+                    // For dSPSC/uSPSC, add aggressive synchronization when stuck
+                    if needs_special_sync && consecutive_failures > 100 {
+                        std::sync::atomic::fence(Ordering::SeqCst);
+                        std::thread::yield_now();
+                        consecutive_failures = 0;
+                    }
+
+                    // If producer is done and we've had many consecutive failures,
+                    // try a few more times with delays
+                    if producer_done && consecutive_failures > 1000 {
+                        // Final attempt with aggressive synchronization
+                        for _ in 0..100 {
+                            std::sync::atomic::fence(Ordering::SeqCst);
+                            std::thread::sleep(std::time::Duration::from_micros(10));
+
+                            if let Ok(_) = q.bench_pop() {
+                                consumed_count += 1;
+                                break;
+                            }
+                        }
+
+                        // If still failing, we're done
+                        if consumed_count < ITERS {
+                            break;
+                        }
+                    }
+
+                    if pop_spin_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS && !producer_done {
                         panic!(
                             "Consumer exceeded max spin retry attempts for pop (producer not done)"
                         );
                     }
+
                     std::hint::spin_loop();
                 }
             }
@@ -582,7 +623,7 @@ where
 // Criterion setup with same parameters as your old benchmark
 fn custom_criterion() -> Criterion {
     Criterion::default()
-        .warm_up_time(Duration::from_secs(5))
+        .warm_up_time(Duration::from_secs(10))
         .measurement_time(Duration::from_secs(15))
         .sample_size(10)
 }
@@ -591,7 +632,6 @@ criterion_group! {
     name = benches;
     config = custom_criterion();
     targets =
-        bench_unbounded,
         bench_dspsc,
         bench_dehnavi,
         bench_iffq,

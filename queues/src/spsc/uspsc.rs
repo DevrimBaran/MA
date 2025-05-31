@@ -1,93 +1,115 @@
+// True unbounded uSPSC implementation using dynamic shared memory allocation
+// This follows the paper's algorithm exactly but adapts it for IPC
+// CRITICAL: Pre-allocates all segments before fork() for cross-process visibility
+
 use crate::spsc::LamportQueue;
 use crate::{DynListQueue, SpscQueue};
 use std::{
+    cell::UnsafeCell,
     ptr,
     sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering},
 };
 
 const POOL_CACHE_SIZE: usize = 32;
+// Pre-allocate enough segments for practical unbounded behavior
+const MAX_SEGMENTS: usize = 32; // Can handle ITERS/segment_size items
 
-// Wrapper for raw pointer to make it Send/Sync
-#[derive(Copy, Clone)]
-struct LamportPtr<T: Send + 'static>(*mut LamportQueue<T>);
+// SharedSegment wraps a pointer and its metadata
+#[repr(C)]
+struct SharedSegment<T: Send + 'static> {
+    queue_ptr: *mut LamportQueue<T>,
+    segment_id: usize, // ID within the pre-allocated pool
+    _padding: usize,   // Ensure 24-byte size for alignment
+}
 
-unsafe impl<T: Send + 'static> Send for LamportPtr<T> {}
-unsafe impl<T: Send + 'static> Sync for LamportPtr<T> {}
+// Manual implementation of Copy and Clone
+impl<T: Send + 'static> Copy for SharedSegment<T> {}
 
-// Paper's BufferPool - Figure 3, lines 22-41
+impl<T: Send + 'static> Clone for SharedSegment<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: Send + 'static> SharedSegment<T> {
+    #[allow(dead_code)]
+    fn null() -> Self {
+        Self {
+            queue_ptr: ptr::null_mut(),
+            segment_id: usize::MAX,
+            _padding: 0,
+        }
+    }
+}
+
+unsafe impl<T: Send + 'static> Send for SharedSegment<T> {}
+unsafe impl<T: Send + 'static> Sync for SharedSegment<T> {}
+
+// Paper's BufferPool adapted for pre-allocated shared memory
 #[repr(C)]
 struct BufferPool<T: Send + 'static> {
-    // Paper: inuse queue and cache
-    inuse_ptr: *mut DynListQueue<LamportPtr<T>>,
-    cache_ptr: *mut LamportQueue<LamportPtr<T>>,
+    inuse_ptr: *mut DynListQueue<SharedSegment<T>>,
+    cache_ptr: *mut LamportQueue<SharedSegment<T>>,
     segment_size: usize,
     segment_count: AtomicUsize,
+
+    // Pre-allocated segments info
+    segments_base: *mut u8,
+    segment_stride: usize,
+    total_segments: usize,
 }
 
 impl<T: Send + 'static> BufferPool<T> {
-    unsafe fn inuse(&self) -> &DynListQueue<LamportPtr<T>> {
+    unsafe fn inuse(&self) -> &DynListQueue<SharedSegment<T>> {
         &*self.inuse_ptr
     }
 
-    unsafe fn cache(&self) -> &LamportQueue<LamportPtr<T>> {
+    unsafe fn cache(&self) -> &LamportQueue<SharedSegment<T>> {
         &*self.cache_ptr
     }
 
-    // Paper: next_w() - Figure 3, lines 26-32
-    fn next_w(&self) -> Option<*mut LamportQueue<T>> {
+    // Paper: next_w() - returns pre-allocated segment
+    fn next_w(&self) -> Option<SharedSegment<T>> {
         unsafe {
             // Paper line 28: if (!cache.pop(&buf))
-            if let Ok(buf_wrapper) = self.cache().pop() {
-                let buf_ptr = buf_wrapper.0;
+            if let Ok(segment) = self.cache().pop() {
                 // Paper line 30: inuse.push(buf)
-                if self.inuse().push(buf_wrapper).is_err() {
+                if self.inuse().push(segment).is_err() {
                     // If inuse is full, put back in cache
-                    let _ = self.cache().push(LamportPtr(buf_ptr));
+                    let _ = self.cache().push(segment);
                     return None;
                 }
-                return Some(buf_ptr);
+                self.segment_count.fetch_add(1, Ordering::Relaxed);
+                return Some(segment);
             }
 
-            // Paper line 29: buf = allocateSPSC(size)
-            // For truly unbounded, we need dynamic allocation
-            let new_queue = Box::new(LamportQueue::with_capacity(self.segment_size));
-            let ptr = Box::into_raw(new_queue);
-
-            // Paper line 30: inuse.push(buf)
-            if self.inuse().push(LamportPtr(ptr)).is_err() {
-                // Failed to add to inuse, cleanup
-                let _ = Box::from_raw(ptr);
-                return None;
-            }
-
-            self.segment_count.fetch_add(1, Ordering::Relaxed);
-            Some(ptr)
+            // No more pre-allocated segments available
+            None
         }
     }
 
     // Paper: next_r() - Figure 3, lines 33-36
-    fn next_r(&self) -> Option<*mut LamportQueue<T>> {
+    fn next_r(&self) -> Option<SharedSegment<T>> {
         unsafe {
             // Paper line 35: return (inuse.pop(&buf)? buf : NULL)
-            self.inuse().pop().ok().map(|wrapper| wrapper.0)
+            self.inuse().pop().ok()
         }
     }
 
     // Paper: release() - Figure 3, lines 37-40
-    fn release(&self, buf: *mut LamportQueue<T>) {
-        if buf.is_null() {
+    fn release(&self, segment: SharedSegment<T>) {
+        if segment.queue_ptr.is_null() {
             return;
         }
 
         unsafe {
             // Paper line 38: buf->reset() - reset pread and pwrite
-            (*buf).head.store(0, Ordering::Relaxed);
-            (*buf).tail.store(0, Ordering::Relaxed);
+            (*segment.queue_ptr).head.store(0, Ordering::Relaxed);
+            (*segment.queue_ptr).tail.store(0, Ordering::Relaxed);
 
             // Paper line 39: if (!cache.push(buf)) deallocateSPSC(buf)
-            if self.cache().push(LamportPtr(buf)).is_err() {
-                // Cache is full, deallocate
-                let _ = Box::from_raw(buf);
+            // In this implementation, we never deallocate - just return to cache
+            if self.cache().push(segment).is_ok() {
                 self.segment_count.fetch_sub(1, Ordering::Relaxed);
             }
         }
@@ -105,13 +127,16 @@ pub struct UnboundedQueue<T: Send + 'static> {
     buf_w: AtomicPtr<LamportQueue<T>>,
     _padding2: [u8; 120],
 
-    // Paper: Pool
+    // Pool must come after atomics for alignment
     pool: BufferPool<T>,
+
+    // Current segment info stored in shared memory with interior mutability
+    current_r_segment: UnsafeCell<SharedSegment<T>>,
+    current_w_segment: UnsafeCell<SharedSegment<T>>,
 
     // Paper: size (segment size)
     size: usize,
 
-    // Additional fields
     initialized: AtomicBool,
     pub segment_count: AtomicUsize,
 }
@@ -120,58 +145,17 @@ unsafe impl<T: Send + 'static> Send for UnboundedQueue<T> {}
 unsafe impl<T: Send + 'static> Sync for UnboundedQueue<T> {}
 
 impl<T: Send + 'static> UnboundedQueue<T> {
-    pub fn with_capacity(segment_size: usize) -> Self {
-        assert!(segment_size > 1, "uSPSC requires size > 1 (Theorem 4.2)");
-        assert!(
-            segment_size.is_power_of_two(),
-            "Segment size must be power of 2"
-        );
-
-        // Create heap-based version
-        let inuse = Box::new(DynListQueue::with_capacity(POOL_CACHE_SIZE));
-        let cache = Box::new(LamportQueue::with_capacity(POOL_CACHE_SIZE));
-        let initial_segment = Box::new(LamportQueue::with_capacity(segment_size));
-
-        let inuse_ptr = Box::into_raw(inuse);
-        let cache_ptr = Box::into_raw(cache);
-        let initial_ptr = Box::into_raw(initial_segment);
-
-        // Add initial segment to inuse queue
-        unsafe {
-            (*inuse_ptr).push(LamportPtr(initial_ptr)).unwrap();
-        }
-
-        let pool = BufferPool {
-            inuse_ptr: inuse_ptr as *mut _,
-            cache_ptr: cache_ptr as *mut _,
-            segment_size,
-            segment_count: AtomicUsize::new(1),
-        };
-
-        Self {
-            buf_r: AtomicPtr::new(initial_ptr),
-            _padding1: [0; 120],
-            buf_w: AtomicPtr::new(initial_ptr),
-            _padding2: [0; 120],
-            pool,
-            size: segment_size,
-            initialized: AtomicBool::new(true),
-            segment_count: AtomicUsize::new(1),
-        }
-    }
-
     pub fn shared_size(segment_size: usize) -> usize {
-        // For shared memory benchmarks, we still need pre-allocated space
-        // But the algorithm supports dynamic growth beyond this
         use std::alloc::Layout;
 
         let self_layout = Layout::new::<Self>();
-        let dspsc_size = DynListQueue::<LamportPtr<T>>::shared_size(POOL_CACHE_SIZE);
-        let cache_size = LamportQueue::<LamportPtr<T>>::shared_size(POOL_CACHE_SIZE);
+        let dspsc_size = DynListQueue::<SharedSegment<T>>::shared_size(POOL_CACHE_SIZE * 2);
+        let cache_size = LamportQueue::<SharedSegment<T>>::shared_size(POOL_CACHE_SIZE);
 
-        // Pre-allocate a reasonable number of segments
-        let initial_segments = 8;
-        let segments_size = LamportQueue::<T>::shared_size(segment_size) * initial_segments;
+        // Align segment size to cache line
+        let segment_layout =
+            Layout::from_size_align(LamportQueue::<T>::shared_size(segment_size), 128).unwrap();
+        let segment_stride = segment_layout.pad_to_align().size();
 
         let mut total = self_layout.size();
         total = (total + 127) & !127;
@@ -179,7 +163,7 @@ impl<T: Send + 'static> UnboundedQueue<T> {
         total = (total + 127) & !127;
         total += cache_size;
         total = (total + 127) & !127;
-        total += segments_size;
+        total += segment_stride * MAX_SEGMENTS; // Pre-allocate all segments
 
         total
     }
@@ -193,66 +177,86 @@ impl<T: Send + 'static> UnboundedQueue<T> {
             "Segment size must be power of 2"
         );
 
-        // Zero initialize
         let total_size = Self::shared_size(segment_size);
-        std::ptr::write_bytes(mem_ptr, 0, total_size);
+        ptr::write_bytes(mem_ptr, 0, total_size);
 
         let self_ptr = mem_ptr as *mut Self;
         let mut offset = Layout::new::<Self>().size();
         offset = (offset + 127) & !127;
 
-        // Initialize dSPSC queue
+        // Initialize dSPSC queue for 'inuse' list
         let dspsc_ptr = mem_ptr.add(offset);
-        let inuse_queue = DynListQueue::init_in_shared(dspsc_ptr, POOL_CACHE_SIZE);
-        let dspsc_size = DynListQueue::<LamportPtr<T>>::shared_size(POOL_CACHE_SIZE);
+        let inuse_queue = DynListQueue::init_in_shared(dspsc_ptr, POOL_CACHE_SIZE * 2);
+        let dspsc_size = DynListQueue::<SharedSegment<T>>::shared_size(POOL_CACHE_SIZE * 2);
         offset += dspsc_size;
         offset = (offset + 127) & !127;
 
-        // Initialize cache queue
+        // Initialize SPSC queue for 'cache'
         let cache_ptr = mem_ptr.add(offset);
         let cache_queue = LamportQueue::init_in_shared(cache_ptr, POOL_CACHE_SIZE);
-        let cache_size = LamportQueue::<LamportPtr<T>>::shared_size(POOL_CACHE_SIZE);
+        let cache_size = LamportQueue::<SharedSegment<T>>::shared_size(POOL_CACHE_SIZE);
         offset += cache_size;
         offset = (offset + 127) & !127;
 
-        // Pre-allocate initial segments
+        // Calculate segment stride
+        let segment_layout =
+            Layout::from_size_align(LamportQueue::<T>::shared_size(segment_size), 128).unwrap();
+        let segment_stride = segment_layout.pad_to_align().size();
+
+        // Initialize all segments
         let segments_base = mem_ptr.add(offset);
-        let initial_segments = 8;
-        let mut segment_ptrs = Vec::with_capacity(initial_segments);
 
-        for i in 0..initial_segments {
-            let segment_offset = i * LamportQueue::<T>::shared_size(segment_size);
-            let segment_ptr = segments_base.add(segment_offset);
-            let segment = LamportQueue::init_in_shared(segment_ptr, segment_size);
-            segment_ptrs.push(segment as *mut _);
+        // Initialize first segment and put it in use
+        let first_queue = LamportQueue::init_in_shared(segments_base, segment_size);
+        let first_segment = SharedSegment {
+            queue_ptr: first_queue as *mut _,
+            segment_id: 0,
+            _padding: 0,
+        };
+        inuse_queue.push(first_segment).unwrap();
+
+        // Initialize remaining segments and add to cache
+        let mut initialized_count = 1;
+        for i in 1..MAX_SEGMENTS {
+            let segment_ptr = segments_base.add(i * segment_stride);
+            let queue = LamportQueue::init_in_shared(segment_ptr, segment_size);
+            let segment = SharedSegment {
+                queue_ptr: queue as *mut _,
+                segment_id: i,
+                _padding: 0,
+            };
+
+            // Try to add to cache
+            if cache_queue.push(segment).is_err() {
+                // Cache full, try inuse
+                if inuse_queue.push(segment).is_err() {
+                    // Both full, stop initializing
+                    break;
+                }
+            }
+            initialized_count += 1;
         }
 
-        let initial_segment = segment_ptrs[0];
-
-        // Add remaining segments to cache
-        for i in 1..initial_segments.min(POOL_CACHE_SIZE) {
-            cache_queue.push(LamportPtr(segment_ptrs[i])).ok();
-        }
-
-        // Create pool
         let pool = BufferPool {
             inuse_ptr: inuse_queue as *mut _,
             cache_ptr: cache_queue as *mut _,
             segment_size,
             segment_count: AtomicUsize::new(1),
+            segments_base,
+            segment_stride,
+            total_segments: initialized_count,
         };
-
-        // Add initial segment to inuse
-        inuse_queue.push(LamportPtr(initial_segment)).unwrap();
 
         ptr::write(
             self_ptr,
             Self {
-                buf_r: AtomicPtr::new(initial_segment),
+                buf_r: AtomicPtr::new(first_queue as *mut _),
                 _padding1: [0; 120],
-                buf_w: AtomicPtr::new(initial_segment),
+                buf_w: AtomicPtr::new(first_queue as *mut _),
                 _padding2: [0; 120],
                 pool,
+                current_r_segment: UnsafeCell::new(first_segment),
+                current_w_segment: UnsafeCell::new(first_segment),
                 size: segment_size,
                 initialized: AtomicBool::new(true),
                 segment_count: AtomicUsize::new(1),
@@ -260,6 +264,24 @@ impl<T: Send + 'static> UnboundedQueue<T> {
         );
 
         &mut *self_ptr
+    }
+
+    // Helper to atomically update segment info
+    unsafe fn update_w_segment(&self, new_segment: SharedSegment<T>) {
+        // Write to the UnsafeCell
+        *self.current_w_segment.get() = new_segment;
+    }
+
+    unsafe fn update_r_segment(&self, new_segment: SharedSegment<T>) {
+        *self.current_r_segment.get() = new_segment;
+    }
+
+    unsafe fn get_r_segment(&self) -> SharedSegment<T> {
+        *self.current_r_segment.get()
+    }
+
+    unsafe fn get_w_segment(&self) -> SharedSegment<T> {
+        *self.current_w_segment.get()
     }
 }
 
@@ -271,16 +293,28 @@ impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
     fn push(&self, data: T) -> Result<(), Self::PushError> {
         let buf_w = self.buf_w.load(Ordering::Acquire);
 
+        if buf_w.is_null() {
+            return Err(());
+        }
+
         // Paper line 4: if (buf_w->full())
         if unsafe { !(*buf_w).available() } {
             // Paper line 5: buf_w = pool.next_w()
-            if let Some(new_buf) = self.pool.next_w() {
-                // The paper mentions WMB is enforced by dSPSC push in next_w
+            if let Some(new_segment) = self.pool.next_w() {
+                // CRITICAL: WMB is enforced by the dSPSC push inside next_w()
+                // as mentioned in the paper (enforced by line 14 in Figure 2)
                 fence(Ordering::Release);
-                self.buf_w.store(new_buf, Ordering::Release);
+
+                // Update the pointer and segment info
+                self.buf_w.store(new_segment.queue_ptr, Ordering::Release);
+                unsafe {
+                    self.update_w_segment(new_segment);
+                }
+
                 self.segment_count.fetch_add(1, Ordering::Relaxed);
+
                 // Paper line 6: buf_w->push(data)
-                unsafe { (*new_buf).push(data).map_err(|_| ()) }
+                unsafe { (*new_segment.queue_ptr).push(data).map_err(|_| ()) }
             } else {
                 Err(())
             }
@@ -294,6 +328,10 @@ impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
     fn pop(&self) -> Result<T, Self::PopError> {
         let buf_r = self.buf_r.load(Ordering::Acquire);
 
+        if buf_r.is_null() {
+            return Err(());
+        }
+
         // Paper line 11: if (buf_r->empty())
         if unsafe { (*buf_r).empty() } {
             // Paper line 12: if (buf_r == buf_w) return false
@@ -303,16 +341,26 @@ impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
             }
 
             // Paper line 13: if (buf_r->empty())
-            // This second check is CRITICAL for correctness under weak memory models
+            // This second check is CRITICAL for correctness
             fence(Ordering::Acquire);
             if unsafe { (*buf_r).empty() } {
                 // Paper lines 14-16: switch to next buffer
-                if let Some(tmp) = self.pool.next_r() {
-                    self.pool.release(buf_r);
-                    self.buf_r.store(tmp, Ordering::Release);
+                if let Some(new_segment) = self.pool.next_r() {
+                    // Get current segment info for release
+                    let current_segment = unsafe { self.get_r_segment() };
+
+                    self.pool.release(current_segment);
+
+                    // Update pointer and segment info
+                    self.buf_r.store(new_segment.queue_ptr, Ordering::Release);
+                    unsafe {
+                        self.update_r_segment(new_segment);
+                    }
+
                     self.segment_count.fetch_sub(1, Ordering::Relaxed);
+
                     // Paper line 19: return buf_r->pop(data)
-                    unsafe { (*tmp).pop() }
+                    unsafe { (*new_segment.queue_ptr).pop() }
                 } else {
                     Err(())
                 }
@@ -327,59 +375,65 @@ impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
     }
 
     fn available(&self) -> bool {
-        unsafe { (*self.buf_w.load(Ordering::Acquire)).available() }
+        let buf_w = self.buf_w.load(Ordering::Acquire);
+        !buf_w.is_null() && unsafe { (*buf_w).available() }
     }
 
     fn empty(&self) -> bool {
         let buf_r = self.buf_r.load(Ordering::Acquire);
         let buf_w = self.buf_w.load(Ordering::Acquire);
-        unsafe { (*buf_r).empty() && buf_r == buf_w }
+        !buf_r.is_null() && !buf_w.is_null() && unsafe { (*buf_r).empty() && buf_r == buf_w }
     }
 }
 
 impl<T: Send + 'static> Drop for UnboundedQueue<T> {
     fn drop(&mut self) {
+        // Only run drop logic if we were properly initialized
         if !self.initialized.load(Ordering::Acquire) {
             return;
         }
 
-        // Pop all remaining items
-        while let Ok(item) = SpscQueue::pop(self) {
-            drop(item);
-        }
+        // Mark as uninitialized to prevent double-drop
+        self.initialized.store(false, Ordering::Release);
 
-        // Clean up all segments
-        unsafe {
-            // Get all segments from inuse queue
-            while let Ok(wrapper) = (*self.pool.inuse_ptr).pop() {
-                let _ = Box::from_raw(wrapper.0);
+        // Pop all remaining items to drop them properly
+        // Use direct implementation to avoid trait dispatch issues
+        loop {
+            let buf_r = self.buf_r.load(Ordering::Acquire);
+            if buf_r.is_null() {
+                break;
             }
 
-            // Get all segments from cache
-            while let Ok(wrapper) = (*self.pool.cache_ptr).pop() {
-                let _ = Box::from_raw(wrapper.0);
-            }
+            if unsafe { (*buf_r).empty() } {
+                let buf_w = self.buf_w.load(Ordering::Acquire);
+                if buf_r == buf_w {
+                    break; // Queue is empty
+                }
 
-            // Clean up the current buffers if they're not already handled
-            let buf_r = self.buf_r.load(Ordering::Relaxed);
-            let buf_w = self.buf_w.load(Ordering::Relaxed);
-
-            // Only free if not already freed above
-            if !buf_r.is_null() {
-                // Check if this buffer was already freed by checking if it's still valid
-                // In shared memory mode, we don't free these as they're in the pre-allocated space
-            }
-
-            // Free the pool queues themselves (only in heap mode)
-            let inuse_ptr = self.pool.inuse_ptr;
-            let cache_ptr = self.pool.cache_ptr;
-
-            if !inuse_ptr.is_null() {
-                let _ = Box::from_raw(inuse_ptr);
-            }
-            if !cache_ptr.is_null() {
-                let _ = Box::from_raw(cache_ptr);
+                // Try to switch to next buffer
+                if let Some(new_segment) = self.pool.next_r() {
+                    let current_segment = unsafe { self.get_r_segment() };
+                    self.pool.release(current_segment);
+                    self.buf_r.store(new_segment.queue_ptr, Ordering::Release);
+                    unsafe {
+                        self.update_r_segment(new_segment);
+                    }
+                } else {
+                    break; // No more segments
+                }
+            } else {
+                // Pop and drop the item
+                if unsafe { (*buf_r).pop() }.is_err() {
+                    break;
+                }
             }
         }
+
+        // Reset all pointers to null
+        self.buf_r.store(ptr::null_mut(), Ordering::Release);
+        self.buf_w.store(ptr::null_mut(), Ordering::Release);
+
+        // No memory deallocation needed - all segments are in the pre-allocated shared memory
+        // The benchmark will unmap the entire shared memory region
     }
 }

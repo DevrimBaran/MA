@@ -12,7 +12,7 @@ const fn null_node<T: Send>() -> *mut Node<T> {
     null_mut()
 }
 
-const CACHE_LINE_SIZE: usize = 64;
+const CACHE_LINE_SIZE: usize = 256;
 
 #[repr(C, align(128))]
 struct Node<T: Send + 'static> {

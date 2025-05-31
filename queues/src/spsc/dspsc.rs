@@ -1,4 +1,4 @@
-// nearly 6 times slower then uspsc like paper says
+// dSPSC slower then uspsc like paper says (paper says up to 6 times slower, in this implementations it is about 2-3 times slower)
 use crate::spsc::lamport::LamportQueue;
 use crate::SpscQueue;
 use std::{
@@ -12,14 +12,13 @@ const fn null_node<T: Send>() -> *mut Node<T> {
     null_mut()
 }
 
-// Fixed cache line size - actual size on x86_64
 const CACHE_LINE_SIZE: usize = 64;
 
 #[repr(C, align(128))]
 struct Node<T: Send + 'static> {
     val: Option<T>,
     next: AtomicPtr<Node<T>>,
-    _padding: [u8; CACHE_LINE_SIZE - 24], // 24 = size of val + next on 64-bit
+    _padding: [u8; CACHE_LINE_SIZE - 24],
 }
 
 #[repr(transparent)]
@@ -34,12 +33,12 @@ pub struct DynListQueue<T: Send + 'static> {
     head: AtomicPtr<Node<T>>,
     tail: AtomicPtr<Node<T>>,
 
-    padding1: [u8; 128 - 16], // 16 = 2 pointers
+    padding1: [u8; 128 - 16],
 
     nodes_pool_ptr: *mut Node<T>,
     next_free_node: AtomicUsize,
 
-    padding2: [u8; 128 - 16], // 16 = 1 pointer + 1 atomic
+    padding2: [u8; 128 - 16],
 
     node_cache: LamportQueue<NodePtr<T>>,
 
@@ -57,9 +56,8 @@ unsafe impl<T: Send> Sync for DynListQueue<T> {}
 
 impl<T: Send + 'static> DynListQueue<T> {
     pub fn shared_size(capacity: usize) -> usize {
-        // Calculate sizes based on capacity
-        let preallocated_nodes = capacity / 2; // Half of ring cap for pre-allocated
-        let node_cache_capacity = capacity; // Full ring cap for cache
+        let preallocated_nodes = capacity / 2;
+        let node_cache_capacity = capacity;
 
         let layout_self = Layout::new::<Self>();
         let lamport_cache_size = LamportQueue::<NodePtr<T>>::shared_size(node_cache_capacity);
@@ -187,38 +185,34 @@ impl<T: Send + 'static> DynListQueue<T> {
             },
         );
 
-        fence(Ordering::SeqCst);
-
         &mut *self_ptr
     }
 
     fn alloc_node(&self, v: T) -> *mut Node<T> {
-        for _ in 0..3 {
-            if let Ok(node_ptr_wrapper) = self.node_cache.pop() {
-                let node_ptr = node_ptr_wrapper.0;
-                if !node_ptr.is_null() {
-                    unsafe {
-                        ptr::write(&mut (*node_ptr).val, Some(v));
-                        (*node_ptr).next.store(null_node(), Ordering::SeqCst);
-                    }
-                    return node_ptr;
+        // Try cache first (paper line 10)
+        if let Ok(node_ptr_wrapper) = self.node_cache.pop() {
+            let node_ptr = node_ptr_wrapper.0;
+            if !node_ptr.is_null() {
+                unsafe {
+                    ptr::write(&mut (*node_ptr).val, Some(v));
+                    (*node_ptr).next.store(null_node(), Ordering::Relaxed);
                 }
+                return node_ptr;
             }
-
-            std::hint::spin_loop();
         }
 
-        let idx = self.next_free_node.fetch_add(1, Ordering::SeqCst);
+        // Try pool
+        let idx = self.next_free_node.fetch_add(1, Ordering::Relaxed);
         if idx < self.pool_capacity {
             let node = unsafe { self.nodes_pool_ptr.add(idx) };
-
             unsafe {
                 ptr::write(&mut (*node).val, Some(v));
-                (*node).next.store(null_node(), Ordering::SeqCst);
+                (*node).next.store(null_node(), Ordering::Relaxed);
             }
             return node;
         }
 
+        // Allocate from heap (paper line 11)
         let layout = Layout::from_size_align(std::mem::size_of::<Node<T>>(), 128).unwrap();
         let ptr = unsafe { std::alloc::alloc(layout) as *mut Node<T> };
 
@@ -268,15 +262,21 @@ impl<T: Send + 'static> DynListQueue<T> {
             if let Some(val) = ptr::replace(&mut (*node_to_recycle).val, None) {
                 drop(val);
             }
-            (*node_to_recycle).next.store(null_node(), Ordering::SeqCst);
+            (*node_to_recycle)
+                .next
+                .store(null_node(), Ordering::Relaxed);
         }
-        if self.is_pool_node(node_to_recycle) {
-            let _ = self.node_cache.push(NodePtr(node_to_recycle));
-        } else {
-            unsafe {
-                let layout = Layout::from_size_align(std::mem::size_of::<Node<T>>(), 128).unwrap();
-                std::alloc::dealloc(node_to_recycle as *mut u8, layout);
-                self.heap_frees.fetch_add(1, Ordering::Relaxed);
+
+        // Try to cache it (paper line 23)
+        if self.node_cache.push(NodePtr(node_to_recycle)).is_err() {
+            // Cache full, free if heap allocated
+            if !self.is_pool_node(node_to_recycle) {
+                unsafe {
+                    let layout =
+                        Layout::from_size_align(std::mem::size_of::<Node<T>>(), 128).unwrap();
+                    std::alloc::dealloc(node_to_recycle as *mut u8, layout);
+                    self.heap_frees.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -287,61 +287,51 @@ impl<T: Send + 'static> SpscQueue<T> for DynListQueue<T> {
     type PopError = ();
 
     fn push(&self, item: T) -> Result<(), ()> {
-        let new_node = self.alloc_node(item);
+        // Paper Figure 2, lines 8-16
+        let new_node = self.alloc_node(item); // lines 9-11
 
-        fence(Ordering::SeqCst);
+        // Paper line 13: WMB() - write-memory-barrier
+        // This ensures node data is visible before the pointer update
+        fence(Ordering::Release);
 
-        let current_tail_ptr = self.tail.load(Ordering::SeqCst);
-
-        if current_tail_ptr.is_null() {
-            return Err(());
-        }
-
+        // Paper line 14: tail->next = n
+        let current_tail = self.tail.load(Ordering::Relaxed);
         unsafe {
-            (*current_tail_ptr).next.store(new_node, Ordering::SeqCst);
+            (*current_tail).next.store(new_node, Ordering::Relaxed);
         }
 
-        fence(Ordering::SeqCst);
-
-        self.tail.store(new_node, Ordering::SeqCst);
+        // Paper line 14: tail = n
+        self.tail.store(new_node, Ordering::Relaxed);
 
         Ok(())
     }
 
     fn pop(&self) -> Result<T, ()> {
-        let current_dummy_ptr = self.head.load(Ordering::SeqCst);
+        // Paper Figure 2, lines 18-25
 
-        if current_dummy_ptr.is_null() {
+        // Paper line 19: if (!head->next) return false
+        let current_head = self.head.load(Ordering::Relaxed);
+        let next_node = unsafe { (*current_head).next.load(Ordering::Relaxed) };
+
+        if next_node.is_null() {
             return Err(());
         }
 
-        fence(Ordering::SeqCst);
-
-        let item_node_ptr = unsafe { (*current_dummy_ptr).next.load(Ordering::SeqCst) };
-
-        if item_node_ptr.is_null() {
-            return Err(());
-        }
-
+        // Paper line 20: Node* n = head
+        // Paper line 21: *data = (head->next)->data
         let value = unsafe {
-            if item_node_ptr.is_null() {
-                return Err(());
-            }
-
-            if let Some(value) = ptr::replace(&mut (*item_node_ptr).val, None) {
-                value
+            if let Some(v) = ptr::replace(&mut (*next_node).val, None) {
+                v
             } else {
                 return Err(());
             }
         };
 
-        fence(Ordering::SeqCst);
+        // Paper line 22: head = head->next
+        self.head.store(next_node, Ordering::Relaxed);
 
-        self.head.store(item_node_ptr, Ordering::SeqCst);
-
-        fence(Ordering::SeqCst);
-
-        self.recycle_node(current_dummy_ptr);
+        // Paper line 23: if (!cache.push(n)) free(n)
+        self.recycle_node(current_head);
 
         Ok(value)
     }
@@ -353,13 +343,8 @@ impl<T: Send + 'static> SpscQueue<T> for DynListQueue<T> {
 
     #[inline]
     fn empty(&self) -> bool {
-        let h = self.head.load(Ordering::SeqCst);
-
-        if h.is_null() {
-            return true;
-        }
-
-        unsafe { (*h).next.load(Ordering::SeqCst).is_null() }
+        let h = self.head.load(Ordering::Relaxed);
+        unsafe { (*h).next.load(Ordering::Relaxed).is_null() }
     }
 }
 
@@ -434,8 +419,8 @@ impl<T: Send + 'static> Drop for DynListQueue<T> {
                     let _ = Box::from_raw(self.base_ptr);
                 }
             } else {
-                // For shared memory queues, need to free heap-allocated nodes
-                // but NOT pool nodes or the base dummy (they're in shared memory)
+                // For shared memory, need to free heap-allocated nodes
+                // but not pool nodes or base dummy
 
                 // Calculate pool bounds
                 let pool_start = self.nodes_pool_ptr as usize;

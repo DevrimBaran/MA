@@ -1,4 +1,4 @@
-// Fixed queues/src/spsc/dehnavi_queue.rs
+// remove queue, we would need to prove that our hardware supports the scheduling guarantees given in the paper to have the same wcet
 use crate::SpscQueue;
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
@@ -114,13 +114,11 @@ impl<T: Send + 'static> SpscQueue<T> for DehnaviQueue<T> {
         // Line 7: Write token
         let wc = self.wc.load(Ordering::Acquire);
         unsafe {
-            // The key fix: use volatile write to prevent data races
-            let ptr = (*self.buffer.get_unchecked(wc)).get();
-            ptr::write_volatile(ptr, MaybeUninit::new(item));
+            ptr::write(
+                (*self.buffer.get_unchecked(wc)).get(),
+                MaybeUninit::new(item),
+            );
         }
-
-        // Ensure the write completes before updating wc
-        std::sync::atomic::fence(Ordering::Release);
 
         // Line 8: wc = (wc + 1) % k
         self.wc.store((wc + 1) % self.capacity, Ordering::Release);
@@ -140,21 +138,11 @@ impl<T: Send + 'static> SpscQueue<T> for DehnaviQueue<T> {
         self.cclaim.store(true, Ordering::Release);
 
         // Line 2: while (pclaim==1);
-        while self.pclaim.load(Ordering::Acquire) {
-            std::hint::spin_loop();
-        }
+        self.pclaim.load(Ordering::Acquire);
 
         // Line 3: Read token
         let rc = self.rc.load(Ordering::Acquire);
-
-        // Ensure we see any writes that happened before
-        std::sync::atomic::fence(Ordering::Acquire);
-
-        let item = unsafe {
-            // Use volatile read to match the volatile write
-            let ptr = (*self.buffer.get_unchecked(rc)).get();
-            ptr::read_volatile(ptr)
-        };
+        let item = unsafe { ptr::read((*self.buffer.get_unchecked(rc)).get()) };
 
         // Line 4: rc = (rc+1) % k
         self.rc.store((rc + 1) % self.capacity, Ordering::Release);

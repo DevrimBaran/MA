@@ -1,7 +1,3 @@
-// True unbounded uSPSC implementation using dynamic shared memory allocation
-// This follows the paper's algorithm exactly but adapts it for IPC
-// CRITICAL: Pre-allocates all segments before fork() for cross-process visibility
-
 use crate::spsc::LamportQueue;
 use crate::{DynListQueue, SpscQueue};
 use std::{
@@ -12,7 +8,7 @@ use std::{
 
 const POOL_CACHE_SIZE: usize = 32;
 // Pre-allocate enough segments for practical unbounded behavior
-const MAX_SEGMENTS: usize = 32; // Can handle ITERS/segment_size items
+const MAX_SEGMENTS: usize = 32;
 
 // SharedSegment wraps a pointer and its metadata
 #[repr(C)]

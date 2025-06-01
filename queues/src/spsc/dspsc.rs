@@ -1,29 +1,22 @@
-// nearly 6 times slower then uspsc like paper says
+// Simplified dSPSC for shared memory only
 use crate::spsc::lamport::LamportQueue;
 use crate::SpscQueue;
 use std::{
-    alloc::Layout,
     ptr::{self, null_mut},
     sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering},
 };
 
-#[inline(always)]
-const fn null_node<T: Send>() -> *mut Node<T> {
-    null_mut()
-}
-
-// Fixed cache line size - actual size on x86_64
 const CACHE_LINE_SIZE: usize = 64;
 
 #[repr(C, align(128))]
 struct Node<T: Send + 'static> {
     val: Option<T>,
     next: AtomicPtr<Node<T>>,
-    _padding: [u8; CACHE_LINE_SIZE - 24], // 24 = size of val + next on 64-bit
+    _padding: [u8; CACHE_LINE_SIZE - 24],
 }
 
 #[repr(transparent)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone)]
 struct NodePtr<U: Send + 'static>(*mut Node<U>);
 
 unsafe impl<U: Send + 'static> Send for NodePtr<U> {}
@@ -33,252 +26,126 @@ unsafe impl<U: Send + 'static> Sync for NodePtr<U> {}
 pub struct DynListQueue<T: Send + 'static> {
     head: AtomicPtr<Node<T>>,
     tail: AtomicPtr<Node<T>>,
+    _padding1: [u8; 128 - 16],
 
-    padding1: [u8; 128 - 16], // 16 = 2 pointers
-
-    nodes_pool_ptr: *mut Node<T>,
+    nodes_pool: *mut Node<T>,
     next_free_node: AtomicUsize,
-
-    padding2: [u8; 128 - 16], // 16 = 1 pointer + 1 atomic
+    _padding2: [u8; 128 - 16],
 
     node_cache: LamportQueue<NodePtr<T>>,
-
-    base_ptr: *mut Node<T>,
-    pool_capacity: usize,
-    cache_capacity: usize,
-    owns_all: bool,
-
-    pub heap_allocs: AtomicUsize,
-    pub heap_frees: AtomicUsize,
+    pool_size: usize,
 }
 
 unsafe impl<T: Send> Send for DynListQueue<T> {}
 unsafe impl<T: Send> Sync for DynListQueue<T> {}
 
 impl<T: Send + 'static> DynListQueue<T> {
-    pub fn shared_size(capacity: usize) -> usize {
-        // Calculate sizes based on capacity
-        let preallocated_nodes = capacity / 2; // Half of ring cap for pre-allocated
-        let node_cache_capacity = capacity; // Full ring cap for cache
+    pub fn shared_size(cache_capacity: usize, nodes_count: usize) -> usize {
+        use std::alloc::Layout;
 
         let layout_self = Layout::new::<Self>();
-        let lamport_cache_size = LamportQueue::<NodePtr<T>>::shared_size(node_cache_capacity);
-        let layout_dummy_node = Layout::new::<Node<T>>();
-        let layout_pool_array = Layout::array::<Node<T>>(preallocated_nodes).unwrap();
+        let layout_nodes = Layout::array::<Node<T>>(nodes_count).unwrap();
+        let lamport_size = LamportQueue::<NodePtr<T>>::shared_size(cache_capacity);
 
-        let (layout1, _) = layout_self.extend(layout_dummy_node).unwrap();
-        let (layout2, _) = layout1.extend(layout_pool_array).unwrap();
-
-        let lamport_align = std::cmp::max(std::mem::align_of::<LamportQueue<NodePtr<T>>>(), 128);
-        let (final_layout, _) = layout2
-            .align_to(lamport_align)
-            .unwrap()
-            .extend(Layout::from_size_align(lamport_cache_size, lamport_align).unwrap())
+        let (layout1, _) = layout_self.extend(layout_nodes).unwrap();
+        let (final_layout, _) = layout1
+            .extend(Layout::from_size_align(lamport_size, 128).unwrap())
             .unwrap();
 
         final_layout.size()
     }
 
-    pub fn with_capacity(capacity: usize) -> Self {
-        let preallocated_nodes = capacity / 2;
-        let node_cache_capacity = capacity;
+    pub unsafe fn init_in_shared(
+        mem_ptr: *mut u8,
+        cache_capacity: usize,
+        nodes_count: usize,
+    ) -> &'static mut Self {
+        use std::alloc::Layout;
 
-        let dummy = Box::into_raw(Box::new(Node {
-            val: None,
-            next: AtomicPtr::new(null_node()),
-            _padding: [0; CACHE_LINE_SIZE - 24],
-        }));
-
-        let mut pool_nodes_vec: Vec<Node<T>> = Vec::with_capacity(preallocated_nodes);
-        for _ in 0..preallocated_nodes {
-            pool_nodes_vec.push(Node {
-                val: None,
-                next: AtomicPtr::new(null_node()),
-                _padding: [0; CACHE_LINE_SIZE - 24],
-            });
-        }
-        let pool_ptr = Box::into_raw(pool_nodes_vec.into_boxed_slice()) as *mut Node<T>;
-
-        let node_cache = LamportQueue::<NodePtr<T>>::with_capacity(node_cache_capacity);
-
-        Self {
-            head: AtomicPtr::new(dummy),
-            tail: AtomicPtr::new(dummy),
-            padding1: [0; 128 - 16],
-            base_ptr: dummy,
-            nodes_pool_ptr: pool_ptr,
-            next_free_node: AtomicUsize::new(0),
-            padding2: [0; 128 - 16],
-            node_cache,
-            pool_capacity: preallocated_nodes,
-            cache_capacity: node_cache_capacity,
-            owns_all: true,
-            heap_allocs: AtomicUsize::new(0),
-            heap_frees: AtomicUsize::new(0),
-        }
-    }
-
-    pub unsafe fn init_in_shared(mem_ptr: *mut u8, capacity: usize) -> &'static mut Self {
-        let preallocated_nodes = capacity / 2;
-        let node_cache_capacity = capacity;
+        let cache_size = cache_capacity;
 
         let self_ptr = mem_ptr as *mut Self;
 
         let layout_self = Layout::new::<Self>();
-        let layout_dummy_node = Layout::new::<Node<T>>();
-        let layout_pool_array = Layout::array::<Node<T>>(preallocated_nodes).unwrap();
+        let layout_nodes = Layout::array::<Node<T>>(nodes_count).unwrap();
+        let lamport_size = LamportQueue::<NodePtr<T>>::shared_size(cache_size);
 
-        let lamport_cache_size = LamportQueue::<NodePtr<T>>::shared_size(node_cache_capacity);
-        let lamport_align = std::cmp::max(std::mem::align_of::<LamportQueue<NodePtr<T>>>(), 128);
-
-        let (layout1, offset_dummy) = layout_self.extend(layout_dummy_node).unwrap();
-        let (layout2, offset_pool_array) = layout1.extend(layout_pool_array).unwrap();
-        let (_, offset_node_cache) = layout2
-            .align_to(lamport_align)
-            .unwrap()
-            .extend(Layout::from_size_align(lamport_cache_size, lamport_align).unwrap())
+        let (layout1, offset_nodes) = layout_self.extend(layout_nodes).unwrap();
+        let (_, offset_cache) = layout1
+            .extend(Layout::from_size_align(lamport_size, 128).unwrap())
             .unwrap();
 
-        let dummy_ptr_val = mem_ptr.add(offset_dummy) as *mut Node<T>;
-
-        ptr::write(
-            dummy_ptr_val,
-            Node {
-                val: None,
-                next: AtomicPtr::new(null_node()),
-                _padding: [0; CACHE_LINE_SIZE - 24],
-            },
-        );
-
-        let pool_nodes_ptr_val = mem_ptr.add(offset_pool_array) as *mut Node<T>;
-
-        for i in 0..preallocated_nodes {
+        // Initialize nodes
+        let nodes_ptr = mem_ptr.add(offset_nodes) as *mut Node<T>;
+        for i in 0..nodes_count {
             ptr::write(
-                pool_nodes_ptr_val.add(i),
+                nodes_ptr.add(i),
                 Node {
                     val: None,
-                    next: AtomicPtr::new(null_node()),
+                    next: AtomicPtr::new(null_mut()),
                     _padding: [0; CACHE_LINE_SIZE - 24],
                 },
             );
         }
 
-        let node_cache_mem_start = mem_ptr.add(offset_node_cache);
+        // First node is dummy
+        let dummy_ptr = nodes_ptr;
 
-        let initialized_node_cache_ref =
-            LamportQueue::<NodePtr<T>>::init_in_shared(node_cache_mem_start, node_cache_capacity);
+        // Initialize cache
+        let cache_ptr = mem_ptr.add(offset_cache);
+        let cache = LamportQueue::<NodePtr<T>>::init_in_shared(cache_ptr, cache_size);
+
+        // Add all free nodes (except dummy) to cache
+        for i in 1..nodes_count {
+            let node_ptr = nodes_ptr.add(i);
+            let _ = cache.push(NodePtr(node_ptr));
+        }
 
         ptr::write(
             self_ptr,
             DynListQueue {
-                head: AtomicPtr::new(dummy_ptr_val),
-                tail: AtomicPtr::new(dummy_ptr_val),
-                padding1: [0; 128 - 16],
-                base_ptr: dummy_ptr_val,
-                nodes_pool_ptr: pool_nodes_ptr_val,
-                next_free_node: AtomicUsize::new(0),
-                padding2: [0; 128 - 16],
-                node_cache: ptr::read(initialized_node_cache_ref as *const _),
-                pool_capacity: preallocated_nodes,
-                cache_capacity: node_cache_capacity,
-                owns_all: false,
-                heap_allocs: AtomicUsize::new(0),
-                heap_frees: AtomicUsize::new(0),
+                head: AtomicPtr::new(dummy_ptr),
+                tail: AtomicPtr::new(dummy_ptr),
+                _padding1: [0; 128 - 16],
+                nodes_pool: nodes_ptr,
+                next_free_node: AtomicUsize::new(nodes_count),
+                _padding2: [0; 128 - 16],
+                node_cache: ptr::read(cache as *const _),
+                pool_size: nodes_count,
             },
         );
 
         fence(Ordering::SeqCst);
-
         &mut *self_ptr
     }
 
-    fn alloc_node(&self, v: T) -> *mut Node<T> {
-        for _ in 0..3 {
-            if let Ok(node_ptr_wrapper) = self.node_cache.pop() {
-                let node_ptr = node_ptr_wrapper.0;
-                if !node_ptr.is_null() {
-                    unsafe {
-                        ptr::write(&mut (*node_ptr).val, Some(v));
-                        (*node_ptr).next.store(null_node(), Ordering::SeqCst);
-                    }
-                    return node_ptr;
-                }
-            }
-
-            std::hint::spin_loop();
-        }
-
-        let idx = self.next_free_node.fetch_add(1, Ordering::SeqCst);
-        if idx < self.pool_capacity {
-            let node = unsafe { self.nodes_pool_ptr.add(idx) };
-
+    fn alloc_node(&self, v: T) -> Option<*mut Node<T>> {
+        // Only use cache, no heap allocation
+        if let Ok(node_ptr) = self.node_cache.pop() {
+            let node = node_ptr.0;
             unsafe {
                 ptr::write(&mut (*node).val, Some(v));
-                (*node).next.store(null_node(), Ordering::SeqCst);
+                (*node).next.store(null_mut(), Ordering::Relaxed);
             }
-            return node;
+            Some(node)
+        } else {
+            None
         }
-
-        let layout = Layout::from_size_align(std::mem::size_of::<Node<T>>(), 128).unwrap();
-        let ptr = unsafe { std::alloc::alloc(layout) as *mut Node<T> };
-
-        if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-
-        self.heap_allocs.fetch_add(1, Ordering::Relaxed);
-
-        unsafe {
-            ptr::write(
-                ptr,
-                Node {
-                    val: Some(v),
-                    next: AtomicPtr::new(null_node()),
-                    _padding: [0; CACHE_LINE_SIZE - 24],
-                },
-            );
-        }
-
-        ptr
     }
 
-    #[inline]
-    fn is_pool_node(&self, p: *mut Node<T>) -> bool {
-        if p == self.base_ptr {
-            return true;
-        }
-
-        if self.nodes_pool_ptr.is_null() {
-            return false;
-        }
-
-        let start = self.nodes_pool_ptr as usize;
-        let end = unsafe { self.nodes_pool_ptr.add(self.pool_capacity) } as usize;
-        let addr = p as usize;
-
-        addr >= start && addr < end
-    }
-
-    fn recycle_node(&self, node_to_recycle: *mut Node<T>) {
-        if node_to_recycle.is_null() {
+    fn recycle_node(&self, node: *mut Node<T>) {
+        if node.is_null() {
             return;
         }
 
         unsafe {
-            if let Some(val) = ptr::replace(&mut (*node_to_recycle).val, None) {
+            if let Some(val) = ptr::replace(&mut (*node).val, None) {
                 drop(val);
             }
-            (*node_to_recycle).next.store(null_node(), Ordering::SeqCst);
+            (*node).next.store(null_mut(), Ordering::Relaxed);
         }
-        if self.is_pool_node(node_to_recycle) {
-            let _ = self.node_cache.push(NodePtr(node_to_recycle));
-        } else {
-            unsafe {
-                let layout = Layout::from_size_align(std::mem::size_of::<Node<T>>(), 128).unwrap();
-                std::alloc::dealloc(node_to_recycle as *mut u8, layout);
-                self.heap_frees.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+
+        let _ = self.node_cache.push(NodePtr(node));
     }
 }
 
@@ -287,199 +154,52 @@ impl<T: Send + 'static> SpscQueue<T> for DynListQueue<T> {
     type PopError = ();
 
     fn push(&self, item: T) -> Result<(), ()> {
-        let new_node = self.alloc_node(item);
+        let new_node = self.alloc_node(item).ok_or(())?;
 
-        fence(Ordering::SeqCst);
+        fence(Ordering::Release); // WMB from paper
 
-        let current_tail_ptr = self.tail.load(Ordering::SeqCst);
-
-        if current_tail_ptr.is_null() {
-            return Err(());
-        }
-
+        let current_tail = self.tail.load(Ordering::Acquire);
         unsafe {
-            (*current_tail_ptr).next.store(new_node, Ordering::SeqCst);
+            (*current_tail).next.store(new_node, Ordering::Release);
         }
 
-        fence(Ordering::SeqCst);
-
-        self.tail.store(new_node, Ordering::SeqCst);
-
+        self.tail.store(new_node, Ordering::Release);
         Ok(())
     }
 
     fn pop(&self) -> Result<T, ()> {
-        let current_dummy_ptr = self.head.load(Ordering::SeqCst);
+        let current_dummy = self.head.load(Ordering::Acquire);
+        let item_node = unsafe { (*current_dummy).next.load(Ordering::Acquire) };
 
-        if current_dummy_ptr.is_null() {
+        if item_node.is_null() {
             return Err(());
         }
 
-        fence(Ordering::SeqCst);
+        let value = unsafe { ptr::replace(&mut (*item_node).val, None).ok_or(())? };
 
-        let item_node_ptr = unsafe { (*current_dummy_ptr).next.load(Ordering::SeqCst) };
-
-        if item_node_ptr.is_null() {
-            return Err(());
-        }
-
-        let value = unsafe {
-            if item_node_ptr.is_null() {
-                return Err(());
-            }
-
-            if let Some(value) = ptr::replace(&mut (*item_node_ptr).val, None) {
-                value
-            } else {
-                return Err(());
-            }
-        };
-
-        fence(Ordering::SeqCst);
-
-        self.head.store(item_node_ptr, Ordering::SeqCst);
-
-        fence(Ordering::SeqCst);
-
-        self.recycle_node(current_dummy_ptr);
+        self.head.store(item_node, Ordering::Release);
+        self.recycle_node(current_dummy);
 
         Ok(value)
     }
 
-    #[inline]
     fn available(&self) -> bool {
-        true
+        // Check if cache has free nodes
+        !self.node_cache.empty()
     }
 
-    #[inline]
     fn empty(&self) -> bool {
-        let h = self.head.load(Ordering::SeqCst);
-
-        if h.is_null() {
-            return true;
-        }
-
-        unsafe { (*h).next.load(Ordering::SeqCst).is_null() }
+        let h = self.head.load(Ordering::Acquire);
+        unsafe { (*h).next.load(Ordering::Acquire).is_null() }
     }
 }
 
 impl<T: Send + 'static> Drop for DynListQueue<T> {
     fn drop(&mut self) {
-        // Pop all remaining items
+        // For shared memory, just drain items
         while let Ok(item) = SpscQueue::pop(self) {
             drop(item);
         }
-
-        unsafe {
-            if self.owns_all {
-                // Calculate pool bounds before we free anything
-                let pool_start = self.nodes_pool_ptr as usize;
-                let pool_end = if self.nodes_pool_ptr.is_null() {
-                    0
-                } else {
-                    self.nodes_pool_ptr.add(self.pool_capacity) as usize
-                };
-
-                // Helper closure to check if a node is in the pool
-                let is_in_pool = |node: *mut Node<T>| -> bool {
-                    if node.is_null() || self.nodes_pool_ptr.is_null() {
-                        return false;
-                    }
-                    let addr = node as usize;
-                    addr >= pool_start && addr < pool_end
-                };
-
-                // Collect all nodes that need to be freed
-                let mut heap_allocated_nodes = Vec::new();
-
-                // Drain the node cache
-                while let Ok(node_ptr) = self.node_cache.pop() {
-                    if !node_ptr.0.is_null()
-                        && !is_in_pool(node_ptr.0)
-                        && node_ptr.0 != self.base_ptr
-                    {
-                        heap_allocated_nodes.push(node_ptr.0);
-                    }
-                }
-
-                // Walk the linked list
-                let mut current = self.head.load(Ordering::Relaxed);
-                while !current.is_null() {
-                    let next = (*current).next.load(Ordering::Relaxed);
-
-                    if current != self.base_ptr && !is_in_pool(current) {
-                        heap_allocated_nodes.push(current);
-                    }
-
-                    current = next;
-                }
-
-                // Free heap-allocated nodes
-                for node in heap_allocated_nodes {
-                    let layout =
-                        Layout::from_size_align(std::mem::size_of::<Node<T>>(), 128).unwrap();
-                    std::alloc::dealloc(node as *mut u8, layout);
-                }
-
-                // Free the pool
-                if !self.nodes_pool_ptr.is_null() {
-                    let _ = Box::from_raw(std::slice::from_raw_parts_mut(
-                        self.nodes_pool_ptr,
-                        self.pool_capacity,
-                    ));
-                }
-
-                // Free the base dummy node
-                if !self.base_ptr.is_null() {
-                    let _ = Box::from_raw(self.base_ptr);
-                }
-            } else {
-                // For shared memory queues, need to free heap-allocated nodes
-                // but NOT pool nodes or the base dummy (they're in shared memory)
-
-                // Calculate pool bounds
-                let pool_start = self.nodes_pool_ptr as usize;
-                let pool_end = if self.nodes_pool_ptr.is_null() {
-                    0
-                } else {
-                    self.nodes_pool_ptr.add(self.pool_capacity) as usize
-                };
-
-                let is_in_pool = |node: *mut Node<T>| -> bool {
-                    if node.is_null() || self.nodes_pool_ptr.is_null() {
-                        return false;
-                    }
-                    let addr = node as usize;
-                    addr >= pool_start && addr < pool_end
-                };
-
-                // Free nodes from cache that were heap-allocated
-                while let Ok(node_ptr) = self.node_cache.pop() {
-                    if !node_ptr.0.is_null()
-                        && !is_in_pool(node_ptr.0)
-                        && node_ptr.0 != self.base_ptr
-                    {
-                        let layout =
-                            Layout::from_size_align(std::mem::size_of::<Node<T>>(), 128).unwrap();
-                        std::alloc::dealloc(node_ptr.0 as *mut u8, layout);
-                    }
-                }
-
-                // Walk the linked list and free heap-allocated nodes
-                let mut current = self.head.load(Ordering::Relaxed);
-                while !current.is_null() {
-                    let next = (*current).next.load(Ordering::Relaxed);
-
-                    // In shared memory, only free nodes that were heap-allocated
-                    if !is_in_pool(current) && current != self.base_ptr {
-                        let layout =
-                            Layout::from_size_align(std::mem::size_of::<Node<T>>(), 128).unwrap();
-                        std::alloc::dealloc(current as *mut u8, layout);
-                    }
-
-                    current = next;
-                }
-            }
-        }
+        // Nodes are in shared memory, don't free
     }
 }

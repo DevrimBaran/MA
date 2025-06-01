@@ -24,7 +24,7 @@ use queues::spsc::blq::K_CACHE_LINE_SLOTS as BLQ_K_SLOTS;
 use queues::spsc::llq::K_CACHE_LINE_SLOTS as LLQ_K_SLOTS;
 
 const PERFORMANCE_TEST: bool = false;
-const RING_CAP: usize = 8192;
+const RING_CAP: usize = 1024;
 const ITERS: usize = 1_000_000;
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 1_000_000_000;
 
@@ -234,9 +234,11 @@ fn bench_mp(c: &mut Criterion) {
 fn bench_dspsc(c: &mut Criterion) {
     c.bench_function("dSPSC", |b| {
         b.iter(|| {
-            let bytes = DynListQueue::<usize>::shared_size(RING_CAP);
+            // For dSPSC: need ITERS + 1 nodes for the benchmark
+            let nodes_needed = ITERS + 1; // +1 for dummy node
+            let bytes = DynListQueue::<usize>::shared_size(RING_CAP, nodes_needed);
             let shm_ptr = unsafe { map_shared(bytes) };
-            let q = unsafe { DynListQueue::init_in_shared(shm_ptr, RING_CAP) };
+            let q = unsafe { DynListQueue::init_in_shared(shm_ptr, RING_CAP, nodes_needed) };
 
             let dur = fork_and_run(q);
 
@@ -251,10 +253,16 @@ fn bench_dspsc(c: &mut Criterion) {
 fn bench_unbounded(c: &mut Criterion) {
     c.bench_function("uSPSC", |b| {
         b.iter(|| {
-            let size = UnboundedQueue::<usize>::shared_size(RING_CAP);
+            // For uSPSC: calculate how many segments we need
+            // Each segment holds RING_CAP items
+            let segments_needed = (ITERS + RING_CAP - 1) / RING_CAP + 2; // +2 for safety
+
+            let size = UnboundedQueue::<usize>::shared_size(RING_CAP, segments_needed);
             let shm_ptr = unsafe { map_shared(size) };
-            let q = unsafe { UnboundedQueue::init_in_shared(shm_ptr, RING_CAP) };
+            let q = unsafe { UnboundedQueue::init_in_shared(shm_ptr, RING_CAP, segments_needed) };
+
             let dur = fork_and_run(q);
+
             unsafe {
                 unmap_shared(shm_ptr, size);
             }

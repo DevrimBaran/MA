@@ -4,14 +4,14 @@ use nix::{
     sys::wait::waitpid,
     unistd::{fork, ForkResult},
 };
-use queues::mpmc::{KWQueue, WFQueue, YangCrummeyQueue};
+use queues::mpmc::{BurdenWFQueue, KWQueue, WFQueue, YangCrummeyQueue};
 use queues::MpmcQueue;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 const PERFORMANCE_TEST: bool = true;
-const ITEMS_PER_PROCESS_TARGET: usize = 200_000;
+const ITEMS_PER_PROCESS_TARGET: usize = 500_000;
 const PROCESS_COUNTS_TO_TEST: &[(usize, usize)] = &[(1, 1), (2, 2), (4, 4), (6, 6)];
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 100_000_000;
 
@@ -94,6 +94,24 @@ impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for WFQueue<T> {
 
     fn bench_is_full(&self) -> bool {
         self.is_full()
+    }
+}
+
+impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for BurdenWFQueue<T> {
+    fn bench_push(&self, item: T, process_id: usize) -> Result<(), ()> {
+        self.enqueue(process_id, item)
+    }
+
+    fn bench_pop(&self, process_id: usize) -> Result<T, ()> {
+        self.dequeue(process_id)
+    }
+
+    fn bench_is_empty(&self) -> bool {
+        self.is_empty()
+    }
+
+    fn bench_is_full(&self) -> bool {
+        false
     }
 }
 
@@ -505,6 +523,38 @@ fn bench_kw_queue(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_burden_wf_queue(c: &mut Criterion) {
+    let mut group = c.benchmark_group("BurdenMPMC");
+
+    for &(num_prods, num_cons) in PROCESS_COUNTS_TO_TEST {
+        let items_per_process = ITEMS_PER_PROCESS_TARGET;
+        let total_processes = num_prods + num_cons;
+
+        group.bench_function(
+            format!("{}P_{}C", num_prods, num_cons),
+            |b: &mut Bencher| {
+                b.iter_custom(|_iters| {
+                    fork_and_run_mpmc_with_helper::<BurdenWFQueue<usize>, _>(
+                        || {
+                            let bytes = BurdenWFQueue::<usize>::shared_size(total_processes);
+                            let shm_ptr = unsafe { map_shared(bytes) };
+                            let q =
+                                unsafe { BurdenWFQueue::init_in_shared(shm_ptr, total_processes) };
+                            (q, shm_ptr, bytes)
+                        },
+                        num_prods,
+                        num_cons,
+                        items_per_process,
+                        false, // needs_helper = false (no helper process needed)
+                    )
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(2))
@@ -515,7 +565,7 @@ fn custom_criterion() -> Criterion {
 criterion_group! {
     name = benches;
     config = custom_criterion();
-    targets = bench_wf_queue
+    targets = bench_burden_wf_queue
 }
 
 criterion_main!(benches);

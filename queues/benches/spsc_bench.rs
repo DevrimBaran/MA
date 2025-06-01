@@ -24,7 +24,7 @@ use queues::spsc::blq::K_CACHE_LINE_SLOTS as BLQ_K_SLOTS;
 use queues::spsc::llq::K_CACHE_LINE_SLOTS as LLQ_K_SLOTS;
 
 const PERFORMANCE_TEST: bool = false;
-const RING_CAP: usize = 16_384;
+const RING_CAP: usize = 8192;
 const ITERS: usize = 1_000_000;
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 1_000_000_000;
 

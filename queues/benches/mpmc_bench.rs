@@ -4,7 +4,7 @@ use nix::{
     sys::wait::waitpid,
     unistd::{fork, ForkResult},
 };
-use queues::mpmc::{KWQueue, YangCrummeyQueue};
+use queues::mpmc::{KWQueue, WFQueue, YangCrummeyQueue};
 use queues::MpmcQueue;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -12,7 +12,7 @@ use std::time::Duration;
 
 const PERFORMANCE_TEST: bool = true;
 const ITEMS_PER_PROCESS_TARGET: usize = 200_000;
-const PROCESS_COUNTS_TO_TEST: &[(usize, usize)] = &[(1, 1), (2, 2), (4, 4), (7, 7)];
+const PROCESS_COUNTS_TO_TEST: &[(usize, usize)] = &[(1, 1), (2, 2), (4, 4), (6, 6)];
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 100_000_000;
 
 trait BenchMpmcQueue<T: Send + Clone>: Send + Sync + 'static {
@@ -79,6 +79,24 @@ impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for KWQueue<T> {
     }
 }
 
+impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for WFQueue<T> {
+    fn bench_push(&self, item: T, process_id: usize) -> Result<(), ()> {
+        self.enqueue(process_id, item)
+    }
+
+    fn bench_pop(&self, process_id: usize) -> Result<T, ()> {
+        self.dequeue(process_id)
+    }
+
+    fn bench_is_empty(&self) -> bool {
+        self.is_empty()
+    }
+
+    fn bench_is_full(&self) -> bool {
+        self.is_full()
+    }
+}
+
 #[repr(C)]
 struct MpmcStartupSync {
     producers_ready: AtomicU32,
@@ -133,11 +151,12 @@ impl MpmcDoneSync {
     }
 }
 
-fn fork_and_run_mpmc<Q, F>(
+fn fork_and_run_mpmc_with_helper<Q, F>(
     queue_init_fn: F,
     num_producers: usize,
     num_consumers: usize,
     items_per_process: usize,
+    needs_helper: bool,
 ) -> Duration
 where
     Q: BenchMpmcQueue<usize> + 'static,
@@ -148,6 +167,7 @@ where
     }
 
     let total_items = num_producers * items_per_process;
+    let total_processes = num_producers + num_consumers;
 
     let (q, q_shm_ptr, q_shm_size) = queue_init_fn();
 
@@ -161,7 +181,55 @@ where
 
     let mut producer_pids = Vec::with_capacity(num_producers);
     let mut consumer_pids = Vec::with_capacity(num_consumers);
+    let mut helper_pid = None;
 
+    // Fork helper process if needed - counts as a participant in startup sync
+    if needs_helper {
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                // Helper process - pin to last core
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    use libc::{cpu_set_t, sched_setaffinity, CPU_SET, CPU_ZERO};
+                    let mut set = std::mem::zeroed::<cpu_set_t>();
+                    CPU_ZERO(&mut set);
+                    CPU_SET(total_processes, &mut set); // Use core after all workers
+                    sched_setaffinity(0, std::mem::size_of::<cpu_set_t>(), &set);
+                }
+
+                // Signal helper is ready
+                startup_sync.producers_ready.fetch_add(1, Ordering::AcqRel);
+
+                // Wait for go signal like other processes
+                while !startup_sync.go_signal.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+
+                // Run helper loop
+                unsafe {
+                    let wf_queue = &*(q as *const _ as *const WFQueue<usize>);
+                    wf_queue.run_helper();
+                }
+
+                unsafe { libc::_exit(0) };
+            }
+            Ok(ForkResult::Parent { child }) => {
+                helper_pid = Some(child);
+            }
+            Err(e) => {
+                unsafe {
+                    if !q_shm_ptr.is_null() {
+                        unmap_shared(q_shm_ptr, q_shm_size);
+                    }
+                    unmap_shared(startup_sync_shm_ptr, startup_sync_size);
+                    unmap_shared(done_sync_shm_ptr, done_sync_size);
+                }
+                panic!("Fork failed for helper: {}", e);
+            }
+        }
+    }
+
+    // Fork producers
     for producer_id in 0..num_producers {
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
@@ -170,6 +238,7 @@ where
                 while !startup_sync.go_signal.load(Ordering::Acquire) {
                     std::hint::spin_loop();
                 }
+
                 let mut push_attempts = 0;
                 for i in 0..items_per_process {
                     let item_value = producer_id * items_per_process + i;
@@ -204,6 +273,7 @@ where
         }
     }
 
+    // Fork consumers
     for consumer_id in 0..num_consumers {
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
@@ -290,15 +360,24 @@ where
         }
     }
 
-    while startup_sync.producers_ready.load(Ordering::Acquire) < num_producers as u32
+    // Wait for all workers AND helper to be ready
+    let expected_producers = if needs_helper {
+        num_producers as u32 + 1 // +1 for helper counted as producer
+    } else {
+        num_producers as u32
+    };
+
+    while startup_sync.producers_ready.load(Ordering::Acquire) < expected_producers
         || startup_sync.consumers_ready.load(Ordering::Acquire) < num_consumers as u32
     {
         std::hint::spin_loop();
     }
 
+    // START TIMING HERE - all processes are ready
     let start_time = std::time::Instant::now();
     startup_sync.go_signal.store(true, Ordering::Release);
 
+    // Wait for producers and consumers
     for pid in producer_pids {
         waitpid(pid, None).expect("waitpid for producer failed");
     }
@@ -308,6 +387,15 @@ where
     }
 
     let duration = start_time.elapsed();
+
+    // Wait for helper if it exists
+    if let Some(helper_pid) = helper_pid {
+        unsafe {
+            let wf_queue = &*(q as *const _ as *const WFQueue<usize>);
+            wf_queue.stop_helper();
+        }
+        waitpid(helper_pid, None).expect("waitpid for helper failed");
+    }
 
     unsafe {
         if !q_shm_ptr.is_null() {
@@ -320,6 +408,39 @@ where
     duration
 }
 
+// Add benchmark function
+fn bench_wf_queue(c: &mut Criterion) {
+    let mut group = c.benchmark_group("VermaMPMC");
+
+    for &(num_prods, num_cons) in PROCESS_COUNTS_TO_TEST {
+        let items_per_process = ITEMS_PER_PROCESS_TARGET;
+        let total_processes = num_prods + num_cons;
+
+        group.bench_function(
+            format!("{}P_{}C", num_prods, num_cons),
+            |b: &mut Bencher| {
+                b.iter_custom(|_iters| {
+                    fork_and_run_mpmc_with_helper::<WFQueue<usize>, _>(
+                        || {
+                            let bytes = WFQueue::<usize>::shared_size(total_processes);
+                            let shm_ptr = unsafe { map_shared(bytes) };
+                            let q = unsafe { WFQueue::init_in_shared(shm_ptr, total_processes) };
+                            (q, shm_ptr, bytes)
+                        },
+                        num_prods,
+                        num_cons,
+                        items_per_process,
+                        true, // needs_helper = true
+                    )
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
+// Update the other benchmarks to use the new function
 fn bench_yang_crummey(c: &mut Criterion) {
     let mut group = c.benchmark_group("YangCrummeyMPMC");
 
@@ -331,7 +452,7 @@ fn bench_yang_crummey(c: &mut Criterion) {
             format!("{}P_{}C", num_prods, num_cons),
             |b: &mut Bencher| {
                 b.iter_custom(|_iters| {
-                    fork_and_run_mpmc::<YangCrummeyQueue<usize>, _>(
+                    fork_and_run_mpmc_with_helper::<YangCrummeyQueue<usize>, _>(
                         || {
                             let bytes = YangCrummeyQueue::<usize>::shared_size(total_processes);
                             let shm_ptr = unsafe { map_shared(bytes) };
@@ -343,6 +464,7 @@ fn bench_yang_crummey(c: &mut Criterion) {
                         num_prods,
                         num_cons,
                         items_per_process,
+                        false, // needs_helper = false
                     )
                 })
             },
@@ -363,7 +485,7 @@ fn bench_kw_queue(c: &mut Criterion) {
             format!("{}P_{}C", num_prods, num_cons),
             |b: &mut Bencher| {
                 b.iter_custom(|_iters| {
-                    fork_and_run_mpmc::<KWQueue<usize>, _>(
+                    fork_and_run_mpmc_with_helper::<KWQueue<usize>, _>(
                         || {
                             let bytes = KWQueue::<usize>::shared_size(total_processes);
                             let shm_ptr = unsafe { map_shared(bytes) };
@@ -373,6 +495,7 @@ fn bench_kw_queue(c: &mut Criterion) {
                         num_prods,
                         num_cons,
                         items_per_process,
+                        false, // needs_helper = false
                     )
                 })
             },
@@ -392,7 +515,7 @@ fn custom_criterion() -> Criterion {
 criterion_group! {
     name = benches;
     config = custom_criterion();
-    targets = bench_yang_crummey, bench_kw_queue
+    targets = bench_wf_queue
 }
 
 criterion_main!(benches);

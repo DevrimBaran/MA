@@ -22,6 +22,7 @@ pub use mpsc::JayantiPetrovicMpscQueue;
 pub use mpsc::JiffyQueue;
 
 pub use mpmc::KWQueue;
+pub use mpmc::WFQueue;
 pub use mpmc::YangCrummeyQueue;
 
 // Common interface for all spsc queues.

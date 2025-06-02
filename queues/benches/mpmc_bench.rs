@@ -4,6 +4,7 @@ use nix::{
     sys::wait::waitpid,
     unistd::{fork, ForkResult},
 };
+use queues::mpmc;
 use queues::mpmc::{BurdenWFQueue, KWQueue, NRQueue, WFQueue, YangCrummeyQueue};
 use queues::MpmcQueue;
 use std::ptr;
@@ -320,6 +321,7 @@ where
                 }
 
                 let mut consumed_count = 0;
+                let mut null_dequeues = 0; // Add this counter
                 let target_items = total_items / num_consumers;
                 let extra_items = if consumer_id < (total_items % num_consumers) {
                     1
@@ -328,42 +330,33 @@ where
                 };
                 let my_target = target_items + extra_items;
 
+                let mut consecutive_empty_checks = 0;
+                const MAX_CONSECUTIVE_EMPTY_CHECKS: usize = 10000;
+
                 while consumed_count < my_target {
-                    let mut pop_attempts = 0;
                     match q.bench_pop(num_producers + consumer_id) {
                         Ok(_item) => {
                             consumed_count += 1;
-                            pop_attempts = 0; // Reset attempts on successful pop
+                            consecutive_empty_checks = 0;
                         }
                         Err(_) => {
-                            pop_attempts += 1;
-                            if pop_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS
-                                && !(done_sync.producers_done.load(Ordering::Acquire)
-                                    == num_producers as u32)
-                            {
-                                panic!(
-                                    "Consumer {} exceeded max spin retry attempts for pop",
-                                    consumer_id
-                                );
-                            }
+                            // Only count it as truly empty if all producers are done
+                            // AND we've waited a reasonable time for propagation
                             if done_sync.producers_done.load(Ordering::Acquire)
                                 == num_producers as u32
                             {
-                                let mut retries = 0;
-                                while retries < 1000 && consumed_count < my_target {
-                                    if q.bench_pop(num_producers + consumer_id).is_ok() {
-                                        consumed_count += 1;
-                                    } else {
-                                        retries += 1;
-                                        std::thread::yield_now();
-                                    }
-                                }
+                                consecutive_empty_checks += 1;
 
-                                if consumed_count < my_target && q.bench_is_empty() {
+                                // Give more time for propagation
+                                if consecutive_empty_checks < 100 {
+                                    std::thread::sleep(std::time::Duration::from_micros(1));
+                                } else if consecutive_empty_checks > MAX_CONSECUTIVE_EMPTY_CHECKS {
                                     break;
                                 }
-                            } else {
-                                std::thread::yield_now();
+                            }
+                            // Don't yield immediately - spin a bit first
+                            for _ in 0..100 {
+                                std::hint::spin_loop();
                             }
                         }
                     }
@@ -371,10 +364,10 @@ where
 
                 done_sync.consumers_done.fetch_add(1, Ordering::AcqRel);
 
-                if !PERFORMANCE_TEST && consumed_count != my_target {
+                if !PERFORMANCE_TEST {
                     eprintln!(
-                        "Warning: Consumer {} consumed {}/{} items",
-                        consumer_id, consumed_count, my_target
+                        "Consumer {} consumed {}/{} items, {} null dequeues",
+                        consumer_id, consumed_count, my_target, null_dequeues
                     );
                 }
 
@@ -431,6 +424,17 @@ where
             wf_queue.stop_helper();
         }
         waitpid(helper_pid, None).expect("waitpid for helper failed");
+    }
+
+    if std::any::type_name::<Q>().contains("NRQueue") {
+        // Call the static debug function
+        NRQueue::<usize>::debug_stats_static();
+
+        // Also call instance method for more info
+        unsafe {
+            let nr_queue = &*(q as *const _ as *const NRQueue<usize>);
+            nr_queue.debug_stats();
+        }
     }
 
     unsafe {

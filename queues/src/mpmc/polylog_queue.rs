@@ -11,8 +11,10 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use crate::MpmcQueue;
 
 const CACHE_LINE_SIZE: usize = 64;
-// Large enough to avoid running out in benchmarks
-const MAX_BLOCKS: usize = 50_000_000;
+const MAX_BLOCKS: usize = 6_000_000;
+
+pub static TOTAL_ENQUEUES: AtomicUsize = AtomicUsize::new(0);
+pub static TOTAL_DEQUEUES: AtomicUsize = AtomicUsize::new(0);
 
 // Block structure - represents a batch of operations
 #[repr(C)]
@@ -146,6 +148,9 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
             // Get block
             let block = leaf.get_block(h);
 
+            // Store whether this is an enqueue BEFORE moving the element
+            let is_enqueue = element.is_some();
+
             // Set element
             *block.element.get() = element;
 
@@ -155,7 +160,7 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 let prev_sumenq = prev_block.sumenq.load(Ordering::Acquire);
                 let prev_sumdeq = prev_block.sumdeq.load(Ordering::Acquire);
 
-                if element.is_some() {
+                if is_enqueue {
                     block.sumenq.store(prev_sumenq + 1, Ordering::Release);
                     block.sumdeq.store(prev_sumdeq, Ordering::Release);
                 } else {
@@ -164,7 +169,7 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 }
             } else {
                 // First block after sentinel
-                if element.is_some() {
+                if is_enqueue {
                     block.sumenq.store(1, Ordering::Release);
                     block.sumdeq.store(0, Ordering::Release);
                 } else {
@@ -202,28 +207,24 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
         unsafe {
             let h = node.head.load(Ordering::Acquire);
 
-            if h >= MAX_BLOCKS {
-                return false; // No space
-            }
-
-            // Help advance children if needed
+            // Lines 26-31: Help advance children
             if !node.left.is_null() {
                 let left = &*node.left;
-                let left_head = left.head.load(Ordering::Acquire);
-                if left_head > 0 {
-                    self.advance(left, left_head - 1);
+                let hdir = left.head.load(Ordering::Acquire);
+                if hdir > 0 && h < MAX_BLOCKS {
+                    self.advance(left, hdir - 1);
                 }
             }
 
             if !node.right.is_null() {
                 let right = &*node.right;
-                let right_head = right.head.load(Ordering::Acquire);
-                if right_head > 0 {
-                    self.advance(right, right_head - 1);
+                let hdir = right.head.load(Ordering::Acquire);
+                if hdir > 0 && h < MAX_BLOCKS {
+                    self.advance(right, hdir - 1);
                 }
             }
 
-            // Create new block
+            // Line 32: Create block
             let new_block = self.create_block(node, h);
             if new_block.is_none() {
                 return true; // No operations to propagate
@@ -231,42 +232,52 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
 
             let (numenq, numdeq, endleft, endright, size) = new_block.unwrap();
 
-            // Get block
-            let block = node.get_block(h);
+            // Line 35: The paper's CAS(v.blocks[h], null, new) is simulated by
+            // the CAS on v.head from h to h+1. Only one thread can succeed.
+            let cas_result =
+                node.head
+                    .compare_exchange(h, h + 1, Ordering::AcqRel, Ordering::Acquire);
 
-            // Try to install block with CAS on head
-            let current_head = node.head.load(Ordering::Acquire);
-            if current_head != h {
+            if cas_result.is_ok() {
+                // We won the CAS, so we get to install the block
+                let block = node.get_block(h);
+
+                // Compute cumulative sums
+                let (sumenq, sumdeq) = if h > 0 {
+                    let prev = node.get_block(h - 1);
+                    (
+                        prev.sumenq.load(Ordering::Acquire) + numenq,
+                        prev.sumdeq.load(Ordering::Acquire) + numdeq,
+                    )
+                } else {
+                    (numenq, numdeq)
+                };
+
+                // Install block data
+                block.sumenq.store(sumenq, Ordering::Release);
+                block.sumdeq.store(sumdeq, Ordering::Release);
+                block.endleft.store(endleft, Ordering::Release);
+                block.endright.store(endright, Ordering::Release);
+
+                if node.is_root {
+                    block.size.store(size, Ordering::Release);
+                }
+            }
+
+            // Line 36: Always call advance (but don't try to advance head again)
+            if cas_result.is_err() {
                 self.advance(node, h);
-                return false;
-            }
-
-            // Set block fields
-            if h > 0 {
-                let prev = node.get_block(h - 1);
-                block.sumenq.store(
-                    prev.sumenq.load(Ordering::Acquire) + numenq,
-                    Ordering::Release,
-                );
-                block.sumdeq.store(
-                    prev.sumdeq.load(Ordering::Acquire) + numdeq,
-                    Ordering::Release,
-                );
             } else {
-                block.sumenq.store(numenq, Ordering::Release);
-                block.sumdeq.store(numdeq, Ordering::Release);
+                // Just set super field
+                if !node.is_root && !node.parent.is_null() {
+                    let block = node.get_block(h);
+                    let parent = &*node.parent;
+                    let parent_head = parent.head.load(Ordering::Acquire);
+                    block.super_idx.store(parent_head, Ordering::Release);
+                }
             }
 
-            block.endleft.store(endleft, Ordering::Release);
-            block.endright.store(endright, Ordering::Release);
-
-            if node.is_root {
-                block.size.store(size, Ordering::Release);
-            }
-
-            // Advance head
-            self.advance(node, h);
-            true
+            cas_result.is_ok()
         }
     }
 
@@ -277,75 +288,88 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
         h: usize,
     ) -> Option<(usize, usize, usize, usize, usize)> {
         unsafe {
-            let mut endleft = 0;
-            let mut endright = 0;
+            // Get previous block's ends with default of 0
+            let (prev_endleft, prev_endright) = if h > 0 {
+                let prev = node.get_block(h - 1);
+                (
+                    prev.endleft.load(Ordering::Acquire),
+                    prev.endright.load(Ordering::Acquire),
+                )
+            } else {
+                (0, 0)
+            };
+
             let mut numenq = 0;
             let mut numdeq = 0;
+            let mut endleft = prev_endleft;
+            let mut endright = prev_endright;
 
-            // Get previous block's ends
-            let prev_endleft = if h > 0 {
-                let prev = node.get_block(h - 1);
-                prev.endleft.load(Ordering::Acquire)
-            } else {
-                0
-            };
-
-            let prev_endright = if h > 0 {
-                let prev = node.get_block(h - 1);
-                prev.endright.load(Ordering::Acquire)
-            } else {
-                0
-            };
-
-            // Get current heads and count operations
+            // Process left child
             if !node.left.is_null() {
                 let left = &*node.left;
-                endleft = left.head.load(Ordering::Acquire).saturating_sub(1);
+                let left_head = left.head.load(Ordering::Acquire);
 
-                // Count operations from left child
-                if endleft > prev_endleft {
-                    for i in (prev_endleft + 1)..=endleft {
-                        let block = left.get_block(i);
-                        let sumenq = block.sumenq.load(Ordering::Acquire);
-                        let sumdeq = block.sumdeq.load(Ordering::Acquire);
-                        let prev_sumenq = if i > 0 {
-                            left.get_block(i - 1).sumenq.load(Ordering::Acquire)
+                // We want blocks [prev_endleft+1 .. left_head-1]
+                if left_head > 0 {
+                    endleft = left_head - 1;
+
+                    // Only count if we have new blocks
+                    if endleft > prev_endleft {
+                        let left_block = left.get_block(endleft);
+                        let left_sumenq = left_block.sumenq.load(Ordering::Acquire);
+                        let left_sumdeq = left_block.sumdeq.load(Ordering::Acquire);
+
+                        let prev_left_sumenq = if prev_endleft > 0 {
+                            left.get_block(prev_endleft).sumenq.load(Ordering::Acquire)
                         } else {
                             0
                         };
-                        let prev_sumdeq = if i > 0 {
-                            left.get_block(i - 1).sumdeq.load(Ordering::Acquire)
+                        let prev_left_sumdeq = if prev_endleft > 0 {
+                            left.get_block(prev_endleft).sumdeq.load(Ordering::Acquire)
                         } else {
                             0
                         };
-                        numenq += sumenq - prev_sumenq;
-                        numdeq += sumdeq - prev_sumdeq;
+
+                        numenq += left_sumenq - prev_left_sumenq;
+                        numdeq += left_sumdeq - prev_left_sumdeq;
                     }
                 }
             }
 
+            // Process right child
             if !node.right.is_null() {
                 let right = &*node.right;
-                endright = right.head.load(Ordering::Acquire).saturating_sub(1);
+                let right_head = right.head.load(Ordering::Acquire);
 
-                // Count operations from right child
-                if endright > prev_endright {
-                    for i in (prev_endright + 1)..=endright {
-                        let block = right.get_block(i);
-                        let sumenq = block.sumenq.load(Ordering::Acquire);
-                        let sumdeq = block.sumdeq.load(Ordering::Acquire);
-                        let prev_sumenq = if i > 0 {
-                            right.get_block(i - 1).sumenq.load(Ordering::Acquire)
+                // We want blocks [prev_endright+1 .. right_head-1]
+                if right_head > 0 {
+                    endright = right_head - 1;
+
+                    // Only count if we have new blocks
+                    if endright > prev_endright {
+                        let right_block = right.get_block(endright);
+                        let right_sumenq = right_block.sumenq.load(Ordering::Acquire);
+                        let right_sumdeq = right_block.sumdeq.load(Ordering::Acquire);
+
+                        let prev_right_sumenq = if prev_endright > 0 {
+                            right
+                                .get_block(prev_endright)
+                                .sumenq
+                                .load(Ordering::Acquire)
                         } else {
                             0
                         };
-                        let prev_sumdeq = if i > 0 {
-                            right.get_block(i - 1).sumdeq.load(Ordering::Acquire)
+                        let prev_right_sumdeq = if prev_endright > 0 {
+                            right
+                                .get_block(prev_endright)
+                                .sumdeq
+                                .load(Ordering::Acquire)
                         } else {
                             0
                         };
-                        numenq += sumenq - prev_sumenq;
-                        numdeq += sumdeq - prev_sumdeq;
+
+                        numenq += right_sumenq - prev_right_sumenq;
+                        numdeq += right_sumdeq - prev_right_sumdeq;
                     }
                 }
             }
@@ -373,19 +397,23 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
     // Advance head and set super field
     fn advance(&self, node: &Node<T>, h: usize) {
         unsafe {
-            // Set super field if not root
+            if h >= MAX_BLOCKS {
+                return;
+            }
+
+            // Set super field if not already set
             if !node.is_root && !node.parent.is_null() {
+                let block = node.get_block(h);
                 let parent = &*node.parent;
                 let parent_head = parent.head.load(Ordering::Acquire);
 
-                let block = node.get_block(h);
                 block
                     .super_idx
                     .compare_exchange(0, parent_head, Ordering::AcqRel, Ordering::Acquire)
                     .ok();
             }
 
-            // Try to advance head
+            // Try to advance head if not already advanced
             node.head
                 .compare_exchange(h, h + 1, Ordering::AcqRel, Ordering::Acquire)
                 .ok();
@@ -502,7 +530,18 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
     fn find_response(&self, root_block_idx: usize, deq_rank: usize) -> Result<T, ()> {
         unsafe {
             let root_node = &*self.root;
+
+            // Validate block index
+            if root_block_idx >= root_node.head.load(Ordering::Acquire) {
+                return Err(()); // Block not yet installed
+            }
+
             let block = root_node.get_block(root_block_idx);
+
+            // Make sure block is initialized
+            if block.sumenq.load(Ordering::Acquire) == 0 && root_block_idx > 0 {
+                return Err(()); // Block not initialized
+            }
             let prev_block = if root_block_idx > 0 {
                 Some(root_node.get_block(root_block_idx - 1))
             } else {
@@ -816,12 +855,58 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
         (total + 4095) & !4095 // Page align
     }
 
+    pub fn count_root_operations(&self) -> (usize, usize) {
+        unsafe {
+            let root_node = &*self.root;
+            let head = root_node.head.load(Ordering::Acquire);
+
+            if head == 0 {
+                return (0, 0);
+            }
+
+            let last_block = root_node.get_block(head - 1);
+            let enqs = last_block.sumenq.load(Ordering::Acquire);
+            let deqs = last_block.sumdeq.load(Ordering::Acquire);
+
+            (enqs, deqs)
+        }
+    }
+
+    pub fn debug_stats_static() {
+        let enqs = TOTAL_ENQUEUES.load(Ordering::Relaxed);
+        let deqs = TOTAL_DEQUEUES.load(Ordering::Relaxed);
+        eprintln!(
+            "Total enqueues: {}, Total dequeues attempted: {}",
+            enqs, deqs
+        );
+    }
+
+    pub fn debug_stats(&self) {
+        let enqs = TOTAL_ENQUEUES.load(Ordering::Relaxed);
+        let deqs = TOTAL_DEQUEUES.load(Ordering::Relaxed);
+        let (root_enqs, root_deqs) = self.count_root_operations();
+
+        eprintln!(
+            "Total enqueues called: {}, Total dequeues called: {}",
+            enqs, deqs
+        );
+        eprintln!(
+            "Root contains: {} enqueues, {} dequeues",
+            root_enqs, root_deqs
+        );
+
+        if enqs > root_enqs {
+            eprintln!("WARNING: {} enqueues lost!", enqs - root_enqs);
+        }
+    }
+
     // Enqueue operation
     pub fn enqueue(&self, thread_id: usize, item: T) -> Result<(), ()> {
         if thread_id >= self.num_processes {
             return Err(());
         }
 
+        TOTAL_ENQUEUES.fetch_add(1, Ordering::Relaxed);
         self.append(thread_id, Some(item));
         Ok(())
     }
@@ -831,6 +916,8 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
         if thread_id >= self.num_processes {
             return Err(());
         }
+
+        TOTAL_DEQUEUES.fetch_add(1, Ordering::Relaxed);
 
         // Append dequeue operation
         self.append(thread_id, None);

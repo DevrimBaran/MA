@@ -46,7 +46,7 @@ pub struct BurdenWFQueue<T: Send + 'static> {
 unsafe impl<T: Send> Send for BurdenWFQueue<T> {}
 unsafe impl<T: Send> Sync for BurdenWFQueue<T> {}
 
-// NOTE: This is a simulation of memory-to-memory swap
+// This is a simulation of memory-to-memory swap
 // Real implementation would require hardware support or more complex synchronization
 // For benchmarking purposes, we use a simplified version that may not be truly atomic
 unsafe fn atomic_swap<T>(a: &AtomicPtr<T>, b: &AtomicPtr<T>) {

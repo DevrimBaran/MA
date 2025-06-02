@@ -23,6 +23,7 @@ pub use mpsc::JiffyQueue;
 
 pub use mpmc::BurdenWFQueue;
 pub use mpmc::KWQueue;
+pub use mpmc::NRQueue;
 pub use mpmc::WFQueue;
 pub use mpmc::YangCrummeyQueue;
 

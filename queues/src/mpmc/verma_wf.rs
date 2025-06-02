@@ -5,7 +5,7 @@
 use std::cell::UnsafeCell;
 use std::mem;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::MpmcQueue;
 

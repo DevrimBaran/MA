@@ -1,4 +1,4 @@
-// queues/src/mpmc/nr_queue.rs
+// queues/src/mpmc/polylog_queue.rs
 // Wait-Free MPMC Queue based on "A Wait-free Queue with Polylogarithmic Step Complexity"
 // by Hossein Naderibeni and Eric Ruppert (PODC 2023)
 
@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use crate::MpmcQueue;
 
 const CACHE_LINE_SIZE: usize = 64;
-const BLOCKS_PER_NODE: usize = 10000; // Pre-allocated blocks per node
+// With GC, we can use a smaller pool since we'll be cleaning up old blocks
+const BLOCKS_PER_NODE: usize = 2_000_000; // Reduced from 600,000
+const GC_FREQUENCY: usize = 250_000; // Run GC every N operations (p^2 as suggested in paper)
 
 // Block structure - represents a batch of operations
 #[repr(C)]
@@ -29,6 +31,9 @@ struct Block<T> {
 
     // For root blocks
     size: AtomicUsize, // Queue size after this block's operations
+
+    // For GC - track if this block can be discarded
+    finished: AtomicBool, // True if all operations in this block are complete
 }
 
 impl<T> Block<T> {
@@ -41,6 +46,7 @@ impl<T> Block<T> {
             endright: AtomicUsize::new(0),
             element: UnsafeCell::new(None),
             size: AtomicUsize::new(0),
+            finished: AtomicBool::new(false),
         }
     }
 }
@@ -49,6 +55,7 @@ impl<T> Block<T> {
 #[repr(C)]
 struct Node<T> {
     head: AtomicUsize, // Next position to append
+    tail: AtomicUsize, // First unfinished block (for GC)
 
     // Tree pointers (set during initialization)
     left: *const Node<T>,
@@ -58,6 +65,9 @@ struct Node<T> {
     is_leaf: bool,
     is_root: bool,
     process_id: usize, // For leaves only
+
+    // GC tracking
+    last_gc_op: AtomicUsize, // Operation count at last GC
 
     // Blocks array follows immediately after this struct in memory
     _phantom: std::marker::PhantomData<T>,
@@ -70,12 +80,14 @@ impl<T> Node<T> {
     fn new() -> Self {
         Self {
             head: AtomicUsize::new(1), // Start at 1, blocks[0] is empty sentinel
+            tail: AtomicUsize::new(1), // Start at 1
             left: ptr::null(),
             right: ptr::null(),
             parent: ptr::null(),
             is_leaf: false,
             is_root: false,
             process_id: usize::MAX,
+            last_gc_op: AtomicUsize::new(0),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -93,7 +105,27 @@ impl<T> Node<T> {
             return None;
         }
         let blocks = self.get_blocks_ptr();
-        Some(&*blocks.add(index))
+        Some(&*blocks.add(index % BLOCKS_PER_NODE)) // Wrap around for circular buffer
+    }
+
+    // Get effective index in circular buffer
+    fn effective_index(&self, logical_index: usize) -> usize {
+        logical_index % BLOCKS_PER_NODE
+    }
+}
+
+// Track finished operations globally
+#[repr(C)]
+struct FinishedTracker {
+    // For each process, track the last finished dequeue in root
+    last_finished_dequeue: [AtomicUsize; 64], // Support up to 64 processes
+}
+
+impl FinishedTracker {
+    fn new() -> Self {
+        Self {
+            last_finished_dequeue: unsafe { mem::zeroed() },
+        }
     }
 }
 
@@ -112,6 +144,12 @@ pub struct NRQueue<T: Send + Clone + 'static> {
 
     // Shared state
     initialized: AtomicBool,
+
+    // Global counters
+    total_operations: AtomicUsize,
+
+    // GC tracking
+    finished_tracker: *mut FinishedTracker,
 
     _phantom: std::marker::PhantomData<T>,
 }
@@ -134,19 +172,80 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
         &*self.get_node_ptr(index)
     }
 
+    // Run garbage collection on a node
+    fn garbage_collect(&self, node: &Node<T>) {
+        unsafe {
+            if node.is_root {
+                // For root, check which blocks have all operations completed
+                let tracker = &*self.finished_tracker;
+                let mut min_unfinished = usize::MAX;
+
+                // Find the earliest unfinished operation across all processes
+                for i in 0..self.num_processes {
+                    let last_finished = tracker.last_finished_dequeue[i].load(Ordering::Acquire);
+                    if last_finished < min_unfinished {
+                        min_unfinished = last_finished;
+                    }
+                }
+
+                // All blocks before min_unfinished can be marked as finished
+                let current_tail = node.tail.load(Ordering::Acquire);
+                let current_head = node.head.load(Ordering::Acquire);
+
+                // Don't GC if we don't have many blocks
+                if current_head - current_tail < BLOCKS_PER_NODE / 2 {
+                    return;
+                }
+
+                // Mark blocks as finished up to min_unfinished
+                for idx in current_tail..min_unfinished.min(current_head) {
+                    if let Some(block) = node.get_block(idx) {
+                        block.finished.store(true, Ordering::Release);
+                    }
+                }
+
+                // Advance tail to skip finished blocks
+                node.tail
+                    .store(min_unfinished.min(current_head), Ordering::Release);
+            }
+        }
+    }
+
+    // Check if GC should run
+    fn maybe_run_gc(&self, node: &Node<T>) {
+        let current_ops = self.total_operations.load(Ordering::Acquire);
+        let last_gc = node.last_gc_op.load(Ordering::Acquire);
+
+        if current_ops - last_gc >= GC_FREQUENCY {
+            if node
+                .last_gc_op
+                .compare_exchange(last_gc, current_ops, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.garbage_collect(node);
+            }
+        }
+    }
+
     // Append operation to leaf
     fn append(&self, process_id: usize, element: Option<T>) {
         unsafe {
             let leaf = self.get_leaf(process_id);
             let h = leaf.head.load(Ordering::Acquire);
+            let tail = leaf.tail.load(Ordering::Acquire);
 
-            if h >= BLOCKS_PER_NODE {
-                panic!("Block pool exhausted for process {}", process_id);
+            // Check if we have space (accounting for circular buffer)
+            if h - tail >= BLOCKS_PER_NODE - 1 {
+                panic!(
+                    "Block pool exhausted for process {}. Head: {}, Tail: {}, Capacity: {}",
+                    process_id, h, tail, BLOCKS_PER_NODE
+                );
             }
 
-            // Get block
+            // Get block using circular indexing
             let blocks = leaf.get_blocks_ptr();
-            let block = &*blocks.add(h);
+            let block_idx = leaf.effective_index(h);
+            let block = &*blocks.add(block_idx);
 
             // Check if this is an enqueue or dequeue before moving element
             let is_enqueue = element.is_some();
@@ -156,7 +255,8 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
 
             // Update sums based on previous block
             if h > 0 {
-                let prev_block = &*blocks.add(h - 1);
+                let prev_idx = leaf.effective_index(h - 1);
+                let prev_block = &*blocks.add(prev_idx);
                 let prev_sumenq = prev_block.sumenq.load(Ordering::Acquire);
                 let prev_sumdeq = prev_block.sumdeq.load(Ordering::Acquire);
 
@@ -178,8 +278,14 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 }
             }
 
+            // Mark block as not finished
+            block.finished.store(false, Ordering::Release);
+
             // Increment head
             leaf.head.fetch_add(1, Ordering::AcqRel);
+
+            // Increment global operation counter
+            self.total_operations.fetch_add(1, Ordering::Relaxed);
 
             // Propagate to root
             if !leaf.parent.is_null() {
@@ -190,6 +296,9 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
 
     // Propagate operations from children to parent
     fn propagate(&self, node: &Node<T>) {
+        // Check if GC should run
+        self.maybe_run_gc(node);
+
         // Double refresh as per paper
         if !self.refresh(node) {
             self.refresh(node);
@@ -206,16 +315,23 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
     fn refresh(&self, node: &Node<T>) -> bool {
         unsafe {
             let h = node.head.load(Ordering::Acquire);
+            let tail = node.tail.load(Ordering::Acquire);
 
-            if h >= BLOCKS_PER_NODE {
-                return false; // Node's block pool exhausted
+            // Check if we have space
+            if h - tail >= BLOCKS_PER_NODE - 1 {
+                // Try GC first
+                self.garbage_collect(node);
+                let new_tail = node.tail.load(Ordering::Acquire);
+                if h - new_tail >= BLOCKS_PER_NODE - 1 {
+                    return false; // Still no space
+                }
             }
 
             // Help advance children if needed
             if !node.left.is_null() {
                 let left = &*node.left;
                 let left_head = left.head.load(Ordering::Acquire);
-                if left_head > 0 && left_head <= BLOCKS_PER_NODE {
+                if left_head > 0 {
                     self.advance(left, left_head - 1);
                 }
             }
@@ -223,7 +339,7 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
             if !node.right.is_null() {
                 let right = &*node.right;
                 let right_head = right.head.load(Ordering::Acquire);
-                if right_head > 0 && right_head <= BLOCKS_PER_NODE {
+                if right_head > 0 {
                     self.advance(right, right_head - 1);
                 }
             }
@@ -236,9 +352,10 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
 
             let (numenq, numdeq, endleft, endright, size) = new_block.unwrap();
 
-            // Get block
+            // Get block using circular indexing
             let blocks = node.get_blocks_ptr();
-            let block = &*blocks.add(h);
+            let block_idx = node.effective_index(h);
+            let block = &*blocks.add(block_idx);
 
             // Check if we can still install (no one else has)
             let current_head = node.head.load(Ordering::Acquire);
@@ -249,7 +366,8 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
 
             // Set block fields
             if h > 0 {
-                let prev = &*blocks.add(h - 1);
+                let prev_idx = node.effective_index(h - 1);
+                let prev = &*blocks.add(prev_idx);
                 block.sumenq.store(
                     prev.sumenq.load(Ordering::Acquire) + numenq,
                     Ordering::Release,
@@ -265,6 +383,7 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
 
             block.endleft.store(endleft, Ordering::Release);
             block.endright.store(endright, Ordering::Release);
+            block.finished.store(false, Ordering::Release);
 
             if node.is_root {
                 block.size.store(size, Ordering::Release);
@@ -311,27 +430,33 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 endleft = left.head.load(Ordering::Acquire).saturating_sub(1);
 
                 // Count operations from left child
-                if endleft > prev_endleft && endleft < BLOCKS_PER_NODE {
+                if endleft > prev_endleft {
+                    let left_tail = left.tail.load(Ordering::Acquire);
                     for i in (prev_endleft + 1)..=endleft {
-                        if let Some(block) = left.get_block(i) {
-                            let sumenq = block.sumenq.load(Ordering::Acquire);
-                            let sumdeq = block.sumdeq.load(Ordering::Acquire);
-                            let prev_sumenq = if i > 0 {
-                                left.get_block(i - 1)
-                                    .map(|b| b.sumenq.load(Ordering::Acquire))
-                                    .unwrap_or(0)
-                            } else {
-                                0
-                            };
-                            let prev_sumdeq = if i > 0 {
-                                left.get_block(i - 1)
-                                    .map(|b| b.sumdeq.load(Ordering::Acquire))
-                                    .unwrap_or(0)
-                            } else {
-                                0
-                            };
-                            numenq += sumenq - prev_sumenq;
-                            numdeq += sumdeq - prev_sumdeq;
+                        if i >= left_tail {
+                            // Only count non-GC'd blocks
+                            if let Some(block) = left.get_block(i) {
+                                if !block.finished.load(Ordering::Acquire) {
+                                    let sumenq = block.sumenq.load(Ordering::Acquire);
+                                    let sumdeq = block.sumdeq.load(Ordering::Acquire);
+                                    let prev_sumenq = if i > 0 {
+                                        left.get_block(i - 1)
+                                            .map(|b| b.sumenq.load(Ordering::Acquire))
+                                            .unwrap_or(0)
+                                    } else {
+                                        0
+                                    };
+                                    let prev_sumdeq = if i > 0 {
+                                        left.get_block(i - 1)
+                                            .map(|b| b.sumdeq.load(Ordering::Acquire))
+                                            .unwrap_or(0)
+                                    } else {
+                                        0
+                                    };
+                                    numenq += sumenq - prev_sumenq;
+                                    numdeq += sumdeq - prev_sumdeq;
+                                }
+                            }
                         }
                     }
                 }
@@ -342,29 +467,35 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 endright = right.head.load(Ordering::Acquire).saturating_sub(1);
 
                 // Count operations from right child
-                if endright > prev_endright && endright < BLOCKS_PER_NODE {
+                if endright > prev_endright {
+                    let right_tail = right.tail.load(Ordering::Acquire);
                     for i in (prev_endright + 1)..=endright {
-                        if let Some(block) = right.get_block(i) {
-                            let sumenq = block.sumenq.load(Ordering::Acquire);
-                            let sumdeq = block.sumdeq.load(Ordering::Acquire);
-                            let prev_sumenq = if i > 0 {
-                                right
-                                    .get_block(i - 1)
-                                    .map(|b| b.sumenq.load(Ordering::Acquire))
-                                    .unwrap_or(0)
-                            } else {
-                                0
-                            };
-                            let prev_sumdeq = if i > 0 {
-                                right
-                                    .get_block(i - 1)
-                                    .map(|b| b.sumdeq.load(Ordering::Acquire))
-                                    .unwrap_or(0)
-                            } else {
-                                0
-                            };
-                            numenq += sumenq - prev_sumenq;
-                            numdeq += sumdeq - prev_sumdeq;
+                        if i >= right_tail {
+                            // Only count non-GC'd blocks
+                            if let Some(block) = right.get_block(i) {
+                                if !block.finished.load(Ordering::Acquire) {
+                                    let sumenq = block.sumenq.load(Ordering::Acquire);
+                                    let sumdeq = block.sumdeq.load(Ordering::Acquire);
+                                    let prev_sumenq = if i > 0 {
+                                        right
+                                            .get_block(i - 1)
+                                            .map(|b| b.sumenq.load(Ordering::Acquire))
+                                            .unwrap_or(0)
+                                    } else {
+                                        0
+                                    };
+                                    let prev_sumdeq = if i > 0 {
+                                        right
+                                            .get_block(i - 1)
+                                            .map(|b| b.sumdeq.load(Ordering::Acquire))
+                                            .unwrap_or(0)
+                                    } else {
+                                        0
+                                    };
+                                    numenq += sumenq - prev_sumenq;
+                                    numdeq += sumdeq - prev_sumdeq;
+                                }
+                            }
                         }
                     }
                 }
@@ -396,7 +527,7 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
     fn advance(&self, node: &Node<T>, h: usize) {
         unsafe {
             // Set super field if not root
-            if !node.is_root && !node.parent.is_null() && h < BLOCKS_PER_NODE {
+            if !node.is_root && !node.parent.is_null() {
                 let parent = &*node.parent;
                 let parent_head = parent.head.load(Ordering::Acquire);
 
@@ -504,14 +635,14 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                         .map(|b| b.endleft.load(Ordering::Acquire))
                         .unwrap_or(0);
 
-                    let left_sumdeq = if endleft > 0 && endleft < BLOCKS_PER_NODE {
+                    let left_sumdeq = if endleft > 0 {
                         left.get_block(endleft)
                             .map(|b| b.sumdeq.load(Ordering::Acquire))
                             .unwrap_or(0)
                     } else {
                         0
                     };
-                    let left_prev_sumdeq = if prev_endleft > 0 && prev_endleft < BLOCKS_PER_NODE {
+                    let left_prev_sumdeq = if prev_endleft > 0 {
                         left.get_block(prev_endleft)
                             .map(|b| b.sumdeq.load(Ordering::Acquire))
                             .unwrap_or(0)
@@ -560,9 +691,10 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
             let enq_rank = deq_rank + prev_sumenq - prev_size;
 
             // Binary search for enqueue's block
-            let mut left = 1;
+            let tail = root_node.tail.load(Ordering::Acquire);
+            let mut left = tail.max(1);
             let mut right = root_block_idx;
-            let mut target_block = 1;
+            let mut target_block = left;
 
             while left <= right {
                 let mid = (left + right) / 2;
@@ -618,17 +750,20 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 let left = &*node.left;
                 let left_numenq = if endleft > prev_endleft {
                     let mut sum = 0;
-                    for i in (prev_endleft + 1)..=endleft.min(BLOCKS_PER_NODE - 1) {
-                        if let Some(child_block) = left.get_block(i) {
-                            let sumenq = child_block.sumenq.load(Ordering::Acquire);
-                            let prev_sumenq = if i > 0 {
-                                left.get_block(i - 1)
-                                    .map(|b| b.sumenq.load(Ordering::Acquire))
-                                    .unwrap_or(0)
-                            } else {
-                                0
-                            };
-                            sum += sumenq - prev_sumenq;
+                    let left_tail = left.tail.load(Ordering::Acquire);
+                    for i in (prev_endleft + 1)..=endleft {
+                        if i >= left_tail {
+                            if let Some(child_block) = left.get_block(i) {
+                                let sumenq = child_block.sumenq.load(Ordering::Acquire);
+                                let prev_sumenq = if i > 0 {
+                                    left.get_block(i - 1)
+                                        .map(|b| b.sumenq.load(Ordering::Acquire))
+                                        .unwrap_or(0)
+                                } else {
+                                    0
+                                };
+                                sum += sumenq - prev_sumenq;
+                            }
                         }
                     }
                     sum
@@ -641,7 +776,7 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                     let mut target = prev_endleft + 1;
                     let mut accumulated = 0;
 
-                    for i in (prev_endleft + 1)..=endleft.min(BLOCKS_PER_NODE - 1) {
+                    for i in (prev_endleft + 1)..=endleft {
                         if let Some(child_block) = left.get_block(i) {
                             let sumenq = child_block.sumenq.load(Ordering::Acquire);
                             let prev_sumenq = if i > 0 {
@@ -675,7 +810,7 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                     let mut accumulated = 0;
                     let adjusted_rank = rank - left_numenq;
 
-                    for i in (prev_endright + 1)..=endright.min(BLOCKS_PER_NODE - 1) {
+                    for i in (prev_endright + 1)..=endright {
                         if let Some(child_block) = right.get_block(i) {
                             let sumenq = child_block.sumenq.load(Ordering::Acquire);
                             let prev_sumenq = if i > 0 {
@@ -725,7 +860,11 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
         let nodes_offset = queue_aligned;
         let nodes_total_size = tree_size * node_size_aligned;
 
-        let total_size = nodes_offset + nodes_total_size;
+        let tracker_offset = nodes_offset + nodes_total_size;
+        let tracker_size = mem::size_of::<FinishedTracker>();
+        let tracker_aligned = (tracker_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
+
+        let total_size = tracker_offset + tracker_aligned;
 
         // Initialize queue
         ptr::write(
@@ -739,11 +878,18 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 nodes_offset,
                 node_size: node_size_aligned,
                 initialized: AtomicBool::new(false),
+                total_operations: AtomicUsize::new(0),
+                finished_tracker: ptr::null_mut(),
                 _phantom: std::marker::PhantomData,
             },
         );
 
         let queue = &mut *queue_ptr;
+
+        // Initialize finished tracker
+        let tracker_ptr = mem.add(tracker_offset) as *mut FinishedTracker;
+        ptr::write(tracker_ptr, FinishedTracker::new());
+        queue.finished_tracker = tracker_ptr;
 
         // Initialize nodes and their blocks
         for i in 0..tree_size {
@@ -797,6 +943,7 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
             sentinel.endleft.store(0, Ordering::Release);
             sentinel.endright.store(0, Ordering::Release);
             sentinel.size.store(0, Ordering::Release);
+            sentinel.finished.store(true, Ordering::Release); // Sentinel is always finished
         }
 
         queue.initialized.store(true, Ordering::Release);
@@ -820,7 +967,10 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
 
         let nodes_total_size = tree_size * node_size_aligned;
 
-        let total = queue_aligned + nodes_total_size;
+        let tracker_size = mem::size_of::<FinishedTracker>();
+        let tracker_aligned = (tracker_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
+
+        let total = queue_aligned + nodes_total_size + tracker_aligned;
         (total + 4095) & !4095 // Page align
     }
 
@@ -849,6 +999,10 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
             let leaf_head = leaf.head.load(Ordering::Acquire);
             let (root_block, rank) = self.index_dequeue(leaf, leaf_head - 1, 1);
 
+            // Update finished tracker
+            let tracker = &*self.finished_tracker;
+            tracker.last_finished_dequeue[thread_id].store(root_block, Ordering::Release);
+
             // Get response
             self.find_response(root_block, rank)
         }
@@ -858,8 +1012,9 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
         unsafe {
             let root_node = &*self.root;
             let head = root_node.head.load(Ordering::Acquire);
+            let tail = root_node.tail.load(Ordering::Acquire);
 
-            if head <= 1 {
+            if head <= tail {
                 return true;
             }
 

@@ -4,15 +4,15 @@ use nix::{
     sys::wait::waitpid,
     unistd::{fork, ForkResult},
 };
-use queues::mpmc;
+use queues::mpmc::{self, polylog_queue, ymc_queue};
 use queues::mpmc::{BurdenWFQueue, KWQueue, NRQueue, WFQueue, YangCrummeyQueue};
 use queues::MpmcQueue;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 const PERFORMANCE_TEST: bool = false;
-const ITEMS_PER_PROCESS_TARGET: usize = 500_000;
+const ITEMS_PER_PROCESS_TARGET: usize = 250_000;
 const PROCESS_COUNTS_TO_TEST: &[(usize, usize)] = &[(1, 1), (2, 2), (4, 4), (6, 6)];
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 100_000_000;
 
@@ -166,6 +166,7 @@ impl MpmcStartupSync {
 struct MpmcDoneSync {
     producers_done: AtomicU32,
     consumers_done: AtomicU32,
+    total_consumed: AtomicUsize, // Add this to track total consumed items
 }
 
 impl MpmcDoneSync {
@@ -177,6 +178,7 @@ impl MpmcDoneSync {
                 Self {
                     producers_done: AtomicU32::new(0),
                     consumers_done: AtomicU32::new(0),
+                    total_consumed: AtomicUsize::new(0),
                 },
             );
             &*sync_ptr
@@ -321,7 +323,6 @@ where
                 }
 
                 let mut consumed_count = 0;
-                let mut null_dequeues = 0; // Add this counter
                 let target_items = total_items / num_consumers;
                 let extra_items = if consumer_id < (total_items % num_consumers) {
                     1
@@ -362,14 +363,11 @@ where
                     }
                 }
 
+                // Add this consumer's count to the total
+                done_sync
+                    .total_consumed
+                    .fetch_add(consumed_count, Ordering::AcqRel);
                 done_sync.consumers_done.fetch_add(1, Ordering::AcqRel);
-
-                if !PERFORMANCE_TEST {
-                    eprintln!(
-                        "Consumer {} consumed {}/{} items, {} null dequeues",
-                        consumer_id, consumed_count, my_target, null_dequeues
-                    );
-                }
 
                 unsafe { libc::_exit(0) };
             }
@@ -426,15 +424,18 @@ where
         waitpid(helper_pid, None).expect("waitpid for helper failed");
     }
 
-    if std::any::type_name::<Q>().contains("NRQueue") {
-        // Call the static debug function
-        NRQueue::<usize>::debug_stats_static();
+    // Get the total consumed count
+    let total_consumed = done_sync.total_consumed.load(Ordering::Acquire);
 
-        // Also call instance method for more info
-        unsafe {
-            let nr_queue = &*(q as *const _ as *const NRQueue<usize>);
-            nr_queue.debug_stats();
-        }
+    if total_consumed != total_items {
+        eprintln!(
+            "Warning (MPMC): Total consumed {}/{} items. Q: {}, Prods: {}, Cons: {}",
+            total_consumed,
+            total_items,
+            std::any::type_name::<Q>(),
+            num_producers,
+            num_consumers
+        );
     }
 
     unsafe {
@@ -590,9 +591,10 @@ fn bench_nr_queue(c: &mut Criterion) {
                 b.iter_custom(|_iters| {
                     fork_and_run_mpmc_with_helper::<NRQueue<usize>, _>(
                         || {
-                            let bytes = NRQueue::<usize>::shared_size(total_processes);
+                            let bytes = NRQueue::<usize>::shared_size(total_processes * 2);
                             let shm_ptr = unsafe { map_shared(bytes) };
-                            let q = unsafe { NRQueue::init_in_shared(shm_ptr, total_processes) };
+                            let q =
+                                unsafe { NRQueue::init_in_shared(shm_ptr, total_processes * 2) };
                             (q, shm_ptr, bytes)
                         },
                         num_prods,

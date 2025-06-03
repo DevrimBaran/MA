@@ -3,7 +3,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use criterion::{criterion_group, criterion_main, Bencher, Criterion};
-use queues::mpsc::{DQueue, DrescherQueue, JayantiPetrovicMpscQueue, JiffyQueue};
+use queues::mpsc::{drescher_queue, DQueue, DrescherQueue, JayantiPetrovicMpscQueue, JiffyQueue};
 use queues::MpscQueue;
 
 use core::fmt;
@@ -332,7 +332,7 @@ fn bench_drescher_mpsc(c: &mut Criterion) {
                 b.iter_custom(|_iters| {
                     fork_and_run_mpsc::<DrescherQueue<usize>, _>(
                         || {
-                            let node_cap = total_items_run + num_prods_current_run; // Extra nodes for producers
+                            let node_cap = total_items_run + num_prods_current_run * 2; // Extra nodes for producers
                             let bytes = DrescherQueue::<usize>::shared_size(node_cap);
                             let shm_ptr = unsafe { map_shared(bytes) };
                             let q = unsafe { DrescherQueue::init_in_shared(shm_ptr, node_cap) };
@@ -481,6 +481,6 @@ criterion_group! {
     name = mpsc_benches;
     config = custom_criterion();
     targets =
-        bench_d_queue_mpsc,
+        bench_drescher_mpsc,
 }
 criterion_main!(mpsc_benches);

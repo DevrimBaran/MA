@@ -213,9 +213,10 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
     pub unsafe fn init_in_shared(mem: *mut u8, num_threads: usize) -> &'static mut Self {
         let queue_ptr = mem as *mut Self;
 
-        let items_per_thread = 100_000;
-        let max_items = items_per_thread * num_threads * 3;
-        let num_segments = std::cmp::min((max_items + SEGMENT_SIZE - 1) / SEGMENT_SIZE, 8192);
+        // Increase items per thread and segments to handle scanning
+        let items_per_thread = 300_000; // Increased from 100_000
+        let max_items = items_per_thread * num_threads * 4; // 4x safety factor
+        let num_segments = std::cmp::min((max_items + SEGMENT_SIZE - 1) / SEGMENT_SIZE, 16384); // Increased from 8192
 
         let queue_size = mem::size_of::<Self>();
         let handles_offset = (queue_size + 127) & !127;
@@ -285,9 +286,9 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
     }
 
     pub fn shared_size(num_threads: usize) -> usize {
-        let items_per_thread = 100_000;
-        let max_items = items_per_thread * num_threads * 3;
-        let num_segments = std::cmp::min((max_items + SEGMENT_SIZE - 1) / SEGMENT_SIZE, 8192);
+        let items_per_thread = 300_000;
+        let max_items = items_per_thread * num_threads * 4;
+        let num_segments = std::cmp::min((max_items + SEGMENT_SIZE - 1) / SEGMENT_SIZE, 16384);
 
         let queue_size = mem::size_of::<Self>();
         let handles_size = num_threads * mem::size_of::<Handle>();
@@ -399,30 +400,50 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
     }
 
     unsafe fn enq_commit(&self, c: *mut Cell, v: usize, cid: u64) {
+        assert!(
+            v != TOP && v != BOTTOM,
+            "Invalid value in enq_commit: {}",
+            v
+        );
+        assert!(v < 1000000000, "Suspicious value in enq_commit: {}", v);
+
         self.advance_end(&self.t, cid + 1);
-        (*c).val.store(v, Ordering::Release);
+        fence(Ordering::SeqCst);
+
+        (*c).val.store(v, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+
+        // Verify the write succeeded
+        let stored = (*c).val.load(Ordering::SeqCst);
+        assert_eq!(
+            stored, v,
+            "enq_commit failed: expected {}, got {}",
+            v, stored
+        );
     }
 
     unsafe fn help_enq(&self, handle: *mut Handle, c: *mut Cell, i: u64) -> Result<usize, ()> {
-        let val = (*c).val.load(Ordering::Acquire);
+        // Strongest possible synchronization
+        fence(Ordering::SeqCst);
+
+        let val = (*c).val.load(Ordering::SeqCst);
         if val != BOTTOM && val != TOP {
+            assert!(val < 1000000000, "Invalid value in cell: {}", val); // Sanity check
             return Ok(val);
         }
 
         match (*c)
             .val
-            .compare_exchange(BOTTOM, TOP, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(BOTTOM, TOP, Ordering::SeqCst, Ordering::SeqCst)
         {
             Ok(_) => {
-                if (*c).enq.load(Ordering::Acquire).is_null() {
-                    let mut iterations = 0;
-                    loop {
-                        iterations += 1;
-                        if iterations > 2 {
-                            break;
-                        }
+                fence(Ordering::SeqCst);
 
-                        let p = (*handle).enq_peer.load(Ordering::Acquire);
+                // Help enqueue with all synchronization
+                if (*c).enq.load(Ordering::SeqCst).is_null() {
+                    // Try harder to find an enqueue to help
+                    for _ in 0..5 {
+                        let p = (*handle).enq_peer.load(Ordering::SeqCst);
                         if p.is_null() {
                             break;
                         }
@@ -430,42 +451,39 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
                         let peer_req = &(*p).enq_req;
                         let (pending, id) = peer_req.get_state();
 
-                        if (*handle).enq_id.load(Ordering::Acquire) == 0
-                            || (*handle).enq_id.load(Ordering::Acquire) == id
-                        {
-                            if pending && id <= i {
-                                match (*c).enq.compare_exchange(
+                        if pending && id <= i {
+                            if (*c)
+                                .enq
+                                .compare_exchange(
                                     null_mut(),
                                     peer_req as *const EnqReq as *mut EnqReq,
-                                    Ordering::AcqRel,
-                                    Ordering::Acquire,
-                                ) {
-                                    Ok(_) => {
-                                        (*handle).enq_peer.store((*p).next, Ordering::Release);
-                                        break;
-                                    }
-                                    Err(_) => {
-                                        (*handle).enq_id.store(id, Ordering::Release);
-                                    }
-                                }
-                            } else {
-                                (*handle).enq_peer.store((*p).next, Ordering::Release);
+                                    Ordering::SeqCst,
+                                    Ordering::SeqCst,
+                                )
+                                .is_ok()
+                            {
                                 break;
                             }
-                        } else {
-                            (*handle).enq_id.store(0, Ordering::Release);
-                            (*handle).enq_peer.store((*p).next, Ordering::Release);
                         }
+
+                        (*handle).enq_peer.store((*p).next, Ordering::SeqCst);
+                        fence(Ordering::SeqCst);
                     }
 
-                    if (*c).enq.load(Ordering::Acquire).is_null() {
-                        (*c).enq.store(TOP_ENQ, Ordering::Release);
+                    if (*c).enq.load(Ordering::SeqCst).is_null() {
+                        (*c).enq.store(TOP_ENQ, Ordering::SeqCst);
                     }
                 }
 
-                let enq_ptr = (*c).enq.load(Ordering::Acquire);
+                fence(Ordering::SeqCst);
+                let enq_ptr = (*c).enq.load(Ordering::SeqCst);
+
                 if enq_ptr == TOP_ENQ {
-                    if self.t.load(Ordering::Acquire) <= i {
+                    fence(Ordering::SeqCst);
+                    let t_final = self.t.load(Ordering::SeqCst);
+                    let h_final = self.h.load(Ordering::SeqCst);
+
+                    if t_final <= i && h_final >= t_final {
                         return Err(());
                     }
                     return Ok(TOP);
@@ -474,27 +492,34 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
                 if !enq_ptr.is_null() && enq_ptr != TOP_ENQ && enq_ptr != EMPTY_ENQ {
                     let req = &*enq_ptr;
                     let (pending, req_id) = req.get_state();
-                    let v = req.val.load(Ordering::Acquire);
+                    let v = req.val.load(Ordering::SeqCst);
 
-                    if req_id > i {
-                        if (*c).val.load(Ordering::Acquire) == TOP
-                            && self.t.load(Ordering::Acquire) <= i
-                        {
-                            return Err(());
+                    if v != BOTTOM && v != TOP && req_id <= i {
+                        if pending {
+                            req.try_claim(req_id, i);
                         }
-                    } else if req.try_claim(req_id, i)
-                        || (!pending && req_id == i && (*c).val.load(Ordering::Acquire) == TOP)
-                    {
-                        self.enq_commit(c, v, i);
+                        // Force write the value
+                        (*c).val.store(v, Ordering::SeqCst);
+                        fence(Ordering::SeqCst);
+
+                        // Verify it was written
+                        let check = (*c).val.load(Ordering::SeqCst);
+                        assert_eq!(
+                            check, v,
+                            "Value write failed: expected {}, got {}",
+                            v, check
+                        );
                     }
                 }
 
-                match (*c).val.load(Ordering::Acquire) {
-                    TOP => Ok(TOP),
-                    v => Ok(v),
-                }
+                fence(Ordering::SeqCst);
+                let final_val = (*c).val.load(Ordering::SeqCst);
+                Ok(final_val)
             }
-            Err(v) if v != TOP => Ok(v),
+            Err(v) if v != TOP && v != BOTTOM => {
+                assert!(v < 1000000000, "Invalid value from CAS: {}", v);
+                Ok(v)
+            }
             Err(_) => Ok(TOP),
         }
     }
@@ -503,12 +528,12 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
         let i = self.h.fetch_add(1, Ordering::AcqRel);
         let c = self.find_cell(&mut (*handle).head.load(Ordering::Acquire), i);
 
-        match self.help_enq(handle, c, i)? {
-            TOP => {
+        match self.help_enq(handle, c, i) {
+            Ok(TOP) => {
                 *id = i;
                 Ok(TOP)
             }
-            v => {
+            Ok(v) => {
                 let deq_ptr = (*c).deq.compare_exchange(
                     null_mut(),
                     TOP_DEQ,
@@ -522,6 +547,11 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
                     *id = i;
                     Ok(TOP)
                 }
+            }
+            Err(_) => {
+                // Don't propagate error immediately - let slow path handle it
+                *id = i;
+                Ok(TOP) // Return TOP to indicate we should try slow path
             }
         }
     }
@@ -678,35 +708,120 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
                 .hazard
                 .store((*handle).head.load(Ordering::Acquire), Ordering::Release);
 
+            // Full memory barrier to ensure all prior operations are visible
+            fence(Ordering::SeqCst);
+
             let mut v = TOP;
             let mut cell_id = 0;
+            let mut total_attempts = 0;
 
-            for _ in 0..PATIENCE {
-                match self.deq_fast(handle, &mut cell_id) {
+            // Keep trying until we get a value or truly empty
+            loop {
+                total_attempts += 1;
+
+                // Fast path attempts with synchronization
+                for attempt in 0..PATIENCE {
+                    fence(Ordering::SeqCst); // Ensure we see all enqueues
+
+                    match self.deq_fast(handle, &mut cell_id) {
+                        Ok(val) if val != TOP && val != BOTTOM => {
+                            // Verify the value is valid
+                            assert!(
+                                val != TOP && val != BOTTOM,
+                                "Fast path returned invalid value: {}",
+                                val
+                            );
+                            v = val;
+                            break;
+                        }
+                        Err(_) => {
+                            // Yield to let enqueues complete
+                            if attempt > 0 {
+                                std::thread::yield_now();
+                            }
+                            fence(Ordering::SeqCst);
+                        }
+                        _ => {}
+                    }
+                }
+
+                if v != TOP && v != BOTTOM {
+                    break; // Got a value
+                }
+
+                // Try slow path with full synchronization
+                fence(Ordering::SeqCst);
+
+                match self.deq_slow(handle, cell_id) {
                     Ok(val) if val != TOP && val != BOTTOM => {
+                        assert!(
+                            val != TOP && val != BOTTOM,
+                            "Slow path returned invalid value: {}",
+                            val
+                        );
                         v = val;
                         break;
                     }
-                    Err(_) => {
-                        (*handle).hazard.store(null_mut(), Ordering::Release);
-                        self.cleanup(handle);
-                        return Err(());
+                    _ => {
+                        // Full synchronization before checking state
+                        fence(Ordering::SeqCst);
+                        std::thread::yield_now();
+                        fence(Ordering::SeqCst);
+
+                        let h_now = self.h.load(Ordering::SeqCst); // Use SeqCst
+                        let t_now = self.t.load(Ordering::SeqCst); // Use SeqCst
+
+                        if h_now >= t_now {
+                            // Really empty
+                            if total_attempts > 5 {
+                                break;
+                            }
+                        } else {
+                            // There MUST be elements, find them
+                            v = self.force_find_value(handle, h_now, t_now);
+                            if v != TOP && v != BOTTOM {
+                                break;
+                            }
+                        }
                     }
-                    _ => {}
                 }
+
+                // Don't spin too long
+                if total_attempts > 20 {
+                    break;
+                }
+
+                // Aggressive yielding
+                std::thread::yield_now();
+                fence(Ordering::SeqCst);
             }
 
             if v == TOP || v == BOTTOM {
-                match self.deq_slow(handle, cell_id) {
-                    Ok(val) if val != TOP && val != BOTTOM => v = val,
-                    _ => {
-                        (*handle).hazard.store(null_mut(), Ordering::Release);
-                        self.cleanup(handle);
-                        return Err(());
-                    }
-                }
+                // Final check with strongest ordering
+                fence(Ordering::SeqCst);
+                let final_h = self.h.load(Ordering::SeqCst);
+                let final_t = self.t.load(Ordering::SeqCst);
+
+                assert!(
+                    final_h >= final_t || (final_t - final_h) < 1000000,
+                    "Queue state inconsistent: h={}, t={}",
+                    final_h,
+                    final_t
+                );
+
+                (*handle).hazard.store(null_mut(), Ordering::Release);
+                self.cleanup(handle);
+                return Err(());
             }
 
+            // Verify we got a valid value
+            assert!(
+                v != TOP && v != BOTTOM,
+                "About to return invalid value: {}",
+                v
+            );
+
+            // Help peer dequeue
             let peer = (*handle).deq_peer.load(Ordering::Acquire);
             if !peer.is_null() {
                 self.help_deq(handle, peer);
@@ -718,6 +833,219 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
 
             Ok(std::mem::transmute_copy::<usize, T>(&v))
         }
+    }
+
+    unsafe fn force_find_value(&self, handle: *mut Handle, start: u64, end: u64) -> usize {
+        // Try up to 50 cells
+        let scan_limit = 50;
+        let scan_end = start.saturating_add(scan_limit).min(end);
+
+        for i in start..scan_end {
+            // Check segment bounds
+            let seg_id = (i / SEGMENT_SIZE as u64) as usize;
+            if seg_id >= 16384 {
+                break;
+            }
+
+            let mut seg = (*handle).head.load(Ordering::Acquire);
+            let c = self.find_cell(&mut seg, i);
+
+            // Strongest synchronization
+            fence(Ordering::SeqCst);
+
+            // First force-help any pending enqueue
+            let enq_ptr = (*c).enq.load(Ordering::SeqCst);
+            if !enq_ptr.is_null() && enq_ptr != TOP_ENQ && enq_ptr != EMPTY_ENQ {
+                let req = &*enq_ptr;
+                let (pending, req_id) = req.get_state();
+
+                if pending && req_id <= i {
+                    let v = req.val.load(Ordering::SeqCst);
+                    if v != BOTTOM && v != TOP {
+                        // Force the enqueue to complete
+                        req.try_claim(req_id, i);
+                        (*c).val.store(v, Ordering::SeqCst);
+                        fence(Ordering::SeqCst);
+                    }
+                }
+            }
+
+            // Check value with strongest ordering
+            fence(Ordering::SeqCst);
+            let val = (*c).val.load(Ordering::SeqCst);
+
+            if val != BOTTOM && val != TOP {
+                // Check if we can claim it
+                let deq_ptr = (*c).deq.load(Ordering::SeqCst);
+                if deq_ptr.is_null() {
+                    if (*c)
+                        .deq
+                        .compare_exchange(null_mut(), TOP_DEQ, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        // Force H forward
+                        loop {
+                            let current_h = self.h.load(Ordering::SeqCst);
+                            if current_h > i {
+                                break;
+                            }
+                            if self
+                                .h
+                                .compare_exchange(
+                                    current_h,
+                                    i + 1,
+                                    Ordering::SeqCst,
+                                    Ordering::SeqCst,
+                                )
+                                .is_ok()
+                            {
+                                break;
+                            }
+                        }
+
+                        assert!(
+                            val != TOP && val != BOTTOM,
+                            "force_find_value found invalid value: {}",
+                            val
+                        );
+                        return val;
+                    }
+                }
+            }
+        }
+
+        TOP
+    }
+
+    unsafe fn comprehensive_scan(&self, handle: *mut Handle, start: u64, end: u64) -> usize {
+        // Limit scan range to prevent segment overflow
+        let scan_limit = 100; // Only scan 100 cells ahead
+        let scan_end = start.saturating_add(scan_limit).min(end);
+
+        for i in start..scan_end {
+            let mut seg = (*handle).head.load(Ordering::Acquire);
+
+            // Check if we're about to exceed segment bounds
+            let seg_id = (i / SEGMENT_SIZE as u64) as usize;
+            if seg_id >= 16384 {
+                // Max segments
+                break;
+            }
+
+            let c = self.find_cell(&mut seg, i);
+
+            // Full fence to ensure we see all updates
+            fence(Ordering::SeqCst);
+
+            // First, help any pending enqueue
+            let enq_ptr = (*c).enq.load(Ordering::Acquire);
+            if !enq_ptr.is_null() && enq_ptr != TOP_ENQ && enq_ptr != EMPTY_ENQ {
+                let req = &*enq_ptr;
+                let (pending, req_id) = req.get_state();
+                let v = req.val.load(Ordering::Acquire);
+
+                if pending && req_id <= i && v != BOTTOM && v != TOP {
+                    // Help complete the enqueue
+                    if req.try_claim(req_id, i) {
+                        (*c).val.store(v, Ordering::Release);
+                        fence(Ordering::SeqCst);
+                    }
+                }
+            }
+
+            // Now check the value
+            let val = (*c).val.load(Ordering::Acquire);
+            if val != BOTTOM && val != TOP {
+                // Check if already claimed
+                let deq_ptr = (*c).deq.load(Ordering::Acquire);
+                if deq_ptr.is_null() {
+                    // Try to claim it
+                    if (*c)
+                        .deq
+                        .compare_exchange(null_mut(), TOP_DEQ, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        // Update H to reflect this dequeue
+                        loop {
+                            let current_h = self.h.load(Ordering::Acquire);
+                            if current_h > i {
+                                break;
+                            }
+                            if self
+                                .h
+                                .compare_exchange(
+                                    current_h,
+                                    i + 1,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                )
+                                .is_ok()
+                            {
+                                break;
+                            }
+                        }
+                        return val;
+                    }
+                }
+            }
+        }
+
+        TOP
+    }
+
+    unsafe fn help_pending_enqueues(&self, handle: *mut Handle) {
+        let h = self.h.load(Ordering::Acquire);
+        let t = self.t.load(Ordering::Acquire);
+
+        // Help complete enqueues for cells between h and t
+        for i in h..h.saturating_add(10).min(t) {
+            let mut seg = (*handle).head.load(Ordering::Acquire);
+            let c = self.find_cell(&mut seg, i);
+
+            // Try to help any pending enqueue at this cell
+            let enq_ptr = (*c).enq.load(Ordering::Acquire);
+            if !enq_ptr.is_null() && enq_ptr != TOP_ENQ && enq_ptr != EMPTY_ENQ {
+                let req = &*enq_ptr;
+                let (pending, req_id) = req.get_state();
+                if pending && req_id <= i {
+                    let v = req.val.load(Ordering::Acquire);
+                    if v != BOTTOM && v != TOP {
+                        (*c).val
+                            .compare_exchange(TOP, v, Ordering::AcqRel, Ordering::Acquire)
+                            .ok();
+                    }
+                }
+            }
+        }
+    }
+
+    unsafe fn scan_for_value(&self, handle: *mut Handle) -> usize {
+        let h = self.h.load(Ordering::Acquire);
+        let t = self.t.load(Ordering::Acquire);
+
+        // Scan a range of cells for any available value
+        for i in h..t.min(h + 100) {
+            let mut seg = (*handle).head.load(Ordering::Acquire);
+            let c = self.find_cell(&mut seg, i);
+
+            let val = (*c).val.load(Ordering::Acquire);
+            if val != BOTTOM && val != TOP {
+                // Try to claim this value
+                if (*c)
+                    .deq
+                    .compare_exchange(null_mut(), TOP_DEQ, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    // Successfully claimed, advance head
+                    self.h
+                        .compare_exchange(i, i + 1, Ordering::AcqRel, Ordering::Acquire)
+                        .ok();
+                    return val;
+                }
+            }
+        }
+
+        TOP
     }
 
     pub fn is_empty(&self) -> bool {

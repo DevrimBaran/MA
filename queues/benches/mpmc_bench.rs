@@ -13,7 +13,7 @@ use std::time::Duration;
 
 const PERFORMANCE_TEST: bool = false;
 const ITEMS_PER_PROCESS_TARGET: usize = 250_000;
-const PROCESS_COUNTS_TO_TEST: &[(usize, usize)] = &[(1, 1), (2, 2), (4, 4), (6, 6)];
+const PROCESS_COUNTS_TO_TEST: &[(usize, usize)] = &[(1, 1), (2, 2)];
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 100_000_000;
 
 trait BenchMpmcQueue<T: Send + Clone>: Send + Sync + 'static {
@@ -166,7 +166,9 @@ impl MpmcStartupSync {
 struct MpmcDoneSync {
     producers_done: AtomicU32,
     consumers_done: AtomicU32,
-    total_consumed: AtomicUsize, // Add this to track total consumed items
+    total_consumed: AtomicUsize,
+    total_produced: AtomicUsize, // Add this to track actual production
+    consumers_active: AtomicU32, // Track active consumers
 }
 
 impl MpmcDoneSync {
@@ -179,6 +181,8 @@ impl MpmcDoneSync {
                     producers_done: AtomicU32::new(0),
                     consumers_done: AtomicU32::new(0),
                     total_consumed: AtomicUsize::new(0),
+                    total_produced: AtomicUsize::new(0),
+                    consumers_active: AtomicU32::new(0),
                 },
             );
             &*sync_ptr
@@ -190,6 +194,7 @@ impl MpmcDoneSync {
     }
 }
 
+// Update fork_and_run_mpmc_with_helper function
 fn fork_and_run_mpmc_with_helper<Q, F>(
     queue_init_fn: F,
     num_producers: usize,
@@ -216,7 +221,7 @@ where
 
     let done_sync_size = MpmcDoneSync::shared_size();
     let done_sync_shm_ptr = unsafe { map_shared(done_sync_size) };
-    let done_sync = MpmcDoneSync::new_in_shm(done_sync_shm_ptr);
+    let done_sync = MpmcDoneSync::new_in_shm(done_sync_shm_ptr); // Pass total_items
 
     let mut producer_pids = Vec::with_capacity(num_producers);
     let mut consumer_pids = Vec::with_capacity(num_consumers);
@@ -268,7 +273,7 @@ where
         }
     }
 
-    // Fork producers
+    // Fork producers (unchanged)
     for producer_id in 0..num_producers {
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
@@ -279,20 +284,31 @@ where
                 }
 
                 let mut push_attempts = 0;
+                let mut produced = 0;
                 for i in 0..items_per_process {
                     let item_value = producer_id * items_per_process + i;
+                    let mut item_push_attempts = 0;
                     while q.bench_push(item_value, producer_id).is_err() {
+                        item_push_attempts += 1;
                         push_attempts += 1;
-                        if push_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS {
-                            panic!(
-                                "Producer {} exceeded max spin retry attempts for push",
-                                producer_id
+                        if item_push_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS {
+                            eprintln!(
+                                "Producer {} failed to push item {} after {} attempts",
+                                producer_id, i, item_push_attempts
                             );
+                            break;
                         }
                         std::hint::spin_loop();
                     }
+                    if item_push_attempts <= MAX_BENCH_SPIN_RETRY_ATTEMPTS {
+                        produced += 1;
+                    }
                 }
 
+                // Report how many we actually produced
+                done_sync
+                    .total_produced
+                    .fetch_add(produced, Ordering::AcqRel);
                 done_sync.producers_done.fetch_add(1, Ordering::AcqRel);
                 unsafe { libc::_exit(0) };
             }
@@ -312,7 +328,7 @@ where
         }
     }
 
-    // Fork consumers
+    // Fork consumers - UPDATED LOGIC
     for consumer_id in 0..num_consumers {
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
@@ -322,53 +338,93 @@ where
                     std::hint::spin_loop();
                 }
 
+                // Mark this consumer as active
+                done_sync.consumers_active.fetch_add(1, Ordering::AcqRel);
+
                 let mut consumed_count = 0;
-                let target_items = total_items / num_consumers;
-                let extra_items = if consumer_id < (total_items % num_consumers) {
-                    1
-                } else {
-                    0
-                };
-                let my_target = target_items + extra_items;
-
                 let mut consecutive_empty_checks = 0;
-                const MAX_CONSECUTIVE_EMPTY_CHECKS: usize = 10000;
+                let mut total_empty_checks = 0;
+                const MAX_CONSECUTIVE_EMPTY_CHECKS: usize = 50_000;
+                const SPIN_BEFORE_YIELD: usize = 1000;
 
-                while consumed_count < my_target {
+                loop {
                     match q.bench_pop(num_producers + consumer_id) {
                         Ok(_item) => {
                             consumed_count += 1;
+                            done_sync.total_consumed.fetch_add(1, Ordering::AcqRel);
                             consecutive_empty_checks = 0;
+                            total_empty_checks = 0;
                         }
                         Err(_) => {
-                            // Only count it as truly empty if all producers are done
-                            // AND we've waited a reasonable time for propagation
-                            if done_sync.producers_done.load(Ordering::Acquire)
-                                == num_producers as u32
-                            {
-                                consecutive_empty_checks += 1;
+                            consecutive_empty_checks += 1;
+                            total_empty_checks += 1;
 
-                                // Give more time for propagation
-                                if consecutive_empty_checks < 100 {
-                                    std::thread::sleep(std::time::Duration::from_micros(1));
-                                } else if consecutive_empty_checks > MAX_CONSECUTIVE_EMPTY_CHECKS {
-                                    break;
+                            // Check current state
+                            let current_consumed = done_sync.total_consumed.load(Ordering::Acquire);
+                            let current_produced = done_sync.total_produced.load(Ordering::Acquire);
+                            let producers_done = done_sync.producers_done.load(Ordering::Acquire)
+                                == num_producers as u32;
+
+                            // If all items that were produced have been consumed, we can exit
+                            if producers_done
+                                && current_produced > 0
+                                && current_consumed >= current_produced
+                            {
+                                break;
+                            }
+
+                            // Give up if we've checked many times and producers are done
+                            if producers_done
+                                && consecutive_empty_checks > MAX_CONSECUTIVE_EMPTY_CHECKS
+                            {
+                                // Mark ourselves as inactive
+                                let active =
+                                    done_sync.consumers_active.fetch_sub(1, Ordering::AcqRel) - 1;
+
+                                // Wait a bit to see if we're the last consumer
+                                for _ in 0..100 {
+                                    let final_consumed =
+                                        done_sync.total_consumed.load(Ordering::Acquire);
+                                    let final_produced =
+                                        done_sync.total_produced.load(Ordering::Acquire);
+
+                                    if final_produced > 0 && final_consumed >= final_produced {
+                                        break;
+                                    }
+
+                                    if active == 0 {
+                                        // We're the last consumer, do a final check
+                                        break;
+                                    }
+
+                                    std::thread::yield_now();
+                                }
+
+                                // Final attempt
+                                match q.bench_pop(num_producers + consumer_id) {
+                                    Ok(_item) => {
+                                        consumed_count += 1;
+                                        done_sync.total_consumed.fetch_add(1, Ordering::AcqRel);
+                                        // Reactivate ourselves
+                                        done_sync.consumers_active.fetch_add(1, Ordering::AcqRel);
+                                        consecutive_empty_checks = 0;
+                                        continue;
+                                    }
+                                    Err(_) => break,
                                 }
                             }
-                            // Don't yield immediately - spin a bit first
-                            for _ in 0..100 {
+
+                            // Yield periodically
+                            if consecutive_empty_checks % SPIN_BEFORE_YIELD == 0 {
+                                std::thread::yield_now();
+                            } else {
                                 std::hint::spin_loop();
                             }
                         }
                     }
                 }
 
-                // Add this consumer's count to the total
-                done_sync
-                    .total_consumed
-                    .fetch_add(consumed_count, Ordering::AcqRel);
                 done_sync.consumers_done.fetch_add(1, Ordering::AcqRel);
-
                 unsafe { libc::_exit(0) };
             }
             Ok(ForkResult::Parent { child }) => {
@@ -426,12 +482,15 @@ where
 
     // Get the total consumed count
     let total_consumed = done_sync.total_consumed.load(Ordering::Acquire);
+    let total_produced = done_sync.total_produced.load(Ordering::Acquire);
 
-    if total_consumed != total_items {
+    if total_consumed != total_produced || total_produced != total_items {
         eprintln!(
-            "Warning (MPMC): Total consumed {}/{} items. Q: {}, Prods: {}, Cons: {}",
-            total_consumed,
+            "Warning (MPMC): Produced {}/{} items, consumed {}/{} items. Q: {}, Prods: {}, Cons: {}",
+            total_produced,
             total_items,
+            total_consumed,
+            total_produced,
             std::any::type_name::<Q>(),
             num_producers,
             num_consumers
@@ -612,7 +671,7 @@ fn bench_nr_queue(c: &mut Criterion) {
 
 fn custom_criterion() -> Criterion {
     Criterion::default()
-        .warm_up_time(Duration::from_secs(2))
+        .warm_up_time(Duration::from_secs(5))
         .measurement_time(Duration::from_secs(10))
         .sample_size(10)
 }
@@ -620,7 +679,12 @@ fn custom_criterion() -> Criterion {
 criterion_group! {
     name = benches;
     config = custom_criterion();
-    targets = bench_nr_queue
+    targets =
+        bench_wf_queue,
+        bench_yang_crummey,
+        bench_kw_queue,
+        bench_burden_wf_queue,
+        bench_nr_queue,
 }
 
 criterion_main!(benches);

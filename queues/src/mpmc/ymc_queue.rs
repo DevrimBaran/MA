@@ -10,7 +10,9 @@ const SEGMENT_SIZE: usize = 1024;
 const PATIENCE: usize = 3;
 const CACHE_LINE_SIZE: usize = 64;
 
-const BOTTOM: usize = 0;
+// Change BOTTOM to a value that won't conflict with actual data
+// Using a high bit pattern that's unlikely to be a valid data value
+const BOTTOM: usize = usize::MAX - 2; // Changed from 0
 const TOP: usize = usize::MAX;
 const EMPTY_ENQ: *mut EnqReq = 1 as *mut EnqReq;
 const TOP_ENQ: *mut EnqReq = 2 as *mut EnqReq;
@@ -836,7 +838,7 @@ impl<T: Send + Clone> Drop for YangCrummeyQueue<T> {
                 let cells = (*current).cells();
                 for i in 0..SEGMENT_SIZE {
                     let val = cells[i].val.load(Ordering::Relaxed);
-                    if val != BOTTOM && val != TOP && val != 0 {
+                    if val != BOTTOM && val != TOP {
                         drop(Box::from_raw(val as *mut T));
                     }
                 }

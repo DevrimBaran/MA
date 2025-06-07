@@ -7,6 +7,7 @@ use nix::{
 use queues::mpmc::{self, polylog_queue, ymc_queue};
 use queues::mpmc::{BurdenWFQueue, KWQueue, NRQueue, WFQueue, YangCrummeyQueue};
 use queues::MpmcQueue;
+use std::cmp::min;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -331,39 +332,126 @@ where
                 let my_target = target_items + extra_items;
 
                 let mut consecutive_empty_checks = 0;
+                let mut last_propagation_attempt = 0;
+                const PROPAGATION_INTERVAL: usize = 100;
                 const MAX_CONSECUTIVE_EMPTY_CHECKS: usize = 10000;
+                const FINAL_DRAIN_ATTEMPTS: usize = 5;
 
+                // Main consumption loop
                 while consumed_count < my_target {
                     match q.bench_pop(num_producers + consumer_id) {
                         Ok(_item) => {
                             consumed_count += 1;
                             consecutive_empty_checks = 0;
+                            last_propagation_attempt = 0;
                         }
                         Err(_) => {
-                            // If we're getting empty but producers are done, force propagation
-                            if done_sync.producers_done.load(Ordering::Acquire)
-                                == num_producers as u32
-                                && consecutive_empty_checks % 1000 == 0
+                            consecutive_empty_checks += 1;
+
+                            // Periodic propagation attempts
+                            if consecutive_empty_checks
+                                > last_propagation_attempt + PROPAGATION_INTERVAL
                             {
-                                // For NRQueue, force propagation
-                                if let Some(nr_queue) =
-                                    unsafe { (q as *const _ as *const NRQueue<usize>).as_ref() }
-                                {
-                                    nr_queue.force_full_propagation();
+                                last_propagation_attempt = consecutive_empty_checks;
+
+                                // Check if producers are done
+                                let producers_done =
+                                    done_sync.producers_done.load(Ordering::Acquire)
+                                        == num_producers as u32;
+
+                                if producers_done {
+                                    // Force propagation for NRQueue
+                                    if let Some(nr_queue) =
+                                        unsafe { (q as *const _ as *const NRQueue<usize>).as_ref() }
+                                    {
+                                        nr_queue.force_full_propagation();
+
+                                        // After forcing propagation, try a few more times
+                                        for _ in 0..10 {
+                                            match q.bench_pop(num_producers + consumer_id) {
+                                                Ok(_item) => {
+                                                    consumed_count += 1;
+                                                    consecutive_empty_checks = 0;
+                                                    break;
+                                                }
+                                                Err(_) => {
+                                                    std::hint::spin_loop();
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
 
-                            consecutive_empty_checks += 1;
-
+                            // Give up if we've been empty for too long
                             if consecutive_empty_checks > MAX_CONSECUTIVE_EMPTY_CHECKS
                                 && consumed_count > 0
                             {
-                                break;
+                                // But first, make absolutely sure there's nothing left
+                                if done_sync.producers_done.load(Ordering::Acquire)
+                                    == num_producers as u32
+                                {
+                                    // Final drain attempt
+                                    for _ in 0..FINAL_DRAIN_ATTEMPTS {
+                                        if let Some(nr_queue) = unsafe {
+                                            (q as *const _ as *const NRQueue<usize>).as_ref()
+                                        } {
+                                            nr_queue.force_full_propagation();
+                                        }
+
+                                        // Try to consume multiple times after each propagation
+                                        let mut found_any = false;
+                                        for _ in 0..100 {
+                                            match q.bench_pop(num_producers + consumer_id) {
+                                                Ok(_item) => {
+                                                    consumed_count += 1;
+                                                    found_any = true;
+                                                }
+                                                Err(_) => {
+                                                    if !found_any {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        if !found_any {
+                                            break;
+                                        }
+                                    }
+
+                                    // Really give up now
+                                    break;
+                                }
                             }
 
-                            // Spin
-                            for _ in 0..100 {
+                            // Backoff spinning
+                            for _ in 0..min(consecutive_empty_checks, 1000) {
                                 std::hint::spin_loop();
+                            }
+                        }
+                    }
+                }
+
+                // Before exiting, try one final aggressive drain
+                if consumed_count < my_target
+                    && done_sync.producers_done.load(Ordering::Acquire) == num_producers as u32
+                {
+                    // Force propagation one more time
+                    if let Some(nr_queue) =
+                        unsafe { (q as *const _ as *const NRQueue<usize>).as_ref() }
+                    {
+                        nr_queue.force_full_propagation();
+                    }
+
+                    // Try to get remaining items
+                    while consumed_count < my_target {
+                        match q.bench_pop(num_producers + consumer_id) {
+                            Ok(_item) => {
+                                consumed_count += 1;
+                            }
+                            Err(_) => {
+                                break;
                             }
                         }
                     }

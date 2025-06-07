@@ -358,15 +358,18 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
 
     // Propagate operations from children to parent
     fn propagate(&self, node: &Node<T>) {
-        // Try refresh multiple times to ensure propagation
-        for _ in 0..3 {
-            if self.refresh(node) {
-                break;
-            }
+        eprintln!("propagate: node={:p}, is_root={}", node, node.is_root);
+
+        // The paper says to call refresh at most twice
+        let first = self.refresh(node);
+        eprintln!("propagate: first refresh returned {}", first);
+
+        if !first {
+            let second = self.refresh(node);
+            eprintln!("propagate: second refresh returned {}", second);
         }
 
         unsafe {
-            // Continue up the tree
             if !node.is_root && !node.parent.is_null() {
                 self.propagate(&*node.parent);
             }
@@ -464,6 +467,15 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
         i: usize,
     ) -> Option<(usize, usize, usize, usize, usize)> {
         unsafe {
+            let node_name = if node.is_root {
+                "root"
+            } else if node.is_leaf {
+                "leaf"
+            } else {
+                "internal"
+            };
+            eprintln!("create_block: node={}, i={}", node_name, i);
+
             let mut numenq = 0;
             let mut numdeq = 0;
             let mut endleft = 0;
@@ -480,15 +492,25 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 (0, 0)
             };
 
+            eprintln!(
+                "create_block: prev_endleft={}, prev_endright={}",
+                prev_endleft, prev_endright
+            );
+
             // Process left child
             if !node.left.is_null() {
                 let left = &*node.left;
-
-                // New end is current head - 1
                 let left_head = left.head.load(Ordering::Acquire);
                 endleft = if left_head > 0 { left_head - 1 } else { 0 };
 
+                eprintln!("create_block: left_head={}, endleft={}", left_head, endleft);
+
                 if endleft > prev_endleft {
+                    // This is the problem - we're only getting one block at a time
+                    eprintln!(
+                        "create_block: Processing {} blocks from left child",
+                        endleft - prev_endleft
+                    );
                     // Get blocks at endpoints
                     let block_prev = if prev_endleft > 0 {
                         left.get_block(prev_endleft)

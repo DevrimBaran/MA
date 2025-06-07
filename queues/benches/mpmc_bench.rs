@@ -448,6 +448,217 @@ where
     duration
 }
 
+fn fork_and_run_mpmc_nr<Q, F>(
+    queue_init_fn: F,
+    num_producers: usize,
+    num_consumers: usize,
+    items_per_process: usize,
+) -> Duration
+where
+    Q: BenchMpmcQueue<usize> + 'static,
+    F: FnOnce() -> (&'static Q, *mut u8, usize),
+{
+    if num_producers == 0 || num_consumers == 0 {
+        return Duration::from_nanos(1);
+    }
+
+    let total_items = num_producers * items_per_process;
+
+    let (q, q_shm_ptr, q_shm_size) = queue_init_fn();
+
+    let startup_sync_size = MpmcStartupSync::shared_size();
+    let startup_sync_shm_ptr = unsafe { map_shared(startup_sync_size) };
+    let startup_sync = MpmcStartupSync::new_in_shm(startup_sync_shm_ptr);
+
+    let done_sync_size = MpmcDoneSync::shared_size();
+    let done_sync_shm_ptr = unsafe { map_shared(done_sync_size) };
+    let done_sync = MpmcDoneSync::new_in_shm(done_sync_shm_ptr);
+
+    let mut producer_pids = Vec::with_capacity(num_producers);
+    let mut consumer_pids = Vec::with_capacity(num_consumers);
+
+    // Fork producers
+    for producer_id in 0..num_producers {
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                startup_sync.producers_ready.fetch_add(1, Ordering::AcqRel);
+
+                while !startup_sync.go_signal.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+
+                let mut push_attempts = 0;
+                for i in 0..items_per_process {
+                    let item_value = producer_id * items_per_process + i;
+                    while q.bench_push(item_value, producer_id).is_err() {
+                        push_attempts += 1;
+                        if push_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS {
+                            panic!(
+                                "Producer {} exceeded max spin retry attempts for push",
+                                producer_id
+                            );
+                        }
+                        std::hint::spin_loop();
+                    }
+                }
+
+                done_sync.producers_done.fetch_add(1, Ordering::AcqRel);
+                unsafe { libc::_exit(0) };
+            }
+            Ok(ForkResult::Parent { child }) => {
+                producer_pids.push(child);
+            }
+            Err(e) => {
+                unsafe {
+                    if !q_shm_ptr.is_null() {
+                        unmap_shared(q_shm_ptr, q_shm_size);
+                    }
+                    unmap_shared(startup_sync_shm_ptr, startup_sync_size);
+                    unmap_shared(done_sync_shm_ptr, done_sync_size);
+                }
+                panic!("Fork failed for producer {}: {}", producer_id, e);
+            }
+        }
+    }
+
+    // Fork consumers
+    for consumer_id in 0..num_consumers {
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                startup_sync.consumers_ready.fetch_add(1, Ordering::AcqRel);
+
+                while !startup_sync.go_signal.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+
+                let mut consumed_count = 0;
+                let target_items = total_items / num_consumers;
+                let extra_items = if consumer_id < (total_items % num_consumers) {
+                    1
+                } else {
+                    0
+                };
+                let my_target = target_items + extra_items;
+
+                let mut consecutive_empty_checks = 0;
+                const MAX_CONSECUTIVE_EMPTY_CHECKS: usize = 100_000;
+
+                while consumed_count < my_target {
+                    match q.bench_pop(num_producers + consumer_id) {
+                        Ok(_item) => {
+                            consumed_count += 1;
+                            consecutive_empty_checks = 0;
+                        }
+                        Err(_) => {
+                            // Check if all producers are done
+                            if done_sync.producers_done.load(Ordering::Acquire)
+                                == num_producers as u32
+                            {
+                                consecutive_empty_checks += 1;
+
+                                // For NRQueue, we need to sync to ensure all operations propagate
+                                if consecutive_empty_checks == 1000 {
+                                    // Cast to NRQueue and call sync
+                                    unsafe {
+                                        let nr_queue = &*(q as *const _ as *const NRQueue<usize>);
+                                        nr_queue.sync();
+                                    }
+                                }
+
+                                // After sync, check total enqueued vs consumed
+                                if consecutive_empty_checks > 10000 {
+                                    unsafe {
+                                        let nr_queue = &*(q as *const _ as *const NRQueue<usize>);
+                                        let total_enqueued = nr_queue.total_enqueued();
+                                        let total_dequeued = nr_queue.total_dequeued();
+
+                                        // If we've consumed everything that was enqueued, we're done
+                                        if total_dequeued >= total_enqueued && total_enqueued > 0 {
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if consecutive_empty_checks > MAX_CONSECUTIVE_EMPTY_CHECKS {
+                                    break;
+                                }
+                            }
+                            std::hint::spin_loop();
+                        }
+                    }
+                }
+
+                // Add this consumer's count to the total
+                done_sync
+                    .total_consumed
+                    .fetch_add(consumed_count, Ordering::AcqRel);
+                done_sync.consumers_done.fetch_add(1, Ordering::AcqRel);
+
+                unsafe { libc::_exit(0) };
+            }
+            Ok(ForkResult::Parent { child }) => {
+                consumer_pids.push(child);
+            }
+            Err(e) => {
+                unsafe {
+                    if !q_shm_ptr.is_null() {
+                        unmap_shared(q_shm_ptr, q_shm_size);
+                    }
+                    unmap_shared(startup_sync_shm_ptr, startup_sync_size);
+                    unmap_shared(done_sync_shm_ptr, done_sync_size);
+                }
+                panic!("Fork failed for consumer {}: {}", consumer_id, e);
+            }
+        }
+    }
+
+    // Wait for all workers to be ready
+    while startup_sync.producers_ready.load(Ordering::Acquire) < num_producers as u32
+        || startup_sync.consumers_ready.load(Ordering::Acquire) < num_consumers as u32
+    {
+        std::hint::spin_loop();
+    }
+
+    // START TIMING HERE - all processes are ready
+    let start_time = std::time::Instant::now();
+    startup_sync.go_signal.store(true, Ordering::Release);
+
+    // Wait for producers and consumers
+    for pid in producer_pids {
+        waitpid(pid, None).expect("waitpid for producer failed");
+    }
+
+    for pid in consumer_pids {
+        waitpid(pid, None).expect("waitpid for consumer failed");
+    }
+
+    let duration = start_time.elapsed();
+
+    // Get the total consumed count
+    let total_consumed = done_sync.total_consumed.load(Ordering::Acquire);
+
+    if total_consumed != total_items {
+        eprintln!(
+            "Warning (MPMC): Total consumed {}/{} items. Q: {}, Prods: {}, Cons: {}",
+            total_consumed,
+            total_items,
+            std::any::type_name::<Q>(),
+            num_producers,
+            num_consumers
+        );
+    }
+
+    unsafe {
+        if !q_shm_ptr.is_null() {
+            unmap_shared(q_shm_ptr, q_shm_size);
+        }
+        unmap_shared(startup_sync_shm_ptr, startup_sync_size);
+        unmap_shared(done_sync_shm_ptr, done_sync_size);
+    }
+
+    duration
+}
+
 // Add benchmark function
 fn bench_wf_queue(c: &mut Criterion) {
     let mut group = c.benchmark_group("VermaMPMC");
@@ -588,7 +799,7 @@ fn bench_nr_queue(c: &mut Criterion) {
             format!("{}P_{}C", num_prods, num_cons),
             |b: &mut Bencher| {
                 b.iter_custom(|_iters| {
-                    fork_and_run_mpmc_with_helper::<NRQueue<usize>, _>(
+                    fork_and_run_mpmc_nr::<NRQueue<usize>, _>(
                         || {
                             let bytes = NRQueue::<usize>::shared_size(total_processes);
                             let shm_ptr = unsafe { map_shared(bytes) };
@@ -598,7 +809,6 @@ fn bench_nr_queue(c: &mut Criterion) {
                         num_prods,
                         num_cons,
                         items_per_process,
-                        false, // needs_helper = false
                     )
                 })
             },
@@ -607,7 +817,6 @@ fn bench_nr_queue(c: &mut Criterion) {
 
     group.finish();
 }
-
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(2))

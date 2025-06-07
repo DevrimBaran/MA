@@ -340,21 +340,28 @@ where
                             consecutive_empty_checks = 0;
                         }
                         Err(_) => {
-                            // Only count it as truly empty if all producers are done
-                            // AND we've waited a reasonable time for propagation
+                            // If we're getting empty but producers are done, force propagation
                             if done_sync.producers_done.load(Ordering::Acquire)
                                 == num_producers as u32
+                                && consecutive_empty_checks % 1000 == 0
                             {
-                                consecutive_empty_checks += 1;
-
-                                // Give more time for propagation
-                                if consecutive_empty_checks < 100 {
-                                    std::thread::sleep(std::time::Duration::from_micros(1));
-                                } else if consecutive_empty_checks > MAX_CONSECUTIVE_EMPTY_CHECKS {
-                                    break;
+                                // For NRQueue, force propagation
+                                if let Some(nr_queue) =
+                                    unsafe { (q as *const _ as *const NRQueue<usize>).as_ref() }
+                                {
+                                    nr_queue.force_full_propagation();
                                 }
                             }
-                            // Don't yield immediately - spin a bit first
+
+                            consecutive_empty_checks += 1;
+
+                            if consecutive_empty_checks > MAX_CONSECUTIVE_EMPTY_CHECKS
+                                && consumed_count > 0
+                            {
+                                break;
+                            }
+
+                            // Spin
                             for _ in 0..100 {
                                 std::hint::spin_loop();
                             }

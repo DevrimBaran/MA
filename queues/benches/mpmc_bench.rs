@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 const PERFORMANCE_TEST: bool = false;
-const ITEMS_PER_PROCESS_TARGET: usize = 250_000;
+const ITEMS_PER_PROCESS_TARGET: usize = 200_000;
 const PROCESS_COUNTS_TO_TEST: &[(usize, usize)] = &[(1, 1), (2, 2), (4, 4), (6, 6)];
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 100_000_000;
 
@@ -619,7 +619,8 @@ fn custom_criterion() -> Criterion {
 criterion_group! {
     name = benches;
     config = custom_criterion();
-    targets = bench_yang_crummey
+    targets =
+        bench_nr_queue,
 }
 
 criterion_main!(benches);

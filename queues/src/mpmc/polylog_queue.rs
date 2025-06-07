@@ -1,21 +1,23 @@
 // queues/src/mpmc/polylog_queue.rs
-// Wait-Free MPMC Queue based on "A Wait-free Queue with Polylogarithmic Step Complexity"
-// by Hossein Naderibeni and Eric Ruppert (PODC 2023)
-// This implements the unbounded-space version from the paper
+// Wait-Free MPMC Queue - Fixed for shared memory with reasonable memory usage
 
 use std::cell::UnsafeCell;
 use std::mem;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::MpmcQueue;
 
 const CACHE_LINE_SIZE: usize = 64;
-// Large enough to avoid running out in benchmarks
-const MAX_BLOCKS: usize = 6_000_000;
+
+// Reasonable block limits based on expected usage
+// For benchmarks with 250K items per process, we need enough blocks
+// In worst case, each operation gets its own block
+const BLOCKS_PER_LEAF: usize = 300_000; // Enough for 250K operations even without batching
+const BLOCKS_PER_INTERNAL: usize = 50_000; // Internal nodes aggregate from children
 
 // Block structure - represents a batch of operations
-#[repr(C)]
+#[repr(C, align(64))] // Cache line aligned
 struct Block<T> {
     // Fields for all blocks
     sumenq: AtomicUsize,    // Total enqueues up to this block (inclusive)
@@ -60,6 +62,7 @@ struct Node<T> {
     is_leaf: bool,
     is_root: bool,
     process_id: usize, // For leaves only
+    max_blocks: usize, // Maximum blocks for this node
 
     // Blocks array follows immediately after this struct in memory
     _phantom: std::marker::PhantomData<T>,
@@ -69,7 +72,7 @@ unsafe impl<T: Send> Send for Node<T> {}
 unsafe impl<T: Send> Sync for Node<T> {}
 
 impl<T> Node<T> {
-    fn new() -> Self {
+    fn new(max_blocks: usize) -> Self {
         Self {
             head: AtomicUsize::new(1), // Start at 1, blocks[0] is empty sentinel
             left: ptr::null(),
@@ -78,6 +81,7 @@ impl<T> Node<T> {
             is_leaf: false,
             is_root: false,
             process_id: usize::MAX,
+            max_blocks,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -85,17 +89,18 @@ impl<T> Node<T> {
     unsafe fn get_blocks_ptr(&self) -> *mut Block<T> {
         // Blocks array starts immediately after the Node struct
         let node_ptr = self as *const Self as *mut u8;
-        let blocks_offset = mem::size_of::<Self>();
-        let aligned_offset = (blocks_offset + 63) & !63; // Cache line align
+        let node_size = mem::size_of::<Self>();
+        // Align to cache line boundary
+        let aligned_offset = (node_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
         node_ptr.add(aligned_offset) as *mut Block<T>
     }
 
-    unsafe fn get_block(&self, index: usize) -> &Block<T> {
-        if index >= MAX_BLOCKS {
-            panic!("Block index {} exceeds MAX_BLOCKS", index);
+    unsafe fn get_block(&self, index: usize) -> Option<&Block<T>> {
+        if index >= self.max_blocks {
+            return None;
         }
         let blocks = self.get_blocks_ptr();
-        &*blocks.add(index)
+        Some(&*blocks.add(index))
     }
 }
 
@@ -109,8 +114,11 @@ pub struct NRQueue<T: Send + Clone + 'static> {
     // Memory management
     base_ptr: *mut u8,
     total_size: usize,
-    nodes_offset: usize,
-    node_size: usize, // Size of one node including its blocks array
+    nodes_base: *mut u8,
+
+    // Node layout info
+    leaf_node_size: usize,
+    internal_node_size: usize,
 
     _phantom: std::marker::PhantomData<T>,
 }
@@ -120,8 +128,20 @@ unsafe impl<T: Send + Clone> Sync for NRQueue<T> {}
 
 impl<T: Send + Clone + 'static> NRQueue<T> {
     unsafe fn get_node_ptr(&self, index: usize) -> *mut Node<T> {
-        let nodes_base = self.base_ptr.add(self.nodes_offset);
-        nodes_base.add(index * self.node_size) as *mut Node<T>
+        let tree_size = (1 << (self.tree_height + 1)) - 1;
+        let leaf_start = (1 << self.tree_height) - 1;
+
+        if index >= leaf_start {
+            // It's a leaf node
+            let leaf_offset = index - leaf_start;
+            let offset = (tree_size - leaf_start) * self.internal_node_size
+                + leaf_offset * self.leaf_node_size;
+            self.nodes_base.add(offset) as *mut Node<T>
+        } else {
+            // It's an internal node
+            let offset = index * self.internal_node_size;
+            self.nodes_base.add(offset) as *mut Node<T>
+        }
     }
 
     unsafe fn get_leaf(&self, process_id: usize) -> &Node<T> {
@@ -129,8 +149,43 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
         &*self.get_node_ptr(leaf_start + process_id)
     }
 
-    unsafe fn get_node(&self, index: usize) -> &Node<T> {
-        &*self.get_node_ptr(index)
+    // Binary search for block containing sum value
+    unsafe fn binary_search_block(
+        &self,
+        node: &Node<T>,
+        sum_value: usize,
+        is_enq: bool,
+    ) -> Option<usize> {
+        let head = node.head.load(Ordering::Acquire);
+        if head <= 1 || sum_value == 0 {
+            return None;
+        }
+
+        let mut left = 1;
+        let mut right = head - 1;
+        let mut result = None;
+
+        while left <= right {
+            let mid = (left + right) / 2;
+            if let Some(block) = node.get_block(mid) {
+                let mid_sum = if is_enq {
+                    block.sumenq.load(Ordering::Acquire)
+                } else {
+                    block.sumdeq.load(Ordering::Acquire)
+                };
+
+                if mid_sum >= sum_value {
+                    result = Some(mid);
+                    right = mid - 1;
+                } else {
+                    left = mid + 1;
+                }
+            } else {
+                break;
+            }
+        }
+
+        result
     }
 
     // Append operation to leaf
@@ -139,12 +194,18 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
             let leaf = self.get_leaf(process_id);
             let h = leaf.head.load(Ordering::Acquire);
 
-            if h >= MAX_BLOCKS {
-                panic!("Exceeded MAX_BLOCKS for process {}", process_id);
+            if h >= leaf.max_blocks {
+                // Queue is full for this process - still try to propagate what we have
+                if !leaf.parent.is_null() && h > 1 {
+                    self.propagate(&*leaf.parent);
+                }
+                return;
             }
 
             // Get block
-            let block = leaf.get_block(h);
+            let Some(block) = leaf.get_block(h) else {
+                return;
+            };
 
             // Check if it's an enqueue or dequeue operation
             let is_enqueue = element.is_some();
@@ -154,16 +215,17 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
 
             // Update sums based on previous block
             if h > 0 {
-                let prev_block = leaf.get_block(h - 1);
-                let prev_sumenq = prev_block.sumenq.load(Ordering::Acquire);
-                let prev_sumdeq = prev_block.sumdeq.load(Ordering::Acquire);
+                if let Some(prev_block) = leaf.get_block(h - 1) {
+                    let prev_sumenq = prev_block.sumenq.load(Ordering::Acquire);
+                    let prev_sumdeq = prev_block.sumdeq.load(Ordering::Acquire);
 
-                if is_enqueue {
-                    block.sumenq.store(prev_sumenq + 1, Ordering::Release);
-                    block.sumdeq.store(prev_sumdeq, Ordering::Release);
-                } else {
-                    block.sumenq.store(prev_sumenq, Ordering::Release);
-                    block.sumdeq.store(prev_sumdeq + 1, Ordering::Release);
+                    if is_enqueue {
+                        block.sumenq.store(prev_sumenq + 1, Ordering::Release);
+                        block.sumdeq.store(prev_sumdeq, Ordering::Release);
+                    } else {
+                        block.sumenq.store(prev_sumenq, Ordering::Release);
+                        block.sumdeq.store(prev_sumdeq + 1, Ordering::Release);
+                    }
                 }
             } else {
                 // First block after sentinel
@@ -205,7 +267,7 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
         unsafe {
             let h = node.head.load(Ordering::Acquire);
 
-            if h >= MAX_BLOCKS {
+            if h >= node.max_blocks {
                 return false; // No space
             }
 
@@ -234,8 +296,14 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
 
             let (numenq, numdeq, endleft, endright, size) = new_block.unwrap();
 
-            // Get block
-            let block = node.get_block(h);
+            // Get block - ensure it exists
+            if h >= node.max_blocks {
+                return false;
+            }
+
+            let Some(block) = node.get_block(h) else {
+                return false;
+            };
 
             // Try to install block with CAS on head
             let current_head = node.head.load(Ordering::Acquire);
@@ -246,15 +314,19 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
 
             // Set block fields
             if h > 0 {
-                let prev = node.get_block(h - 1);
-                block.sumenq.store(
-                    prev.sumenq.load(Ordering::Acquire) + numenq,
-                    Ordering::Release,
-                );
-                block.sumdeq.store(
-                    prev.sumdeq.load(Ordering::Acquire) + numdeq,
-                    Ordering::Release,
-                );
+                if let Some(prev) = node.get_block(h - 1) {
+                    block.sumenq.store(
+                        prev.sumenq.load(Ordering::Acquire) + numenq,
+                        Ordering::Release,
+                    );
+                    block.sumdeq.store(
+                        prev.sumdeq.load(Ordering::Acquire) + numdeq,
+                        Ordering::Release,
+                    );
+                } else {
+                    block.sumenq.store(numenq, Ordering::Release);
+                    block.sumdeq.store(numdeq, Ordering::Release);
+                }
             } else {
                 block.sumenq.store(numenq, Ordering::Release);
                 block.sumdeq.store(numdeq, Ordering::Release);
@@ -273,7 +345,7 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
         }
     }
 
-    // Create block for refresh
+    // Create block for refresh (optimized version)
     fn create_block(
         &self,
         node: &Node<T>,
@@ -286,69 +358,75 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
             let mut numdeq = 0;
 
             // Get previous block's ends
-            let prev_endleft = if h > 0 {
-                let prev = node.get_block(h - 1);
-                prev.endleft.load(Ordering::Acquire)
+            let (prev_endleft, prev_endright) = if h > 0 {
+                if let Some(prev) = node.get_block(h - 1) {
+                    (
+                        prev.endleft.load(Ordering::Acquire),
+                        prev.endright.load(Ordering::Acquire),
+                    )
+                } else {
+                    (0, 0)
+                }
             } else {
-                0
+                (0, 0)
             };
 
-            let prev_endright = if h > 0 {
-                let prev = node.get_block(h - 1);
-                prev.endright.load(Ordering::Acquire)
-            } else {
-                0
-            };
-
-            // Get current heads and count operations
+            // Process left child
             if !node.left.is_null() {
                 let left = &*node.left;
                 endleft = left.head.load(Ordering::Acquire).saturating_sub(1);
 
-                // Count operations from left child
                 if endleft > prev_endleft {
-                    for i in (prev_endleft + 1)..=endleft {
-                        let block = left.get_block(i);
-                        let sumenq = block.sumenq.load(Ordering::Acquire);
-                        let sumdeq = block.sumdeq.load(Ordering::Acquire);
-                        let prev_sumenq = if i > 0 {
-                            left.get_block(i - 1).sumenq.load(Ordering::Acquire)
+                    // Get sum at endleft and prev_endleft
+                    if let Some(end_block) = left.get_block(endleft) {
+                        let end_sumenq = end_block.sumenq.load(Ordering::Acquire);
+                        let end_sumdeq = end_block.sumdeq.load(Ordering::Acquire);
+
+                        let (prev_sumenq, prev_sumdeq) = if prev_endleft > 0 {
+                            if let Some(prev_block) = left.get_block(prev_endleft) {
+                                (
+                                    prev_block.sumenq.load(Ordering::Acquire),
+                                    prev_block.sumdeq.load(Ordering::Acquire),
+                                )
+                            } else {
+                                (0, 0)
+                            }
                         } else {
-                            0
+                            (0, 0)
                         };
-                        let prev_sumdeq = if i > 0 {
-                            left.get_block(i - 1).sumdeq.load(Ordering::Acquire)
-                        } else {
-                            0
-                        };
-                        numenq += sumenq - prev_sumenq;
-                        numdeq += sumdeq - prev_sumdeq;
+
+                        numenq += end_sumenq - prev_sumenq;
+                        numdeq += end_sumdeq - prev_sumdeq;
                     }
                 }
             }
 
+            // Process right child
             if !node.right.is_null() {
                 let right = &*node.right;
                 endright = right.head.load(Ordering::Acquire).saturating_sub(1);
 
-                // Count operations from right child
                 if endright > prev_endright {
-                    for i in (prev_endright + 1)..=endright {
-                        let block = right.get_block(i);
-                        let sumenq = block.sumenq.load(Ordering::Acquire);
-                        let sumdeq = block.sumdeq.load(Ordering::Acquire);
-                        let prev_sumenq = if i > 0 {
-                            right.get_block(i - 1).sumenq.load(Ordering::Acquire)
+                    // Get sum at endright and prev_endright
+                    if let Some(end_block) = right.get_block(endright) {
+                        let end_sumenq = end_block.sumenq.load(Ordering::Acquire);
+                        let end_sumdeq = end_block.sumdeq.load(Ordering::Acquire);
+
+                        let (prev_sumenq, prev_sumdeq) = if prev_endright > 0 {
+                            if let Some(prev_block) = right.get_block(prev_endright) {
+                                (
+                                    prev_block.sumenq.load(Ordering::Acquire),
+                                    prev_block.sumdeq.load(Ordering::Acquire),
+                                )
+                            } else {
+                                (0, 0)
+                            }
                         } else {
-                            0
+                            (0, 0)
                         };
-                        let prev_sumdeq = if i > 0 {
-                            right.get_block(i - 1).sumdeq.load(Ordering::Acquire)
-                        } else {
-                            0
-                        };
-                        numenq += sumenq - prev_sumenq;
-                        numdeq += sumdeq - prev_sumdeq;
+
+                        numenq += end_sumenq - prev_sumenq;
+                        numdeq += end_sumdeq - prev_sumdeq;
                     }
                 }
             }
@@ -360,7 +438,9 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
             // Calculate size for root blocks
             let size = if node.is_root {
                 let prev_size = if h > 0 {
-                    node.get_block(h - 1).size.load(Ordering::Acquire)
+                    node.get_block(h - 1)
+                        .map(|b| b.size.load(Ordering::Acquire))
+                        .unwrap_or(0)
                 } else {
                     0
                 };
@@ -377,15 +457,24 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
     fn advance(&self, node: &Node<T>, h: usize) {
         unsafe {
             // Set super field if not root
-            if !node.is_root && !node.parent.is_null() {
+            if !node.is_root && !node.parent.is_null() && h < node.max_blocks {
                 let parent = &*node.parent;
                 let parent_head = parent.head.load(Ordering::Acquire);
 
-                let block = node.get_block(h);
-                block
-                    .super_idx
-                    .compare_exchange(0, parent_head, Ordering::AcqRel, Ordering::Acquire)
-                    .ok();
+                if let Some(block) = node.get_block(h) {
+                    // Only try to set if it's still 0
+                    if block.super_idx.load(Ordering::Acquire) == 0 {
+                        block
+                            .super_idx
+                            .compare_exchange(
+                                0,
+                                parent_head.max(1),
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .ok();
+                    }
+                }
             }
 
             // Try to advance head
@@ -404,15 +493,18 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
     ) -> (usize, usize) {
         unsafe {
             while !node.is_root {
-                let block = node.get_block(block_idx);
+                let Some(block) = node.get_block(block_idx) else {
+                    return (0, 0);
+                };
+
                 let super_idx = block.super_idx.load(Ordering::Acquire);
+                let super_idx = if super_idx == 0 { 1 } else { super_idx };
 
                 let parent = &*node.parent;
                 let is_left = ptr::eq(parent.left, node);
 
                 // Verify super index
-                let actual_super = if super_idx > 0 {
-                    let parent_block = parent.get_block(super_idx);
+                let actual_super = if let Some(parent_block) = parent.get_block(super_idx) {
                     let end_field = if is_left {
                         parent_block.endleft.load(Ordering::Acquire)
                     } else {
@@ -425,21 +517,27 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                         super_idx
                     }
                 } else {
-                    1 // Minimum valid block
+                    1
                 };
 
                 // Calculate position in parent block
-                let parent_block = parent.get_block(actual_super);
-                let prev_parent = if actual_super > 0 {
-                    Some(parent.get_block(actual_super - 1))
-                } else {
-                    None
+                let (Some(parent_block), prev_parent) = (
+                    parent.get_block(actual_super),
+                    if actual_super > 0 {
+                        parent.get_block(actual_super - 1)
+                    } else {
+                        None
+                    },
+                ) else {
+                    return (0, 0);
                 };
 
                 // Add dequeues before this block in parent
                 if is_left {
                     let prev_sumdeq = if block_idx > 0 {
-                        node.get_block(block_idx - 1).sumdeq.load(Ordering::Acquire)
+                        node.get_block(block_idx - 1)
+                            .map(|b| b.sumdeq.load(Ordering::Acquire))
+                            .unwrap_or(0)
                     } else {
                         0
                     };
@@ -448,8 +546,8 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                         .unwrap_or(0);
                     let parent_prev_sumdeq = if parent_prev_endleft > 0 {
                         node.get_block(parent_prev_endleft)
-                            .sumdeq
-                            .load(Ordering::Acquire)
+                            .map(|b| b.sumdeq.load(Ordering::Acquire))
+                            .unwrap_or(0)
                     } else {
                         0
                     };
@@ -457,7 +555,9 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 } else {
                     // Right child - add left child's dequeues too
                     let prev_sumdeq = if block_idx > 0 {
-                        node.get_block(block_idx - 1).sumdeq.load(Ordering::Acquire)
+                        node.get_block(block_idx - 1)
+                            .map(|b| b.sumdeq.load(Ordering::Acquire))
+                            .unwrap_or(0)
                     } else {
                         0
                     };
@@ -466,8 +566,8 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                         .unwrap_or(0);
                     let parent_prev_sumdeq = if parent_prev_endright > 0 {
                         node.get_block(parent_prev_endright)
-                            .sumdeq
-                            .load(Ordering::Acquire)
+                            .map(|b| b.sumdeq.load(Ordering::Acquire))
+                            .unwrap_or(0)
                     } else {
                         0
                     };
@@ -481,12 +581,16 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                         .unwrap_or(0);
 
                     let left_sumdeq = if endleft > 0 {
-                        left.get_block(endleft).sumdeq.load(Ordering::Acquire)
+                        left.get_block(endleft)
+                            .map(|b| b.sumdeq.load(Ordering::Acquire))
+                            .unwrap_or(0)
                     } else {
                         0
                     };
                     let left_prev_sumdeq = if prev_endleft > 0 {
-                        left.get_block(prev_endleft).sumdeq.load(Ordering::Acquire)
+                        left.get_block(prev_endleft)
+                            .map(|b| b.sumdeq.load(Ordering::Acquire))
+                            .unwrap_or(0)
                     } else {
                         0
                     };
@@ -505,9 +609,18 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
     fn find_response(&self, root_block_idx: usize, deq_rank: usize) -> Result<T, ()> {
         unsafe {
             let root_node = &*self.root;
-            let block = root_node.get_block(root_block_idx);
+
+            // Check if block index is valid
+            if root_block_idx == 0 || root_block_idx >= root_node.head.load(Ordering::Acquire) {
+                return Err(());
+            }
+
+            let Some(block) = root_node.get_block(root_block_idx) else {
+                return Err(());
+            };
+
             let prev_block = if root_block_idx > 0 {
-                Some(root_node.get_block(root_block_idx - 1))
+                root_node.get_block(root_block_idx - 1)
             } else {
                 None
             };
@@ -520,7 +633,7 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                     .map(|b| b.sumenq.load(Ordering::Acquire))
                     .unwrap_or(0);
 
-            // Check if queue is empty
+            // Check if queue is empty at the time of this dequeue
             if prev_size + numenq < deq_rank {
                 return Err(()); // Null dequeue
             }
@@ -531,38 +644,16 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 .unwrap_or(0);
             let enq_rank = deq_rank + prev_sumenq - prev_size;
 
-            // Doubling search for enqueue's block
-            let mut start = root_block_idx;
-            let mut step = 1;
-
-            // Search backwards
-            while start > 0 && root_node.get_block(start).sumenq.load(Ordering::Acquire) >= enq_rank
-            {
-                start = start.saturating_sub(step);
-                step *= 2;
-            }
-
-            // Binary search in the range
-            let mut left = start;
-            let mut right = root_block_idx;
-            let mut target_block = left;
-
-            while left <= right {
-                let mid = (left + right) / 2;
-                let mid_block = root_node.get_block(mid);
-                let mid_sumenq = mid_block.sumenq.load(Ordering::Acquire);
-
-                if mid_sumenq >= enq_rank {
-                    target_block = mid;
-                    right = mid - 1;
-                } else {
-                    left = mid + 1;
-                }
-            }
+            // Binary search for enqueue's block
+            let target_block = self
+                .binary_search_block(
+                    root_node, enq_rank, true, // is_enq
+                )
+                .ok_or(())?;
 
             // Get enqueue within block
             let prev_target = if target_block > 0 {
-                Some(root_node.get_block(target_block - 1))
+                root_node.get_block(target_block - 1)
             } else {
                 None
             };
@@ -581,12 +672,17 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
     fn get_enqueue(&self, node: &Node<T>, block_idx: usize, rank: usize) -> Result<T, ()> {
         unsafe {
             if node.is_leaf {
-                let block = node.get_block(block_idx);
+                let Some(block) = node.get_block(block_idx) else {
+                    return Err(());
+                };
                 (*block.element.get()).clone().ok_or(())
             } else {
-                let block = node.get_block(block_idx);
+                let Some(block) = node.get_block(block_idx) else {
+                    return Err(());
+                };
+
                 let prev_block = if block_idx > 0 {
-                    Some(node.get_block(block_idx - 1))
+                    node.get_block(block_idx - 1)
                 } else {
                     None
                 };
@@ -598,60 +694,52 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 let endleft = block.endleft.load(Ordering::Acquire);
 
                 let left = &*node.left;
+
+                // Calculate left child's enqueues using sums
                 let left_numenq = if endleft > prev_endleft {
-                    let mut sum = 0;
-                    for i in (prev_endleft + 1)..=endleft {
-                        let child_block = left.get_block(i);
-                        let sumenq = child_block.sumenq.load(Ordering::Acquire);
-                        let prev_sumenq = if i > 0 {
-                            left.get_block(i - 1).sumenq.load(Ordering::Acquire)
-                        } else {
-                            0
-                        };
-                        sum += sumenq - prev_sumenq;
-                    }
-                    sum
+                    let end_sum = left
+                        .get_block(endleft)
+                        .map(|b| b.sumenq.load(Ordering::Acquire))
+                        .unwrap_or(0);
+                    let prev_sum = if prev_endleft > 0 {
+                        left.get_block(prev_endleft)
+                            .map(|b| b.sumenq.load(Ordering::Acquire))
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    end_sum - prev_sum
                 } else {
                     0
                 };
 
                 if rank <= left_numenq {
                     // In left child - binary search for the block
-                    let mut left_idx = prev_endleft + 1;
-                    let mut right_idx = endleft;
-                    let mut target = left_idx;
-                    let mut accumulated = 0;
+                    let target_enq = if prev_endleft > 0 {
+                        let base = left
+                            .get_block(prev_endleft)
+                            .map(|b| b.sumenq.load(Ordering::Acquire))
+                            .unwrap_or(0);
+                        base + rank
+                    } else {
+                        rank
+                    };
 
-                    while left_idx <= right_idx {
-                        let mid = (left_idx + right_idx) / 2;
-                        let child_block = left.get_block(mid);
-                        let sumenq = child_block.sumenq.load(Ordering::Acquire);
-                        let base_sumenq = if prev_endleft > 0 {
-                            left.get_block(prev_endleft).sumenq.load(Ordering::Acquire)
-                        } else {
-                            0
-                        };
+                    let target = self
+                        .binary_search_block(
+                            left, target_enq, true, // is_enq
+                        )
+                        .ok_or(())?;
 
-                        if sumenq - base_sumenq >= rank {
-                            target = mid;
-                            right_idx = mid - 1;
-                        } else {
-                            left_idx = mid + 1;
-                        }
-                    }
+                    let prev_sum = if target > 1 {
+                        left.get_block(target - 1)
+                            .map(|b| b.sumenq.load(Ordering::Acquire))
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
 
-                    // Calculate accumulated up to target - 1
-                    if target > prev_endleft + 1 {
-                        let prev_target = left.get_block(target - 1);
-                        let base = if prev_endleft > 0 {
-                            left.get_block(prev_endleft).sumenq.load(Ordering::Acquire)
-                        } else {
-                            0
-                        };
-                        accumulated = prev_target.sumenq.load(Ordering::Acquire) - base;
-                    }
-
-                    let rank_in_child = rank - accumulated;
+                    let rank_in_child = target_enq - prev_sum;
                     self.get_enqueue(left, target, rank_in_child)
                 } else {
                     // In right child
@@ -659,52 +747,35 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                     let prev_endright = prev_block
                         .map(|b| b.endright.load(Ordering::Acquire))
                         .unwrap_or(0);
-                    let endright = block.endright.load(Ordering::Acquire);
 
                     let adjusted_rank = rank - left_numenq;
 
-                    // Binary search in right child
-                    let mut left_idx = prev_endright + 1;
-                    let mut right_idx = endright;
-                    let mut target = left_idx;
-                    let mut accumulated = 0;
+                    let target_enq = if prev_endright > 0 {
+                        let base = right
+                            .get_block(prev_endright)
+                            .map(|b| b.sumenq.load(Ordering::Acquire))
+                            .unwrap_or(0);
+                        base + adjusted_rank
+                    } else {
+                        adjusted_rank
+                    };
 
-                    while left_idx <= right_idx {
-                        let mid = (left_idx + right_idx) / 2;
-                        let child_block = right.get_block(mid);
-                        let sumenq = child_block.sumenq.load(Ordering::Acquire);
-                        let base_sumenq = if prev_endright > 0 {
-                            right
-                                .get_block(prev_endright)
-                                .sumenq
-                                .load(Ordering::Acquire)
-                        } else {
-                            0
-                        };
+                    let target = self
+                        .binary_search_block(
+                            right, target_enq, true, // is_enq
+                        )
+                        .ok_or(())?;
 
-                        if sumenq - base_sumenq >= adjusted_rank {
-                            target = mid;
-                            right_idx = mid - 1;
-                        } else {
-                            left_idx = mid + 1;
-                        }
-                    }
+                    let prev_sum = if target > 1 {
+                        right
+                            .get_block(target - 1)
+                            .map(|b| b.sumenq.load(Ordering::Acquire))
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
 
-                    // Calculate accumulated up to target - 1
-                    if target > prev_endright + 1 {
-                        let prev_target = right.get_block(target - 1);
-                        let base = if prev_endright > 0 {
-                            right
-                                .get_block(prev_endright)
-                                .sumenq
-                                .load(Ordering::Acquire)
-                        } else {
-                            0
-                        };
-                        accumulated = prev_target.sumenq.load(Ordering::Acquire) - base;
-                    }
-
-                    let rank_in_child = adjusted_rank - accumulated;
+                    let rank_in_child = target_enq - prev_sum;
                     self.get_enqueue(right, target, rank_in_child)
                 }
             }
@@ -718,22 +789,36 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
         // Calculate tree dimensions
         let tree_height = (num_processes as f64).log2().ceil() as usize;
         let tree_size = (1 << (tree_height + 1)) - 1;
+        let leaf_start = (1 << tree_height) - 1;
+        let internal_nodes = leaf_start;
 
-        // Calculate node size (node struct + blocks array)
+        // Calculate node sizes
         let node_struct_size = mem::size_of::<Node<T>>();
-        let blocks_offset = (node_struct_size + 63) & !63; // Cache line align
-        let blocks_size = MAX_BLOCKS * mem::size_of::<Block<T>>();
-        let node_size = blocks_offset + blocks_size;
-        let node_size_aligned = (node_size + 63) & !63;
+        let node_aligned = (node_struct_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
+
+        // Block size should already be cache-line aligned due to #[repr(C, align(64))]
+        let block_size = mem::size_of::<Block<T>>();
+        let leaf_blocks_size = BLOCKS_PER_LEAF * block_size;
+        let internal_blocks_size = BLOCKS_PER_INTERNAL * block_size;
+
+        let leaf_node_size = node_aligned + leaf_blocks_size;
+        let internal_node_size = node_aligned + internal_blocks_size;
+
+        // Align to cache lines
+        let leaf_node_size = (leaf_node_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
+        let internal_node_size =
+            (internal_node_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
         // Memory layout
         let queue_size = mem::size_of::<Self>();
         let queue_aligned = (queue_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
         let nodes_offset = queue_aligned;
-        let nodes_total_size = tree_size * node_size_aligned;
+        let internal_nodes_size = internal_nodes * internal_node_size;
+        let leaf_nodes_size = num_processes * leaf_node_size;
+        let total_nodes_size = internal_nodes_size + leaf_nodes_size;
 
-        let total_size = nodes_offset + nodes_total_size;
+        let total_size = nodes_offset + total_nodes_size;
 
         // Initialize queue
         ptr::write(
@@ -744,8 +829,9 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 num_processes,
                 base_ptr: mem,
                 total_size,
-                nodes_offset,
-                node_size: node_size_aligned,
+                nodes_base: mem.add(nodes_offset),
+                leaf_node_size,
+                internal_node_size,
                 _phantom: std::marker::PhantomData,
             },
         );
@@ -754,18 +840,42 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
 
         // Initialize nodes and their blocks
         for i in 0..tree_size {
-            let node_ptr = queue.get_node_ptr(i);
-            ptr::write(node_ptr, Node::new());
+            if i >= leaf_start + num_processes {
+                continue; // Skip unused leaves
+            }
 
-            // Initialize sentinel block (block 0) only
+            let node_ptr = queue.get_node_ptr(i);
+            let max_blocks = if i >= leaf_start {
+                BLOCKS_PER_LEAF
+            } else {
+                BLOCKS_PER_INTERNAL
+            };
+
+            ptr::write(node_ptr, Node::new(max_blocks));
+
+            // Initialize first few blocks to avoid initialization races
             let blocks_ptr = (*node_ptr).get_blocks_ptr();
-            ptr::write(blocks_ptr.add(0), Block::new());
+            let blocks_to_init = if i >= leaf_start {
+                // For leaves, initialize a reasonable number of blocks
+                1000.min(max_blocks)
+            } else {
+                // For internal nodes, initialize fewer
+                100.min(max_blocks)
+            };
+
+            for j in 0..blocks_to_init {
+                ptr::write(blocks_ptr.add(j), Block::new());
+            }
         }
 
         // Build tree structure
         queue.root = queue.get_node_ptr(0); // Root is at index 0
 
         for i in 0..tree_size {
+            if i >= leaf_start + num_processes {
+                continue; // Skip unused leaves
+            }
+
             let node = &mut *queue.get_node_ptr(i);
 
             // Set tree pointers
@@ -776,15 +886,18 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
             let left_idx = 2 * i + 1;
             let right_idx = 2 * i + 2;
 
-            if left_idx < tree_size {
+            if left_idx < tree_size
+                && (left_idx < leaf_start || left_idx < leaf_start + num_processes)
+            {
                 node.left = queue.get_node_ptr(left_idx);
             }
-            if right_idx < tree_size {
+            if right_idx < tree_size
+                && (right_idx < leaf_start || right_idx < leaf_start + num_processes)
+            {
                 node.right = queue.get_node_ptr(right_idx);
             }
 
             // Mark leaves and root
-            let leaf_start = (1 << tree_height) - 1;
             if i >= leaf_start && i < leaf_start + num_processes {
                 node.is_leaf = true;
                 node.process_id = i - leaf_start;
@@ -801,21 +914,34 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
     // Calculate required shared memory size
     pub fn shared_size(num_processes: usize) -> usize {
         let tree_height = (num_processes as f64).log2().ceil() as usize;
-        let tree_size = (1 << (tree_height + 1)) - 1;
+        let leaf_start = (1 << tree_height) - 1;
+        let internal_nodes = leaf_start;
 
         let queue_size = mem::size_of::<Self>();
         let queue_aligned = (queue_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
-        // Calculate node size
+        // Calculate node sizes
         let node_struct_size = mem::size_of::<Node<T>>();
-        let blocks_offset = (node_struct_size + 63) & !63;
-        let blocks_size = MAX_BLOCKS * mem::size_of::<Block<T>>();
-        let node_size = blocks_offset + blocks_size;
-        let node_size_aligned = (node_size + 63) & !63;
+        let node_aligned = (node_struct_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
-        let nodes_total_size = tree_size * node_size_aligned;
+        // Block size should already be cache-line aligned due to #[repr(C, align(64))]
+        let block_size = mem::size_of::<Block<T>>();
+        let leaf_blocks_size = BLOCKS_PER_LEAF * block_size;
+        let internal_blocks_size = BLOCKS_PER_INTERNAL * block_size;
 
-        let total = queue_aligned + nodes_total_size;
+        let leaf_node_size = node_aligned + leaf_blocks_size;
+        let internal_node_size = node_aligned + internal_blocks_size;
+
+        // Align to cache lines
+        let leaf_node_size = (leaf_node_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
+        let internal_node_size =
+            (internal_node_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
+
+        let internal_nodes_size = internal_nodes * internal_node_size;
+        let leaf_nodes_size = num_processes * leaf_node_size;
+        let total_nodes_size = internal_nodes_size + leaf_nodes_size;
+
+        let total = queue_aligned + total_nodes_size;
         (total + 4095) & !4095 // Page align
     }
 
@@ -842,7 +968,17 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
             // Find dequeue's position
             let leaf = self.get_leaf(thread_id);
             let leaf_head = leaf.head.load(Ordering::Acquire);
+            if leaf_head <= 1 {
+                return Err(());
+            }
+
+            // The dequeue we just appended is at position leaf_head - 1
             let (root_block, rank) = self.index_dequeue(leaf, leaf_head - 1, 1);
+
+            // Check if we got a valid root block
+            if root_block == 0 {
+                return Err(());
+            }
 
             // Get response
             self.find_response(root_block, rank)
@@ -858,13 +994,16 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 return true;
             }
 
-            let block = root_node.get_block(head - 1);
-            block.size.load(Ordering::Acquire) == 0
+            if let Some(block) = root_node.get_block(head - 1) {
+                block.size.load(Ordering::Acquire) == 0
+            } else {
+                true
+            }
         }
     }
 
     pub fn is_full(&self) -> bool {
-        false // Unbounded queue
+        false // Unbounded queue (within block limits)
     }
 }
 

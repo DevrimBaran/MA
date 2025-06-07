@@ -7,13 +7,12 @@ use nix::{
 use queues::mpmc::{self, polylog_queue, ymc_queue};
 use queues::mpmc::{BurdenWFQueue, KWQueue, NRQueue, WFQueue, YangCrummeyQueue};
 use queues::MpmcQueue;
-use std::cmp::min;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 const PERFORMANCE_TEST: bool = false;
-const ITEMS_PER_PROCESS_TARGET: usize = 200_000;
+const ITEMS_PER_PROCESS_TARGET: usize = 250_000;
 const PROCESS_COUNTS_TO_TEST: &[(usize, usize)] = &[(1, 1), (2, 2), (4, 4), (6, 6)];
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 100_000_000;
 
@@ -332,126 +331,32 @@ where
                 let my_target = target_items + extra_items;
 
                 let mut consecutive_empty_checks = 0;
-                let mut last_propagation_attempt = 0;
-                const PROPAGATION_INTERVAL: usize = 100;
                 const MAX_CONSECUTIVE_EMPTY_CHECKS: usize = 10000;
-                const FINAL_DRAIN_ATTEMPTS: usize = 5;
 
-                // Main consumption loop
                 while consumed_count < my_target {
                     match q.bench_pop(num_producers + consumer_id) {
                         Ok(_item) => {
                             consumed_count += 1;
                             consecutive_empty_checks = 0;
-                            last_propagation_attempt = 0;
                         }
                         Err(_) => {
-                            consecutive_empty_checks += 1;
-
-                            // Periodic propagation attempts
-                            if consecutive_empty_checks
-                                > last_propagation_attempt + PROPAGATION_INTERVAL
+                            // Only count it as truly empty if all producers are done
+                            // AND we've waited a reasonable time for propagation
+                            if done_sync.producers_done.load(Ordering::Acquire)
+                                == num_producers as u32
                             {
-                                last_propagation_attempt = consecutive_empty_checks;
+                                consecutive_empty_checks += 1;
 
-                                // Check if producers are done
-                                let producers_done =
-                                    done_sync.producers_done.load(Ordering::Acquire)
-                                        == num_producers as u32;
-
-                                if producers_done {
-                                    // Force propagation for NRQueue
-                                    if let Some(nr_queue) =
-                                        unsafe { (q as *const _ as *const NRQueue<usize>).as_ref() }
-                                    {
-                                        nr_queue.force_full_propagation();
-
-                                        // After forcing propagation, try a few more times
-                                        for _ in 0..10 {
-                                            match q.bench_pop(num_producers + consumer_id) {
-                                                Ok(_item) => {
-                                                    consumed_count += 1;
-                                                    consecutive_empty_checks = 0;
-                                                    break;
-                                                }
-                                                Err(_) => {
-                                                    std::hint::spin_loop();
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Give up if we've been empty for too long
-                            if consecutive_empty_checks > MAX_CONSECUTIVE_EMPTY_CHECKS
-                                && consumed_count > 0
-                            {
-                                // But first, make absolutely sure there's nothing left
-                                if done_sync.producers_done.load(Ordering::Acquire)
-                                    == num_producers as u32
-                                {
-                                    // Final drain attempt
-                                    for _ in 0..FINAL_DRAIN_ATTEMPTS {
-                                        if let Some(nr_queue) = unsafe {
-                                            (q as *const _ as *const NRQueue<usize>).as_ref()
-                                        } {
-                                            nr_queue.force_full_propagation();
-                                        }
-
-                                        // Try to consume multiple times after each propagation
-                                        let mut found_any = false;
-                                        for _ in 0..100 {
-                                            match q.bench_pop(num_producers + consumer_id) {
-                                                Ok(_item) => {
-                                                    consumed_count += 1;
-                                                    found_any = true;
-                                                }
-                                                Err(_) => {
-                                                    if !found_any {
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        if !found_any {
-                                            break;
-                                        }
-                                    }
-
-                                    // Really give up now
+                                // Give more time for propagation
+                                if consecutive_empty_checks < 100 {
+                                    std::thread::sleep(std::time::Duration::from_micros(1));
+                                } else if consecutive_empty_checks > MAX_CONSECUTIVE_EMPTY_CHECKS {
                                     break;
                                 }
                             }
-
-                            // Backoff spinning
-                            for _ in 0..min(consecutive_empty_checks, 1000) {
+                            // Don't yield immediately - spin a bit first
+                            for _ in 0..100 {
                                 std::hint::spin_loop();
-                            }
-                        }
-                    }
-                }
-
-                // Before exiting, try one final aggressive drain
-                if consumed_count < my_target
-                    && done_sync.producers_done.load(Ordering::Acquire) == num_producers as u32
-                {
-                    // Force propagation one more time
-                    if let Some(nr_queue) =
-                        unsafe { (q as *const _ as *const NRQueue<usize>).as_ref() }
-                    {
-                        nr_queue.force_full_propagation();
-                    }
-
-                    // Try to get remaining items
-                    while consumed_count < my_target {
-                        match q.bench_pop(num_producers + consumer_id) {
-                            Ok(_item) => {
-                                consumed_count += 1;
-                            }
-                            Err(_) => {
-                                break;
                             }
                         }
                     }
@@ -685,10 +590,9 @@ fn bench_nr_queue(c: &mut Criterion) {
                 b.iter_custom(|_iters| {
                     fork_and_run_mpmc_with_helper::<NRQueue<usize>, _>(
                         || {
-                            let bytes = NRQueue::<usize>::shared_size(total_processes * 2);
+                            let bytes = NRQueue::<usize>::shared_size(total_processes);
                             let shm_ptr = unsafe { map_shared(bytes) };
-                            let q =
-                                unsafe { NRQueue::init_in_shared(shm_ptr, total_processes * 2) };
+                            let q = unsafe { NRQueue::init_in_shared(shm_ptr, total_processes) };
                             (q, shm_ptr, bytes)
                         },
                         num_prods,
@@ -714,8 +618,7 @@ fn custom_criterion() -> Criterion {
 criterion_group! {
     name = benches;
     config = custom_criterion();
-    targets =
-        bench_nr_queue,
+    targets = bench_nr_queue
 }
 
 criterion_main!(benches);

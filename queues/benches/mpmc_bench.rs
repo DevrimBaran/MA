@@ -541,10 +541,33 @@ where
                 let my_target = target_items + extra_items;
 
                 let mut consecutive_empty = 0;
-                const SYNC_EVERY_N_EMPTY: usize = 1000;
-                const AGGRESSIVE_SYNC_AFTER: usize = 10000;
+                const MAX_EMPTY_AFTER_DONE: usize = 50000; // Reduced from 100000
+                let mut total_dequeue_attempts = 0; // Track ALL dequeue attempts
 
                 while consumed_count < my_target {
+                    total_dequeue_attempts += 1;
+
+                    // CRITICAL: For single consumer, allow exactly total_items + 1 attempts
+                    // The +1 is for discovering the queue is empty
+                    if num_consumers == 1 && total_dequeue_attempts > total_items + 1 {
+                        eprintln!(
+                            "Consumer {} stopping - dequeue attempts ({}) > items + 1 ({})",
+                            consumer_id,
+                            total_dequeue_attempts,
+                            total_items + 1
+                        );
+                        break;
+                    } else if total_dequeue_attempts > total_items * 2 {
+                        // For multiple consumers, be more lenient due to races
+                        eprintln!(
+                            "Consumer {} stopping - excessive dequeue attempts ({} > {})",
+                            consumer_id,
+                            total_dequeue_attempts,
+                            total_items * 2
+                        );
+                        break;
+                    }
+
                     match q.bench_pop(num_producers + consumer_id) {
                         Ok(_item) => {
                             consumed_count += 1;
@@ -557,31 +580,36 @@ where
                             {
                                 consecutive_empty += 1;
 
-                                // Every 1000 empty tries, force sync
+                                // Periodically force sync
                                 if consecutive_empty % 1000 == 0 {
                                     unsafe {
                                         let nr_queue = &*(q as *const _ as *const NRQueue<usize>);
-                                        nr_queue.sync();
 
-                                        // Check if we're really done
-                                        let actual_size = nr_queue.get_actual_queue_size();
-                                        if actual_size == 0 && !nr_queue.has_pending_enqueues() {
-                                            // Really empty and no pending operations
-                                            if consecutive_empty > 10000 {
-                                                eprintln!(
-                                                    "Consumer {} stopping. Consumed {}/{} items",
-                                                    consumer_id, consumed_count, my_target
-                                                );
-                                                break;
+                                        // Use increasingly aggressive sync
+                                        if consecutive_empty < 10000 {
+                                            nr_queue.sync();
+                                        } else if consecutive_empty < 30000 {
+                                            // More aggressive
+                                            for _ in 0..3 {
+                                                nr_queue.sync();
                                             }
                                         } else {
-                                            // Reset counter - there's still stuff to consume
-                                            consecutive_empty = 0;
+                                            // Super aggressive
+                                            nr_queue.force_complete_sync();
                                         }
                                     }
                                 }
+
+                                // If we've tried a LOT and producers are done, we're probably done
+                                if consecutive_empty > MAX_EMPTY_AFTER_DONE {
+                                    eprintln!(
+                                        "Consumer {} stopping after {} empty tries. Consumed {}/{} items",
+                                        consumer_id, consecutive_empty, consumed_count, my_target
+                                    );
+                                    break;
+                                }
                             } else {
-                                // Producers still running
+                                // Producers still running - keep trying
                                 std::hint::spin_loop();
                             }
                         }

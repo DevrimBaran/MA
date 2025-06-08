@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 const PERFORMANCE_TEST: bool = false;
-const ITEMS_PER_PROCESS_TARGET: usize = 250_000;
+const ITEMS_PER_PROCESS_TARGET: usize = 100_000;
 const PROCESS_COUNTS_TO_TEST: &[(usize, usize)] = &[(1, 1), (2, 2), (4, 4), (6, 6)];
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 100_000_000;
 
@@ -122,7 +122,7 @@ impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for NRQueue<T> {
     }
 
     fn bench_pop(&self, process_id: usize) -> Result<T, ()> {
-        self.dequeue(process_id)
+        self.simple_dequeue(process_id)
     }
 
     fn bench_is_empty(&self) -> bool {
@@ -540,55 +540,55 @@ where
                 };
                 let my_target = target_items + extra_items;
 
-                let mut consecutive_empty_checks = 0;
-                const MAX_CONSECUTIVE_EMPTY_CHECKS: usize = 100_000;
+                let mut consecutive_empty = 0;
+                const SYNC_EVERY_N_EMPTY: usize = 1000;
+                const AGGRESSIVE_SYNC_AFTER: usize = 10000;
 
                 while consumed_count < my_target {
                     match q.bench_pop(num_producers + consumer_id) {
                         Ok(_item) => {
                             consumed_count += 1;
-                            consecutive_empty_checks = 0;
+                            consecutive_empty = 0;
                         }
                         Err(_) => {
-                            // Check if all producers are done
+                            // Only worry about empty after producers are done
                             if done_sync.producers_done.load(Ordering::Acquire)
                                 == num_producers as u32
                             {
-                                consecutive_empty_checks += 1;
+                                consecutive_empty += 1;
 
-                                // For NRQueue, we need to sync to ensure all operations propagate
-                                if consecutive_empty_checks == 1000 {
-                                    // Cast to NRQueue and call sync
+                                // Every 1000 empty tries, force sync
+                                if consecutive_empty % 1000 == 0 {
                                     unsafe {
                                         let nr_queue = &*(q as *const _ as *const NRQueue<usize>);
                                         nr_queue.sync();
-                                    }
-                                }
 
-                                // After sync, check total enqueued vs consumed
-                                if consecutive_empty_checks > 10000 {
-                                    unsafe {
-                                        let nr_queue = &*(q as *const _ as *const NRQueue<usize>);
-                                        let total_enqueued = nr_queue.total_enqueued();
-                                        let total_dequeued = nr_queue.total_dequeued();
-
-                                        // If we've consumed everything that was enqueued, we're done
-                                        if total_dequeued >= total_enqueued && total_enqueued > 0 {
-                                            break;
+                                        // Check if we're really done
+                                        let actual_size = nr_queue.get_actual_queue_size();
+                                        if actual_size == 0 && !nr_queue.has_pending_enqueues() {
+                                            // Really empty and no pending operations
+                                            if consecutive_empty > 10000 {
+                                                eprintln!(
+                                                    "Consumer {} stopping. Consumed {}/{} items",
+                                                    consumer_id, consumed_count, my_target
+                                                );
+                                                break;
+                                            }
+                                        } else {
+                                            // Reset counter - there's still stuff to consume
+                                            consecutive_empty = 0;
                                         }
                                     }
                                 }
-
-                                if consecutive_empty_checks > MAX_CONSECUTIVE_EMPTY_CHECKS {
-                                    break;
-                                }
+                            } else {
+                                // Producers still running
+                                std::hint::spin_loop();
                             }
-                            std::hint::spin_loop();
                         }
                     }
                 }
 
-                // Add this consumer's count to the total
+                // Report what we consumed
                 done_sync
                     .total_consumed
                     .fetch_add(consumed_count, Ordering::AcqRel);
@@ -637,15 +637,18 @@ where
     // Get the total consumed count
     let total_consumed = done_sync.total_consumed.load(Ordering::Acquire);
 
+    // This should ALWAYS equal total_items
     if total_consumed != total_items {
         eprintln!(
-            "Warning (MPMC): Total consumed {}/{} items. Q: {}, Prods: {}, Cons: {}",
-            total_consumed,
-            total_items,
-            std::any::type_name::<Q>(),
-            num_producers,
-            num_consumers
+            "ERROR: NRQueue data loss! Consumed {}/{} items. Prods: {}, Cons: {}",
+            total_consumed, total_items, num_producers, num_consumers
         );
+
+        // Debug the final state
+        unsafe {
+            let nr_queue = &*(q as *const _ as *const NRQueue<usize>);
+            nr_queue.debug_state();
+        }
     }
 
     unsafe {

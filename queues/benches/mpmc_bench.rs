@@ -532,91 +532,49 @@ where
                 }
 
                 let mut consumed_count = 0;
-                let target_items = total_items / num_consumers;
-                let extra_items = if consumer_id < (total_items % num_consumers) {
-                    1
-                } else {
-                    0
-                };
-                let my_target = target_items + extra_items;
+                let mut consecutive_empty_checks = 0;
+                const MAX_CONSECUTIVE_EMPTY_CHECKS: usize = 10000;
 
-                let mut consecutive_empty = 0;
-                const MAX_EMPTY_AFTER_DONE: usize = 50000; // Reduced from 100000
-                let mut total_dequeue_attempts = 0; // Track ALL dequeue attempts
-
-                while consumed_count < my_target {
-                    total_dequeue_attempts += 1;
-
-                    // CRITICAL: For single consumer, allow exactly total_items + 1 attempts
-                    // The +1 is for discovering the queue is empty
-                    if num_consumers == 1 && total_dequeue_attempts > total_items + 1 {
-                        eprintln!(
-                            "Consumer {} stopping - dequeue attempts ({}) > items + 1 ({})",
-                            consumer_id,
-                            total_dequeue_attempts,
-                            total_items + 1
-                        );
-                        break;
-                    } else if total_dequeue_attempts > total_items * 2 {
-                        // For multiple consumers, be more lenient due to races
-                        eprintln!(
-                            "Consumer {} stopping - excessive dequeue attempts ({} > {})",
-                            consumer_id,
-                            total_dequeue_attempts,
-                            total_items * 2
-                        );
-                        break;
-                    }
-
+                loop {
                     match q.bench_pop(num_producers + consumer_id) {
                         Ok(_item) => {
                             consumed_count += 1;
-                            consecutive_empty = 0;
+                            consecutive_empty_checks = 0;
                         }
                         Err(_) => {
                             // Only worry about empty after producers are done
                             if done_sync.producers_done.load(Ordering::Acquire)
                                 == num_producers as u32
                             {
-                                consecutive_empty += 1;
+                                consecutive_empty_checks += 1;
 
-                                // Periodically force sync
-                                if consecutive_empty % 1000 == 0 {
-                                    unsafe {
-                                        let nr_queue = &*(q as *const _ as *const NRQueue<usize>);
-
-                                        // Use increasingly aggressive sync
-                                        if consecutive_empty < 10000 {
-                                            nr_queue.sync();
-                                        } else if consecutive_empty < 30000 {
-                                            // More aggressive
-                                            for _ in 0..3 {
-                                                nr_queue.sync();
-                                            }
-                                        } else {
-                                            // Super aggressive
-                                            nr_queue.force_complete_sync();
-                                        }
+                                // Periodically check if all items have been consumed globally
+                                if consecutive_empty_checks % 1000 == 0 {
+                                    let total_consumed_global =
+                                        done_sync.total_consumed.load(Ordering::Acquire);
+                                    if total_consumed_global >= total_items {
+                                        // All items consumed globally, we can stop
+                                        break;
                                     }
                                 }
 
-                                // If we've tried a LOT and producers are done, we're probably done
-                                if consecutive_empty > MAX_EMPTY_AFTER_DONE {
-                                    eprintln!(
-                                        "Consumer {} stopping after {} empty tries. Consumed {}/{} items",
-                                        consumer_id, consecutive_empty, consumed_count, my_target
-                                    );
+                                // Give more time for propagation
+                                if consecutive_empty_checks < 100 {
+                                    std::thread::sleep(std::time::Duration::from_micros(1));
+                                } else if consecutive_empty_checks > MAX_CONSECUTIVE_EMPTY_CHECKS {
+                                    // We've waited long enough
                                     break;
                                 }
-                            } else {
-                                // Producers still running - keep trying
+                            }
+                            // Don't yield immediately - spin a bit first
+                            for _ in 0..100 {
                                 std::hint::spin_loop();
                             }
                         }
                     }
                 }
 
-                // Report what we consumed
+                // Add this consumer's count to the total
                 done_sync
                     .total_consumed
                     .fetch_add(consumed_count, Ordering::AcqRel);

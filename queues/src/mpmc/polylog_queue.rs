@@ -7,6 +7,8 @@ use crate::MpmcQueue;
 
 const CACHE_LINE_SIZE: usize = 64;
 const BLOCKS_PER_NODE: usize = 2_000_000;
+const MAX_SPIN_ITERATIONS: usize = 1000;
+const MAX_BLOCK_SEARCH_ITERATIONS: usize = 100;
 
 #[repr(C)]
 struct Block<T> {
@@ -321,18 +323,16 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
     }
 
     pub fn simple_dequeue(&self, thread_id: usize) -> Result<T, ()> {
-        const MAX_RETRIES: usize = 3; // enough for propagation
+        const MAX_RETRIES: usize = 3;
 
         for _ in 0..=MAX_RETRIES {
-            /* 1 ─ ensure our view is current */
             self.sync();
 
-            /* 2 ─ read authoritative counters in the root */
             unsafe {
                 let root = &*self.root;
                 let root_head = root.head.load(Ordering::Acquire);
                 if root_head <= 1 {
-                    return Err(()); // queue empty
+                    return Err(());
                 }
 
                 let last_blk = root.get_block(root_head - 1).ok_or(())?;
@@ -341,25 +341,19 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 let size_now = last_blk.size.load(Ordering::Acquire);
 
                 if size_now == 0 {
-                    return Err(()); // empty for sure
+                    return Err(());
                 }
 
-                /* 3 ─ our dequeue must succeed: append our block */
                 self.append(thread_id, None);
-
-                /* 4 ─ propagate our block (and any pending enqueues) */
                 self.sync();
 
-                /* 5 ─ fetch the element that belongs to the new total_deq+1 */
-                let my_rank = total_deq + 1; // exactly the next dequeue
+                let my_rank = total_deq + 1;
                 if let Ok(val) = self.get_enqueue_by_rank(my_rank) {
-                    return Ok(val); // success
+                    return Ok(val);
                 }
-                /* else: propagation lagged – retry the whole procedure */
             }
         }
 
-        /* After MAX_RETRIES the element is still not visible: declare empty. */
         Err(())
     }
 
@@ -406,7 +400,10 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 } else {
                     0
                 };
-                loop {
+
+                // Bounded loop - at most we'll search through p blocks
+                let max_search = self.num_processes.min(MAX_BLOCK_SEARCH_ITERATIONS);
+                for _ in 0..max_search {
                     let block = match root.get_block(blk) {
                         Some(b) => b,
                         None => break,
@@ -427,6 +424,7 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
 
     pub fn sync(&self) {
         unsafe {
+            // Help all leaves advance
             for i in 0..self.num_processes {
                 let leaf = self.get_leaf(i);
                 let head = leaf.head.load(Ordering::Acquire);
@@ -436,7 +434,9 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 }
             }
 
-            for pass in 0..5 {
+            // Bounded number of passes through the tree
+            let max_passes = 5.min(self.tree_height + 2);
+            for pass in 0..max_passes {
                 for level in (0..=self.tree_height).rev() {
                     let start_idx = (1 << level) - 1;
                     let end_idx = (1 << (level + 1)) - 1;
@@ -444,6 +444,7 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                     for idx in start_idx..end_idx.min(start_idx + (1 << level)) {
                         let node = self.get_node(idx);
 
+                        // Bounded refresh attempts
                         for _ in 0..3 {
                             self.refresh(node);
 
@@ -455,7 +456,7 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                     }
                 }
 
-                if pass < 4 {
+                if pass < max_passes - 1 {
                     std::thread::yield_now();
                 }
             }
@@ -475,7 +476,6 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                     let current_super = block.super_idx.load(Ordering::Acquire);
                     if current_super == 0 {
                         let parent_head = parent.head.load(Ordering::Acquire);
-
                         let super_value = parent_head.max(1);
                         block.super_idx.store(super_value, Ordering::Release);
                     }
@@ -495,9 +495,33 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 let block = node.get_block(block_idx).expect("Block must exist");
                 let mut super_idx = block.super_idx.load(Ordering::Acquire);
 
-                while super_idx == 0 {
-                    std::hint::spin_loop();
+                // FIXED: Bounded spin with helping
+                let mut spin_count = 0;
+                while super_idx == 0 && spin_count < MAX_SPIN_ITERATIONS {
+                    // Help advance the parent
+                    if !node.parent.is_null() {
+                        let parent = &*node.parent;
+                        let parent_head = parent.head.load(Ordering::Acquire);
+                        if parent_head > 0 {
+                            self.advance(parent, parent_head - 1);
+                        }
+
+                        // Also help refresh the parent to propagate our block
+                        self.refresh(parent);
+                    }
+
+                    spin_count += 1;
+                    if spin_count % 10 == 0 {
+                        std::thread::yield_now();
+                    }
+
                     super_idx = block.super_idx.load(Ordering::Acquire);
+                }
+
+                // If still 0 after bounded spinning, use conservative estimate
+                if super_idx == 0 {
+                    let parent = &*node.parent;
+                    super_idx = parent.head.load(Ordering::Acquire).max(1);
                 }
 
                 let parent = &*node.parent;
@@ -603,11 +627,13 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
         mut blk_idx: usize,
         mut rank: usize,
     ) -> Result<T, ()> {
-        use std::sync::atomic::Ordering;
         unsafe {
-            loop {
+            // Bounded depth - at most tree_height iterations
+            for _ in 0..=self.tree_height {
                 if node.is_leaf {
-                    loop {
+                    // Bounded search through blocks in leaf
+                    let max_leaf_search = self.num_processes.min(MAX_BLOCK_SEARCH_ITERATIONS);
+                    for _ in 0..max_leaf_search {
                         let head_limit = node.head.load(Ordering::Acquire).saturating_sub(1);
                         if blk_idx > head_limit {
                             return Err(());
@@ -628,9 +654,13 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                         }
                         return (*blk.element.get()).clone().ok_or(());
                     }
+                    return Err(()); // Not found after bounded search
                 }
 
-                loop {
+                // For internal nodes, bounded search
+                let max_internal_search = (2 * self.num_processes).min(MAX_BLOCK_SEARCH_ITERATIONS);
+                let mut found = false;
+                for _ in 0..max_internal_search {
                     let head_limit = node.head.load(Ordering::Acquire).saturating_sub(1);
                     if blk_idx > head_limit {
                         return Err(());
@@ -699,6 +729,7 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                         continue;
                     }
 
+                    // Found the block containing our element
                     if rank <= left_num && left_num > 0 {
                         node = &*node.left;
                         blk_idx = blk.endleft.load(Ordering::Acquire);
@@ -707,9 +738,16 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                         node = &*node.right;
                         blk_idx = blk.endright.load(Ordering::Acquire);
                     }
+                    found = true;
                     break;
                 }
+
+                if !found {
+                    return Err(()); // Element not found after bounded search
+                }
             }
+
+            Err(()) // Tree too deep, shouldn't happen
         }
     }
 
@@ -776,8 +814,9 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
         unsafe {
             let mut changed = true;
             let mut iterations = 0;
+            let max_iterations = (self.tree_height * 10).min(100); // Bounded iterations
 
-            while changed && iterations < 100 {
+            while changed && iterations < max_iterations {
                 changed = false;
                 iterations += 1;
 
@@ -791,6 +830,7 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                     0
                 };
 
+                // Bounded number of sync attempts
                 for _ in 0..5 {
                     self.sync();
                 }

@@ -376,52 +376,31 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 return None;
             }
 
-            // CRITICAL: Validate to prevent phantom operations
-            if node.is_root {
-                // The total in root should never exceed what's in leaves
-                let mut actual_leaf_enq = 0;
-                let mut actual_leaf_deq = 0;
-
-                for i in 0..self.num_processes {
-                    let leaf = self.get_leaf(i);
-                    let leaf_head = leaf.head.load(Ordering::Acquire);
-                    if leaf_head > 1 {
-                        if let Some(block) = leaf.get_block(leaf_head - 1) {
-                            actual_leaf_enq += block.sumenq.load(Ordering::Acquire);
-                            actual_leaf_deq += block.sumdeq.load(Ordering::Acquire);
-                        }
-                    }
-                }
-
-                let new_root_enq = prev_sumenq + numenq;
-                let new_root_deq = prev_sumdeq + numdeq;
-
-                if new_root_enq > actual_leaf_enq {
-                    // Would create phantom enqueues
-                    return None;
-                }
-
-                if new_root_deq > actual_leaf_deq {
-                    // Would create phantom dequeues
-                    return None;
-                }
-            }
-
             // Calculate size for root blocks
             let size = if node.is_root {
-                // Count successful dequeues (those that found an item)
+                // Calculate the new total operations
                 let total_enq_after = prev_sumenq + numenq;
                 let total_deq_after = prev_sumdeq + numdeq;
 
-                // If we have more dequeues than enqueues, some dequeues returned null
-                if total_deq_after > total_enq_after {
-                    // All enqueues have been dequeued, queue is empty
-                    0
+                // The key insight: not all dequeue attempts succeed!
+                // Only the first N dequeues (where N = number of enqueues) can succeed
+                // The rest must return empty
+
+                // Calculate successful dequeues
+                let successful_dequeues = total_deq_after.min(total_enq_after);
+
+                // Queue size = total enqueues - successful dequeues
+                let new_size = total_enq_after.saturating_sub(successful_dequeues);
+
+                // Sanity check: size should not increase by more than new enqueues
+                // and should not decrease by more than new dequeues
+                if numenq >= numdeq {
+                    // More enqueues than dequeues in this block
+                    prev_size + (numenq - numdeq)
                 } else {
-                    // Queue size = enqueues - successful dequeues
-                    // Successful dequeues = min(total_deq, total_enq)
-                    let successful_deq = total_deq_after.min(total_enq_after);
-                    total_enq_after - successful_deq
+                    // More dequeues than enqueues
+                    // Size decreases but can't go below 0
+                    prev_size.saturating_sub(numdeq - numenq)
                 }
             } else {
                 0
@@ -433,13 +412,11 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
 
     // Simplified dequeue that correctly handles the queue size
     pub fn simple_dequeue(&self, thread_id: usize) -> Result<T, ()> {
-        // Always record the dequeue attempt
-        self.append(thread_id, None);
-
         unsafe {
-            // Force sync to ensure our dequeue is visible
+            // First sync to see current state
             self.sync();
 
+            // Check if there are any items to dequeue by looking at root
             let root = &*self.root;
             let root_head = root.head.load(Ordering::Acquire);
 
@@ -447,20 +424,44 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 return Err(());
             }
 
-            // Find which dequeue we are in our leaf
+            // Get the authoritative counts from root
+            let root_last_block = root.get_block(root_head - 1).ok_or(())?;
+            let total_enqueues_in_root = root_last_block.sumenq.load(Ordering::Acquire);
+            let total_dequeues_in_root = root_last_block.sumdeq.load(Ordering::Acquire);
+            let queue_size = root_last_block.size.load(Ordering::Acquire);
+
+            // If queue is empty, don't even try
+            if queue_size == 0 {
+                return Err(());
+            }
+
+            // Calculate successful dequeues (those that got items)
+            // This is min(dequeues_attempted, enqueues)
+            let successful_dequeues = total_enqueues_in_root.min(total_dequeues_in_root);
+
+            // If all items have been dequeued, return empty
+            if successful_dequeues >= total_enqueues_in_root {
+                return Err(());
+            }
+
+            // Now append our dequeue attempt
+            self.append(thread_id, None);
+
+            // Force sync to propagate our dequeue
+            self.sync();
+
+            // Now find our position
             let leaf = self.get_leaf(thread_id);
             let leaf_head = leaf.head.load(Ordering::Acquire);
             let my_dequeue_block = leaf_head - 1;
 
-            // Get our dequeue number within our leaf
             let my_leaf_deq_num = if let Some(block) = leaf.get_block(my_dequeue_block) {
                 block.sumdeq.load(Ordering::Acquire)
             } else {
                 return Err(());
             };
 
-            // Count total enqueues and dequeues from all leaves to get the true global position
-            let mut total_enqueues = 0;
+            // Count total dequeues from all processes to get our global position
             let mut dequeues_before_me = 0;
 
             for i in 0..self.num_processes {
@@ -469,47 +470,36 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
 
                 if proc_head > 1 {
                     if let Some(last_block) = proc_leaf.get_block(proc_head - 1) {
-                        // Count enqueues from this process
-                        total_enqueues += last_block.sumenq.load(Ordering::Acquire);
-
-                        // Count dequeues that come before ours
                         if i < thread_id {
-                            // All dequeues from processes with lower IDs come before ours
                             dequeues_before_me += last_block.sumdeq.load(Ordering::Acquire);
                         } else if i == thread_id {
-                            // Count dequeues in our process that come before this one
                             dequeues_before_me += my_leaf_deq_num - 1;
                         }
                     }
                 }
             }
 
-            // Our global dequeue number (1-based)
+            // Our global dequeue number
             let my_global_deq_num = dequeues_before_me + 1;
 
             // Debug
             if my_leaf_deq_num >= 99999 && my_leaf_deq_num <= 100001 {
                 eprintln!(
                     "Thread {} dequeue #{} (global #{}), total_enqueues={}",
-                    thread_id, my_leaf_deq_num, my_global_deq_num, total_enqueues
+                    thread_id, my_leaf_deq_num, my_global_deq_num, total_enqueues_in_root
                 );
             }
 
-            // If our dequeue number exceeds total enqueues, return empty
-            if my_global_deq_num > total_enqueues {
+            // CRITICAL: Check if our dequeue would be successful
+            // We're successful if we're within the first N dequeues where N = number of enqueues
+            if my_global_deq_num > total_enqueues_in_root {
                 if my_leaf_deq_num >= 99999 && my_leaf_deq_num <= 100001 {
-                    eprintln!(
-                        "  -> Empty: global deq {} > total enq {}",
-                        my_global_deq_num, total_enqueues
-                    );
+                    eprintln!("  -> Result: false (beyond enqueues)");
                 }
                 return Err(());
             }
 
-            // Force another sync to ensure the enqueue we want is visible in root
-            self.sync();
-
-            // Find the enqueue in the root
+            // Get the enqueue
             let result = self.get_enqueue_by_rank(my_global_deq_num);
 
             if my_leaf_deq_num >= 99999 && my_leaf_deq_num <= 100001 {
@@ -929,10 +919,11 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 }
 
                 // Navigate to the correct child based on enqueue count
-                if rank <= left_numenq {
-                    // Find the specific block in left child
-                    let mut target_block = prev_endleft + 1;
+                if rank <= left_numenq && left_numenq > 0 {
+                    // Find the specific block in left child that contains this rank
                     let mut accumulated = 0;
+                    let mut target_block = prev_endleft + 1;
+                    let mut rank_in_target = rank;
 
                     for i in (prev_endleft + 1)..=endleft {
                         if let Some(child_block) = left.get_block(i) {
@@ -946,23 +937,24 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                             };
                             let child_numenq = child_sumenq - child_prev_sumenq;
 
-                            if accumulated + child_numenq >= rank {
+                            if child_numenq > 0 && accumulated + child_numenq >= rank {
                                 target_block = i;
+                                rank_in_target = rank - accumulated;
                                 break;
                             }
                             accumulated += child_numenq;
                         }
                     }
 
-                    let rank_in_child = rank - accumulated;
-                    self.get_enqueue(left, target_block, rank_in_child)
-                } else if rank <= left_numenq + right_numenq {
+                    self.get_enqueue(left, target_block, rank_in_target)
+                } else if rank > left_numenq && right_numenq > 0 {
                     // In right child
                     let adjusted_rank = rank - left_numenq;
 
-                    // Find the specific block in right child
-                    let mut target_block = prev_endright + 1;
+                    // Find the specific block in right child that contains this rank
                     let mut accumulated = 0;
+                    let mut target_block = prev_endright + 1;
+                    let mut rank_in_target = adjusted_rank;
 
                     for i in (prev_endright + 1)..=endright {
                         if let Some(child_block) = right.get_block(i) {
@@ -977,16 +969,16 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                             };
                             let child_numenq = child_sumenq - child_prev_sumenq;
 
-                            if accumulated + child_numenq >= adjusted_rank {
+                            if child_numenq > 0 && accumulated + child_numenq >= adjusted_rank {
                                 target_block = i;
+                                rank_in_target = adjusted_rank - accumulated;
                                 break;
                             }
                             accumulated += child_numenq;
                         }
                     }
 
-                    let rank_in_child = adjusted_rank - accumulated;
-                    self.get_enqueue(right, target_block, rank_in_child)
+                    self.get_enqueue(right, target_block, rank_in_target)
                 } else {
                     // This shouldn't happen - rank is beyond this block's enqueues
                     eprintln!(

@@ -325,7 +325,7 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
     pub fn simple_dequeue(&self, thread_id: usize) -> Result<T, ()> {
         const MAX_RETRIES: usize = 3;
 
-        for _ in 0..=MAX_RETRIES {
+        for retry in 0..=MAX_RETRIES {
             self.sync();
 
             unsafe {
@@ -344,12 +344,37 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                     return Err(());
                 }
 
+                // Append our dequeue
                 self.append(thread_id, None);
-                self.sync();
 
+                // Force complete sync to ensure our dequeue is visible
+                self.force_complete_sync();
+
+                // Re-read the root state after our dequeue is propagated
+                let new_root_head = root.head.load(Ordering::Acquire);
+                let new_last_blk = root.get_block(new_root_head - 1).ok_or(())?;
+                let new_total_enq = new_last_blk.sumenq.load(Ordering::Acquire);
+                let new_total_deq = new_last_blk.sumdeq.load(Ordering::Acquire);
+
+                // Find our dequeue's position
+                // We know our dequeue is somewhere between total_deq+1 and new_total_deq
                 let my_rank = total_deq + 1;
+
+                // Critical check: ensure our dequeue is valid
+                // A dequeue at position my_rank is valid only if my_rank <= total_enqueues
+                if my_rank > new_total_enq {
+                    // Our dequeue would exceed the number of enqueues - queue was empty
+                    return Err(());
+                }
+
+                // Our dequeue is valid, get the element
                 if let Ok(val) = self.get_enqueue_by_rank(my_rank) {
                     return Ok(val);
+                }
+
+                // If we can't find the element yet, retry
+                if retry < MAX_RETRIES {
+                    std::thread::yield_now();
                 }
             }
         }

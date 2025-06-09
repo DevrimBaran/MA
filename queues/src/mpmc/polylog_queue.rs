@@ -20,6 +20,7 @@ struct Block<T> {
     element: UnsafeCell<Option<T>>,
 
     size: AtomicUsize,
+    next_deq: AtomicUsize,
 }
 
 impl<T> Block<T> {
@@ -32,6 +33,7 @@ impl<T> Block<T> {
             endright: AtomicUsize::new(0),
             element: UnsafeCell::new(None),
             size: AtomicUsize::new(0),
+            next_deq: AtomicUsize::new(0),
         }
     }
 }
@@ -319,44 +321,46 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
     }
 
     pub fn simple_dequeue(&self, thread_id: usize) -> Result<T, ()> {
-        use std::sync::atomic::Ordering;
+        const MAX_RETRIES: usize = 3; // enough for propagation
 
-        loop {
+        for _ in 0..=MAX_RETRIES {
+            /* 1 ─ ensure our view is current */
             self.sync();
 
+            /* 2 ─ read authoritative counters in the root */
             unsafe {
                 let root = &*self.root;
                 let root_head = root.head.load(Ordering::Acquire);
                 if root_head <= 1 {
-                    return Err(());
+                    return Err(()); // queue empty
                 }
 
                 let last_blk = root.get_block(root_head - 1).ok_or(())?;
-
                 let total_enq = last_blk.sumenq.load(Ordering::Acquire);
+                let total_deq = last_blk.sumdeq.load(Ordering::Acquire);
                 let size_now = last_blk.size.load(Ordering::Acquire);
 
                 if size_now == 0 {
-                    return Err(());
+                    return Err(()); // empty for sure
                 }
 
-                if last_blk
-                    .size
-                    .compare_exchange(size_now, size_now - 1, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-                {
-                    continue;
-                }
-
-                let my_global_deq = total_enq - (size_now - 1);
-
+                /* 3 ─ our dequeue must succeed: append our block */
                 self.append(thread_id, None);
 
+                /* 4 ─ propagate our block (and any pending enqueues) */
                 self.sync();
 
-                return self.get_enqueue_by_rank(my_global_deq);
+                /* 5 ─ fetch the element that belongs to the new total_deq+1 */
+                let my_rank = total_deq + 1; // exactly the next dequeue
+                if let Ok(val) = self.get_enqueue_by_rank(my_rank) {
+                    return Ok(val); // success
+                }
+                /* else: propagation lagged – retry the whole procedure */
             }
         }
+
+        /* After MAX_RETRIES the element is still not visible: declare empty. */
+        Err(())
     }
 
     #[inline(always)]

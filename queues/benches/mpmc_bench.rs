@@ -533,42 +533,27 @@ where
 
                 let mut consumed_count = 0;
                 let mut consecutive_empty_checks = 0;
-                const MAX_CONSECUTIVE_EMPTY_CHECKS: usize = 10000;
+                const MAX_CONSECUTIVE_EMPTY_CHECKS: usize = 50000;
 
                 loop {
                     match q.bench_pop(num_producers + consumer_id) {
-                        Ok(_item) => {
+                        Ok(_) => {
+                            // got an element
                             consumed_count += 1;
                             consecutive_empty_checks = 0;
                         }
                         Err(_) => {
-                            // Only worry about empty after producers are done
+                            // if producers are done *and* the queue itself claims empty,
+                            // then we are really finished
                             if done_sync.producers_done.load(Ordering::Acquire)
                                 == num_producers as u32
+                                && q.bench_is_empty()
                             {
-                                consecutive_empty_checks += 1;
-
-                                // Periodically check if all items have been consumed globally
-                                if consecutive_empty_checks % 1000 == 0 {
-                                    let total_consumed_global =
-                                        done_sync.total_consumed.load(Ordering::Acquire);
-                                    if total_consumed_global >= total_items {
-                                        // All items consumed globally, we can stop
-                                        break;
-                                    }
-                                }
-
-                                // Give more time for propagation
-                                if consecutive_empty_checks < 100 {
-                                    std::thread::sleep(std::time::Duration::from_micros(1));
-                                } else if consecutive_empty_checks > MAX_CONSECUTIVE_EMPTY_CHECKS {
-                                    // We've waited long enough
-                                    break;
-                                }
+                                break;
                             }
-                            // Don't yield immediately - spin a bit first
-                            for _ in 0..100 {
-                                std::hint::spin_loop();
+                            consecutive_empty_checks += 1;
+                            if consecutive_empty_checks > MAX_CONSECUTIVE_EMPTY_CHECKS {
+                                break; // give up after long idle
                             }
                         }
                     }

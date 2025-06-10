@@ -543,7 +543,7 @@ where
                 let mut consecutive_empty_checks = 0;
                 const MAX_CONSECUTIVE_EMPTY_CHECKS: usize = 1000;
                 let mut total_empty_checks = 0;
-                const MAX_TOTAL_EMPTY_CHECKS: usize = 10000;
+                const MAX_TOTAL_EMPTY_CHECKS: usize = 100000; // Increased from 10000
 
                 while consumed_count < my_target && total_empty_checks < MAX_TOTAL_EMPTY_CHECKS {
                     match q.bench_pop(num_producers + consumer_id) {
@@ -567,8 +567,16 @@ where
                                         unsafe { (q as *const _ as *const NRQueue<usize>).as_ref() }
                                     {
                                         // Try multiple syncs to ensure propagation
-                                        for _ in 0..5 {
+                                        for sync_round in 0..10 {
+                                            // Increased from 5
                                             nr_queue.sync();
+
+                                            // Small delay between syncs
+                                            if sync_round > 5 {
+                                                std::thread::sleep(
+                                                    std::time::Duration::from_micros(10),
+                                                );
+                                            }
 
                                             // Try to pop after each sync
                                             match q.bench_pop(num_producers + consumer_id) {
@@ -582,9 +590,23 @@ where
                                             }
                                         }
 
-                                        // If still failing after aggressive sync, we're likely done
+                                        // If still failing after aggressive sync, check one more time
                                         if consecutive_empty_checks > MAX_CONSECUTIVE_EMPTY_CHECKS {
-                                            break;
+                                            // Force a complete sync
+                                            nr_queue.force_complete_sync();
+
+                                            // One final attempt
+                                            match q.bench_pop(num_producers + consumer_id) {
+                                                Ok(_) => {
+                                                    consumed_count += 1;
+                                                    consecutive_empty_checks = 0;
+                                                    total_empty_checks = 0;
+                                                }
+                                                Err(_) => {
+                                                    // We're likely done
+                                                    break;
+                                                }
+                                            }
                                         }
                                     }
                                 }

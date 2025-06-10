@@ -323,13 +323,16 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
     }
 
     pub fn simple_dequeue(&self, thread_id: usize) -> Result<T, ()> {
-        const MAX_RETRIES: usize = 3;
+        const MAX_RETRIES: usize = 5;
+        const MAX_SYNC_ATTEMPTS: usize = 10;
 
         for retry in 0..MAX_RETRIES {
             unsafe {
                 // Sync before checking the queue state
                 if retry > 0 {
-                    self.sync();
+                    for _ in 0..retry.min(3) {
+                        self.sync();
+                    }
                 }
 
                 let root = &*self.root;
@@ -351,50 +354,63 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 // Append our dequeue operation
                 self.append(thread_id, None);
 
-                // Sync to ensure our dequeue is visible
-                self.sync();
+                // Multiple syncs to ensure propagation
+                for _ in 0..3 {
+                    self.sync();
+                }
 
-                // Find where our dequeue ended up
-                let new_root_head = root.head.load(Ordering::Acquire);
+                // Find where our dequeue ended up - search more aggressively
+                let mut sync_attempts = 0;
+                loop {
+                    let new_root_head = root.head.load(Ordering::Acquire);
 
-                // Search for a block that contains dequeues after our snapshot
-                for block_idx in (root_head - 1)..new_root_head {
-                    if let Some(block) = root.get_block(block_idx) {
-                        let block_total_deq = block.sumdeq.load(Ordering::Acquire);
-
-                        // If this block has more dequeues than our snapshot, our dequeue is here or later
-                        if block_total_deq > snapshot_total_deq {
-                            // Our dequeue is number (snapshot_total_deq + 1)
-                            let my_deq_rank = snapshot_total_deq + 1;
-
-                            // Check if there are enough enqueues for our dequeue
+                    // Search from our snapshot position to the current head
+                    let search_start = root_head.saturating_sub(1);
+                    for block_idx in search_start..new_root_head {
+                        if let Some(block) = root.get_block(block_idx) {
+                            let block_total_deq = block.sumdeq.load(Ordering::Acquire);
                             let block_total_enq = block.sumenq.load(Ordering::Acquire);
-                            if my_deq_rank > block_total_enq {
-                                // Not enough enqueues yet, might need to sync more
-                                if retry < MAX_RETRIES - 1 {
-                                    continue; // Retry with more syncing
-                                }
-                                return Err(());
-                            }
 
-                            // Get the enqueue at our rank
-                            match self.get_enqueue_by_rank(my_deq_rank) {
-                                Ok(val) => return Ok(val),
-                                Err(_) => {
-                                    if retry < MAX_RETRIES - 1 {
-                                        continue; // Retry
+                            // Our dequeue should be in a block where total_deq > snapshot_total_deq
+                            if block_total_deq > snapshot_total_deq {
+                                // Calculate which dequeue we are
+                                let my_deq_rank = snapshot_total_deq + 1;
+
+                                // Check if our dequeue is successful (not null)
+                                if my_deq_rank <= block_total_enq {
+                                    // Find and return the corresponding enqueue
+                                    match self.get_enqueue_by_rank(my_deq_rank) {
+                                        Ok(val) => return Ok(val),
+                                        Err(_) => {
+                                            // The enqueue should exist, try syncing more
+                                            if sync_attempts < MAX_SYNC_ATTEMPTS {
+                                                self.sync();
+                                                sync_attempts += 1;
+                                                break; // Break inner loop to retry search
+                                            }
+                                        }
                                     }
+                                } else {
+                                    // Our dequeue would be null - the queue was empty
                                     return Err(());
                                 }
                             }
                         }
                     }
+
+                    // If we haven't found our dequeue yet, sync and try again
+                    if sync_attempts < MAX_SYNC_ATTEMPTS {
+                        self.sync();
+                        sync_attempts += 1;
+                    } else {
+                        // We've synced enough - if we still can't find it, give up
+                        break;
+                    }
                 }
 
-                // If we didn't find our dequeue, sync more and retry
+                // If we get here, we couldn't find our dequeue after many sync attempts
                 if retry < MAX_RETRIES - 1 {
-                    self.sync();
-                    continue;
+                    continue; // Try the whole process again
                 }
             }
         }
@@ -461,19 +477,25 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
 
     pub fn sync(&self) {
         unsafe {
-            // Help all leaves advance
+            // First pass: Help all leaves advance
             for i in 0..self.num_processes {
                 let leaf = self.get_leaf(i);
                 let head = leaf.head.load(Ordering::Acquire);
 
-                if head > 0 && !leaf.parent.is_null() {
+                if head > 0 {
                     self.advance(leaf, head - 1);
+
+                    // Also refresh the parent to propagate immediately
+                    if !leaf.parent.is_null() {
+                        self.refresh(&*leaf.parent);
+                    }
                 }
             }
 
-            // Bounded number of passes through the tree
+            // Multiple passes through the tree
             let max_passes = 5.min(self.tree_height + 2);
             for pass in 0..max_passes {
+                // Bottom-up traversal to ensure child operations propagate
                 for level in (0..=self.tree_height).rev() {
                     let start_idx = (1 << level) - 1;
                     let end_idx = (1 << (level + 1)) - 1;
@@ -481,21 +503,39 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                     for idx in start_idx..end_idx.min(start_idx + (1 << level)) {
                         let node = self.get_node(idx);
 
-                        // Bounded refresh attempts
-                        for _ in 0..3 {
+                        // Multiple refresh attempts to ensure propagation
+                        let refresh_attempts = if node.is_root { 5 } else { 3 };
+                        for attempt in 0..refresh_attempts {
                             self.refresh(node);
 
                             let h = node.head.load(Ordering::Acquire);
                             if h > 0 {
                                 self.advance(node, h - 1);
                             }
+
+                            // For root, also check children one more time
+                            if node.is_root && attempt == refresh_attempts - 1 {
+                                if !node.left.is_null() {
+                                    self.refresh(&*node.left);
+                                }
+                                if !node.right.is_null() {
+                                    self.refresh(&*node.right);
+                                }
+                            }
                         }
                     }
                 }
 
+                // Yield between passes to let other threads make progress
                 if pass < max_passes - 1 {
                     std::thread::yield_now();
                 }
+            }
+
+            // Final check: ensure root is fully up to date
+            let root = &*self.root;
+            for _ in 0..3 {
+                self.refresh(root);
             }
         }
     }

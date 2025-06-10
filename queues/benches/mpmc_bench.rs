@@ -477,7 +477,7 @@ where
     let mut producer_pids = Vec::with_capacity(num_producers);
     let mut consumer_pids = Vec::with_capacity(num_consumers);
 
-    // Fork producers
+    // Fork producers (same as before)
     for producer_id in 0..num_producers {
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
@@ -521,7 +521,7 @@ where
         }
     }
 
-    // Fork consumers
+    // Fork consumers - FIXED to match the standard distribution
     for consumer_id in 0..num_consumers {
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
@@ -532,28 +532,75 @@ where
                 }
 
                 let mut consumed_count = 0;
-                let mut consecutive_empty_checks = 0;
-                const MAX_CONSECUTIVE_EMPTY_CHECKS: usize = 50000;
+                let target_items = total_items / num_consumers;
+                let extra_items = if consumer_id < (total_items % num_consumers) {
+                    1
+                } else {
+                    0
+                };
+                let my_target = target_items + extra_items;
 
-                loop {
+                let mut consecutive_empty_checks = 0;
+                const MAX_CONSECUTIVE_EMPTY_CHECKS: usize = 1000;
+                let mut total_empty_checks = 0;
+                const MAX_TOTAL_EMPTY_CHECKS: usize = 10000;
+
+                while consumed_count < my_target && total_empty_checks < MAX_TOTAL_EMPTY_CHECKS {
                     match q.bench_pop(num_producers + consumer_id) {
-                        Ok(_) => {
-                            // got an element
+                        Ok(_item) => {
                             consumed_count += 1;
                             consecutive_empty_checks = 0;
+                            total_empty_checks = 0;
                         }
                         Err(_) => {
-                            // if producers are done *and* the queue itself claims empty,
-                            // then we are really finished
+                            total_empty_checks += 1;
+
+                            // Only increment consecutive counter if producers are done
                             if done_sync.producers_done.load(Ordering::Acquire)
                                 == num_producers as u32
-                                && q.bench_is_empty()
                             {
-                                break;
+                                consecutive_empty_checks += 1;
+
+                                if consecutive_empty_checks > MAX_CONSECUTIVE_EMPTY_CHECKS {
+                                    // Do a final aggressive sync attempt
+                                    if let Some(nr_queue) =
+                                        unsafe { (q as *const _ as *const NRQueue<usize>).as_ref() }
+                                    {
+                                        // Try multiple syncs to ensure propagation
+                                        for _ in 0..5 {
+                                            nr_queue.sync();
+
+                                            // Try to pop after each sync
+                                            match q.bench_pop(num_producers + consumer_id) {
+                                                Ok(_) => {
+                                                    consumed_count += 1;
+                                                    consecutive_empty_checks = 0;
+                                                    total_empty_checks = 0;
+                                                    break;
+                                                }
+                                                Err(_) => continue,
+                                            }
+                                        }
+
+                                        // If still failing after aggressive sync, we're likely done
+                                        if consecutive_empty_checks > MAX_CONSECUTIVE_EMPTY_CHECKS {
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else {
+                                consecutive_empty_checks = 0;
                             }
-                            consecutive_empty_checks += 1;
-                            if consecutive_empty_checks > MAX_CONSECUTIVE_EMPTY_CHECKS {
-                                break; // give up after long idle
+
+                            // Adaptive backoff
+                            if consecutive_empty_checks < 10 {
+                                for _ in 0..10 {
+                                    std::hint::spin_loop();
+                                }
+                            } else if consecutive_empty_checks < 100 {
+                                std::thread::yield_now();
+                            } else {
+                                std::thread::sleep(std::time::Duration::from_micros(1));
                             }
                         }
                     }
@@ -608,7 +655,6 @@ where
     // Get the total consumed count
     let total_consumed = done_sync.total_consumed.load(Ordering::Acquire);
 
-    // This should ALWAYS equal total_items
     if total_consumed != total_items {
         eprintln!(
             "ERROR: NRQueue data loss! Consumed {}/{} items. Prods: {}, Cons: {}",

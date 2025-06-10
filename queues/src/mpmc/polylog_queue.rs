@@ -325,78 +325,76 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
     pub fn simple_dequeue(&self, thread_id: usize) -> Result<T, ()> {
         const MAX_RETRIES: usize = 3;
 
-        for _ in 0..=MAX_RETRIES {
-            self.sync();
-
+        for retry in 0..MAX_RETRIES {
             unsafe {
+                // Sync before checking the queue state
+                if retry > 0 {
+                    self.sync();
+                }
+
                 let root = &*self.root;
                 let root_head = root.head.load(Ordering::Acquire);
                 if root_head <= 1 {
                     return Err(());
                 }
 
-                let last_blk = root.get_block(root_head - 1).ok_or(())?;
-                let total_enq = last_blk.sumenq.load(Ordering::Acquire);
-                let total_deq = last_blk.sumdeq.load(Ordering::Acquire);
-                let size_now = last_blk.size.load(Ordering::Acquire);
-
-                if size_now == 0 {
+                let last_block = root.get_block(root_head - 1).ok_or(())?;
+                let initial_size = last_block.size.load(Ordering::Acquire);
+                if initial_size == 0 {
                     return Err(());
                 }
 
                 // Remember the state before our dequeue
-                let snapshot_head = root_head;
-                let snapshot_enq = total_enq;
-                let snapshot_deq = total_deq;
+                let snapshot_total_enq = last_block.sumenq.load(Ordering::Acquire);
+                let snapshot_total_deq = last_block.sumdeq.load(Ordering::Acquire);
 
-                // Append our dequeue
+                // Append our dequeue operation
                 self.append(thread_id, None);
+
+                // Sync to ensure our dequeue is visible
                 self.sync();
 
-                // Now find where our dequeue ended up in the root
+                // Find where our dequeue ended up
                 let new_root_head = root.head.load(Ordering::Acquire);
 
-                // Search for our dequeue in the root blocks
-                let mut my_dequeue_rank = None;
-
-                // Start from where we were and search forward
-                for idx in snapshot_head..=new_root_head {
-                    if let Some(block) = root.get_block(idx) {
+                // Search for a block that contains dequeues after our snapshot
+                for block_idx in (root_head - 1)..new_root_head {
+                    if let Some(block) = root.get_block(block_idx) {
                         let block_total_deq = block.sumdeq.load(Ordering::Acquire);
-                        let prev_total_deq = if idx > 0 {
-                            root.get_block(idx - 1)
-                                .map(|b| b.sumdeq.load(Ordering::Acquire))
-                                .unwrap_or(0)
-                        } else {
-                            0
-                        };
 
-                        // Our dequeue should be somewhere in this range
-                        if prev_total_deq <= snapshot_deq && block_total_deq > snapshot_deq {
-                            // Found the block containing our dequeue
-                            // Our rank is snapshot_deq + 1 (we're the next dequeue after the snapshot)
-                            my_dequeue_rank = Some(snapshot_deq + 1);
-                            break;
+                        // If this block has more dequeues than our snapshot, our dequeue is here or later
+                        if block_total_deq > snapshot_total_deq {
+                            // Our dequeue is number (snapshot_total_deq + 1)
+                            let my_deq_rank = snapshot_total_deq + 1;
+
+                            // Check if there are enough enqueues for our dequeue
+                            let block_total_enq = block.sumenq.load(Ordering::Acquire);
+                            if my_deq_rank > block_total_enq {
+                                // Not enough enqueues yet, might need to sync more
+                                if retry < MAX_RETRIES - 1 {
+                                    continue; // Retry with more syncing
+                                }
+                                return Err(());
+                            }
+
+                            // Get the enqueue at our rank
+                            match self.get_enqueue_by_rank(my_deq_rank) {
+                                Ok(val) => return Ok(val),
+                                Err(_) => {
+                                    if retry < MAX_RETRIES - 1 {
+                                        continue; // Retry
+                                    }
+                                    return Err(());
+                                }
+                            }
                         }
                     }
                 }
 
-                let my_rank = my_dequeue_rank.unwrap_or(snapshot_deq + 1);
-
-                // Check if our dequeue is valid (within the number of enqueues)
-                let final_root_head = root.head.load(Ordering::Acquire);
-                if let Some(final_block) = root.get_block(final_root_head - 1) {
-                    let final_total_enq = final_block.sumenq.load(Ordering::Acquire);
-
-                    // If our dequeue rank exceeds total enqueues, the queue was empty
-                    if my_rank > final_total_enq {
-                        return Err(());
-                    }
-                }
-
-                // Now get the element
-                if let Ok(val) = self.get_enqueue_by_rank(my_rank) {
-                    return Ok(val);
+                // If we didn't find our dequeue, sync more and retry
+                if retry < MAX_RETRIES - 1 {
+                    self.sync();
+                    continue;
                 }
             }
         }
@@ -406,67 +404,59 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
 
     #[inline(always)]
     fn get_enqueue_by_rank(&self, rank: usize) -> Result<T, ()> {
-        const MAX_RETRIES: usize = 3;
-        for _try in 0..MAX_RETRIES {
-            if _try > 0 {
-                self.force_complete_sync();
-            }
-            unsafe {
-                let root = &*self.root;
-                let root_head = root.head.load(Ordering::Acquire);
-                if root_head <= 1 || rank == 0 {
-                    return Err(());
-                }
-                let total_enq = root
-                    .get_block(root_head - 1)
-                    .map(|b| b.sumenq.load(Ordering::Acquire))
-                    .unwrap_or(0);
-                if rank > total_enq {
-                    return Err(());
-                }
+        unsafe {
+            let root = &*self.root;
+            let root_head = root.head.load(Ordering::Acquire);
 
-                let (mut lo, mut hi, mut blk) = (1, root_head - 1, 1);
-                while lo <= hi {
-                    let mid = lo + (hi - lo) / 2;
-                    if let Some(b) = root.get_block(mid) {
-                        if b.sumenq.load(Ordering::Acquire) >= rank {
-                            blk = mid;
-                            hi = mid.saturating_sub(1);
-                        } else {
-                            lo = mid + 1;
-                        }
+            if root_head <= 1 || rank == 0 {
+                return Err(());
+            }
+
+            // Find the block containing the rank-th enqueue
+            let mut left = 1;
+            let mut right = root_head - 1;
+            let mut target_block = 0;
+
+            while left <= right {
+                let mid = left + (right - left) / 2;
+                if let Some(block) = root.get_block(mid) {
+                    let block_sum_enq = block.sumenq.load(Ordering::Acquire);
+                    if block_sum_enq >= rank {
+                        target_block = mid;
+                        right = mid - 1;
                     } else {
-                        break;
+                        left = mid + 1;
                     }
-                }
-
-                let mut prev_enq = if blk > 0 {
-                    root.get_block(blk - 1)
-                        .map(|b| b.sumenq.load(Ordering::Acquire))
-                        .unwrap_or(0)
                 } else {
-                    0
-                };
-
-                // Bounded loop - at most we'll search through p blocks
-                let max_search = self.num_processes.min(MAX_BLOCK_SEARCH_ITERATIONS);
-                for _ in 0..max_search {
-                    let block = match root.get_block(blk) {
-                        Some(b) => b,
-                        None => break,
-                    };
-                    let blk_sum_enq = block.sumenq.load(Ordering::Acquire);
-                    let blk_num_enq = blk_sum_enq - prev_enq;
-                    if blk_num_enq > 0 && rank <= blk_sum_enq {
-                        let rank_in_blk = rank - prev_enq;
-                        return self.get_enqueue(root, blk, rank_in_blk);
-                    }
-                    blk += 1;
-                    prev_enq = blk_sum_enq;
+                    break;
                 }
             }
+
+            if target_block == 0 {
+                return Err(());
+            }
+
+            // Get the exact position within the block
+            let prev_sum_enq = if target_block > 0 {
+                root.get_block(target_block - 1)
+                    .map(|b| b.sumenq.load(Ordering::Acquire))
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+
+            let rank_in_block = rank - prev_sum_enq;
+
+            // Verify the block actually contains this enqueue
+            if let Some(block) = root.get_block(target_block) {
+                let block_num_enq = block.sumenq.load(Ordering::Acquire) - prev_sum_enq;
+                if rank_in_block > block_num_enq {
+                    return Err(());
+                }
+            }
+
+            self.get_enqueue(root, target_block, rank_in_block)
         }
-        Err(())
     }
 
     pub fn sync(&self) {

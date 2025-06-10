@@ -325,7 +325,7 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
     pub fn simple_dequeue(&self, thread_id: usize) -> Result<T, ()> {
         const MAX_RETRIES: usize = 3;
 
-        for retry in 0..=MAX_RETRIES {
+        for _ in 0..=MAX_RETRIES {
             self.sync();
 
             unsafe {
@@ -344,37 +344,59 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                     return Err(());
                 }
 
+                // Remember the state before our dequeue
+                let snapshot_head = root_head;
+                let snapshot_enq = total_enq;
+                let snapshot_deq = total_deq;
+
                 // Append our dequeue
                 self.append(thread_id, None);
+                self.sync();
 
-                // Force complete sync to ensure our dequeue is visible
-                self.force_complete_sync();
-
-                // Re-read the root state after our dequeue is propagated
+                // Now find where our dequeue ended up in the root
                 let new_root_head = root.head.load(Ordering::Acquire);
-                let new_last_blk = root.get_block(new_root_head - 1).ok_or(())?;
-                let new_total_enq = new_last_blk.sumenq.load(Ordering::Acquire);
-                let new_total_deq = new_last_blk.sumdeq.load(Ordering::Acquire);
 
-                // Find our dequeue's position
-                // We know our dequeue is somewhere between total_deq+1 and new_total_deq
-                let my_rank = total_deq + 1;
+                // Search for our dequeue in the root blocks
+                let mut my_dequeue_rank = None;
 
-                // Critical check: ensure our dequeue is valid
-                // A dequeue at position my_rank is valid only if my_rank <= total_enqueues
-                if my_rank > new_total_enq {
-                    // Our dequeue would exceed the number of enqueues - queue was empty
-                    return Err(());
+                // Start from where we were and search forward
+                for idx in snapshot_head..=new_root_head {
+                    if let Some(block) = root.get_block(idx) {
+                        let block_total_deq = block.sumdeq.load(Ordering::Acquire);
+                        let prev_total_deq = if idx > 0 {
+                            root.get_block(idx - 1)
+                                .map(|b| b.sumdeq.load(Ordering::Acquire))
+                                .unwrap_or(0)
+                        } else {
+                            0
+                        };
+
+                        // Our dequeue should be somewhere in this range
+                        if prev_total_deq <= snapshot_deq && block_total_deq > snapshot_deq {
+                            // Found the block containing our dequeue
+                            // Our rank is snapshot_deq + 1 (we're the next dequeue after the snapshot)
+                            my_dequeue_rank = Some(snapshot_deq + 1);
+                            break;
+                        }
+                    }
                 }
 
-                // Our dequeue is valid, get the element
+                let my_rank = my_dequeue_rank.unwrap_or(snapshot_deq + 1);
+
+                // Check if our dequeue is valid (within the number of enqueues)
+                let final_root_head = root.head.load(Ordering::Acquire);
+                if let Some(final_block) = root.get_block(final_root_head - 1) {
+                    let final_total_enq = final_block.sumenq.load(Ordering::Acquire);
+
+                    // If our dequeue rank exceeds total enqueues, the queue was empty
+                    if my_rank > final_total_enq {
+                        return Err(());
+                    }
+                }
+
+                // Now get the element
                 if let Ok(val) = self.get_enqueue_by_rank(my_rank) {
                     return Ok(val);
-                }
-
-                // If we can't find the element yet, retry
-                if retry < MAX_RETRIES {
-                    std::thread::yield_now();
                 }
             }
         }

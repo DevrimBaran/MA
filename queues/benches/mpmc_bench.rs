@@ -292,7 +292,7 @@ where
                     }
                 }
 
-                done_sync.producers_done.fetch_add(1, Ordering::SeqCst);
+                done_sync.producers_done.fetch_add(1, Ordering::AcqRel);
                 unsafe { libc::_exit(0) };
             }
             Ok(ForkResult::Parent { child }) => {
@@ -311,7 +311,7 @@ where
         }
     }
 
-    // Fork consumers with better synchronization
+    // Fork consumers
     for consumer_id in 0..num_consumers {
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
@@ -331,7 +331,7 @@ where
                 let my_target = target_items + extra_items;
 
                 let mut consecutive_empty_checks = 0;
-                const MAX_CONSECUTIVE_EMPTY_CHECKS: usize = 100000; // Much higher threshold
+                const MAX_CONSECUTIVE_EMPTY_CHECKS: usize = 10000;
 
                 while consumed_count < my_target {
                     match q.bench_pop(num_producers + consumer_id) {
@@ -340,62 +340,33 @@ where
                             consecutive_empty_checks = 0;
                         }
                         Err(_) => {
-                            // Full memory barrier to ensure we see all producer updates
-                            std::sync::atomic::fence(Ordering::SeqCst);
-
-                            // Check if all producers are done with SeqCst ordering
-                            let producers_done = done_sync.producers_done.load(Ordering::SeqCst);
-
-                            if producers_done == num_producers as u32 {
+                            // Only count it as truly empty if all producers are done
+                            // AND we've waited a reasonable time for propagation
+                            if done_sync.producers_done.load(Ordering::Acquire)
+                                == num_producers as u32
+                            {
                                 consecutive_empty_checks += 1;
 
-                                // Give LOTS of time for any in-flight operations
-                                if consecutive_empty_checks < 1000 {
-                                    // Spin first
-                                    for _ in 0..1000 {
-                                        std::hint::spin_loop();
-                                    }
-                                } else if consecutive_empty_checks < 10000 {
-                                    // Then yield
-                                    std::thread::yield_now();
-                                } else if consecutive_empty_checks < 50000 {
-                                    // Then sleep briefly
-                                    std::thread::sleep(std::time::Duration::from_micros(10));
-                                } else if consecutive_empty_checks < MAX_CONSECUTIVE_EMPTY_CHECKS {
-                                    // Longer sleep
-                                    std::thread::sleep(std::time::Duration::from_micros(100));
-                                } else {
-                                    // Final check - try one more time with full sync
-                                    std::sync::atomic::fence(Ordering::SeqCst);
-                                    match q.bench_pop(num_producers + consumer_id) {
-                                        Ok(_) => {
-                                            consumed_count += 1;
-                                            consecutive_empty_checks = 0;
-                                            continue;
-                                        }
-                                        Err(_) => {
-                                            // Really done now
-                                            break;
-                                        }
-                                    }
+                                // Give more time for propagation
+                                if consecutive_empty_checks < 100 {
+                                    std::thread::sleep(std::time::Duration::from_micros(1));
+                                } else if consecutive_empty_checks > MAX_CONSECUTIVE_EMPTY_CHECKS {
+                                    break;
                                 }
-                            } else {
-                                // Producers still running - just spin
-                                consecutive_empty_checks = 0;
-                                for _ in 0..100 {
-                                    std::hint::spin_loop();
-                                }
+                            }
+                            // Don't yield immediately - spin a bit first
+                            for _ in 0..100 {
+                                std::hint::spin_loop();
                             }
                         }
                     }
                 }
 
-                // Add this consumer's count to the total with SeqCst
-                std::sync::atomic::fence(Ordering::SeqCst);
+                // Add this consumer's count to the total
                 done_sync
                     .total_consumed
-                    .fetch_add(consumed_count, Ordering::SeqCst);
-                done_sync.consumers_done.fetch_add(1, Ordering::SeqCst);
+                    .fetch_add(consumed_count, Ordering::AcqRel);
+                done_sync.consumers_done.fetch_add(1, Ordering::AcqRel);
 
                 unsafe { libc::_exit(0) };
             }
@@ -452,11 +423,8 @@ where
         waitpid(helper_pid, None).expect("waitpid for helper failed");
     }
 
-    // Final synchronization before checking results
-    std::sync::atomic::fence(Ordering::SeqCst);
-
     // Get the total consumed count
-    let total_consumed = done_sync.total_consumed.load(Ordering::SeqCst);
+    let total_consumed = done_sync.total_consumed.load(Ordering::Acquire);
 
     if total_consumed != total_items {
         eprintln!(
@@ -893,7 +861,7 @@ fn bench_nr_queue(c: &mut Criterion) {
 }
 fn custom_criterion() -> Criterion {
     Criterion::default()
-        .warm_up_time(Duration::from_secs(5))
+        .warm_up_time(Duration::from_secs(2))
         .measurement_time(Duration::from_secs(10))
         .sample_size(10)
 }
@@ -902,6 +870,7 @@ criterion_group! {
     name = benches;
     config = custom_criterion();
     targets =
+        bench_wf_queue,
         bench_yang_crummey,
         bench_kw_queue,
         bench_burden_wf_queue,

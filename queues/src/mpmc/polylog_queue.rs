@@ -323,99 +323,102 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
     }
 
     pub fn simple_dequeue(&self, thread_id: usize) -> Result<T, ()> {
-        const MAX_RETRIES: usize = 5;
-        const MAX_SYNC_ATTEMPTS: usize = 10;
+        const MAX_RETRIES: usize = 10;
+        const SYNC_ROUNDS: usize = 5;
 
-        for retry in 0..MAX_RETRIES {
-            unsafe {
-                // Sync before checking the queue state
-                if retry > 0 {
-                    for _ in 0..retry.min(3) {
-                        self.sync();
-                    }
+        unsafe {
+            // Take a snapshot of the queue state BEFORE appending
+            let root = &*self.root;
+            let initial_root_head = root.head.load(Ordering::Acquire);
+
+            // Get the total number of operations before our dequeue
+            let (initial_total_enq, initial_total_deq) = if initial_root_head > 0 {
+                if let Some(last_block) = root.get_block(initial_root_head - 1) {
+                    (
+                        last_block.sumenq.load(Ordering::Acquire),
+                        last_block.sumdeq.load(Ordering::Acquire),
+                    )
+                } else {
+                    (0, 0)
                 }
+            } else {
+                (0, 0)
+            };
 
-                let root = &*self.root;
-                let root_head = root.head.load(Ordering::Acquire);
-                if root_head <= 1 {
-                    return Err(());
-                }
+            // Check if queue is empty before we even try
+            if initial_total_enq <= initial_total_deq {
+                return Err(());
+            }
 
-                let last_block = root.get_block(root_head - 1).ok_or(())?;
-                let initial_size = last_block.size.load(Ordering::Acquire);
-                if initial_size == 0 {
-                    return Err(());
-                }
+            // Now append our dequeue
+            self.append(thread_id, None);
 
-                // Remember the state before our dequeue
-                let snapshot_total_enq = last_block.sumenq.load(Ordering::Acquire);
-                let snapshot_total_deq = last_block.sumdeq.load(Ordering::Acquire);
+            // Our dequeue will be the (initial_total_deq + 1)th dequeue
+            let my_deq_rank = initial_total_deq + 1;
 
-                // Append our dequeue operation
-                self.append(thread_id, None);
+            // Multiple sync rounds to ensure propagation
+            for _ in 0..SYNC_ROUNDS {
+                self.force_complete_sync();
+            }
 
-                // Multiple syncs to ensure propagation
-                for _ in 0..3 {
-                    self.sync();
-                }
+            // Now search for our dequeue with retries
+            for retry in 0..MAX_RETRIES {
+                let current_root_head = root.head.load(Ordering::Acquire);
 
-                // Find where our dequeue ended up - search more aggressively
-                let mut sync_attempts = 0;
-                loop {
-                    let new_root_head = root.head.load(Ordering::Acquire);
+                // Search through all blocks from initial position to current
+                for block_idx in initial_root_head.saturating_sub(1)..current_root_head {
+                    if let Some(block) = root.get_block(block_idx) {
+                        let block_total_deq = block.sumdeq.load(Ordering::Acquire);
 
-                    // Search from our snapshot position to the current head
-                    let search_start = root_head.saturating_sub(1);
-                    for block_idx in search_start..new_root_head {
-                        if let Some(block) = root.get_block(block_idx) {
-                            let block_total_deq = block.sumdeq.load(Ordering::Acquire);
+                        // Our dequeue is in this block if block_total_deq >= my_deq_rank
+                        if block_total_deq >= my_deq_rank {
+                            // Check if it's a successful dequeue
                             let block_total_enq = block.sumenq.load(Ordering::Acquire);
 
-                            // Our dequeue should be in a block where total_deq > snapshot_total_deq
-                            if block_total_deq > snapshot_total_deq {
-                                // Calculate which dequeue we are
-                                let my_deq_rank = snapshot_total_deq + 1;
-
-                                // Check if our dequeue is successful (not null)
-                                if my_deq_rank <= block_total_enq {
-                                    // Find and return the corresponding enqueue
-                                    match self.get_enqueue_by_rank(my_deq_rank) {
-                                        Ok(val) => return Ok(val),
-                                        Err(_) => {
-                                            // The enqueue should exist, try syncing more
-                                            if sync_attempts < MAX_SYNC_ATTEMPTS {
-                                                self.sync();
-                                                sync_attempts += 1;
-                                                break; // Break inner loop to retry search
-                                            }
+                            if my_deq_rank <= block_total_enq {
+                                // Find the enqueue corresponding to our dequeue
+                                match self.get_enqueue_by_rank(my_deq_rank) {
+                                    Ok(val) => return Ok(val),
+                                    Err(_) => {
+                                        // Sync more and retry
+                                        if retry < MAX_RETRIES - 1 {
+                                            self.force_complete_sync();
+                                            break;
                                         }
                                     }
-                                } else {
-                                    // Our dequeue would be null - the queue was empty
-                                    return Err(());
                                 }
+                            } else {
+                                // Our dequeue is null - queue was empty
+                                return Err(());
                             }
                         }
                     }
-
-                    // If we haven't found our dequeue yet, sync and try again
-                    if sync_attempts < MAX_SYNC_ATTEMPTS {
-                        self.sync();
-                        sync_attempts += 1;
-                    } else {
-                        // We've synced enough - if we still can't find it, give up
-                        break;
-                    }
                 }
 
-                // If we get here, we couldn't find our dequeue after many sync attempts
+                // If we haven't found it yet, sync more
                 if retry < MAX_RETRIES - 1 {
-                    continue; // Try the whole process again
+                    self.force_complete_sync();
+                    std::thread::yield_now();
                 }
             }
-        }
 
-        Err(())
+            // Final attempt: check if we became null due to insufficient enqueues
+            let final_root_head = root.head.load(Ordering::Acquire);
+            if let Some(last_block) = root.get_block(final_root_head - 1) {
+                let final_total_enq = last_block.sumenq.load(Ordering::Acquire);
+                let final_total_deq = last_block.sumdeq.load(Ordering::Acquire);
+
+                // Verify our dequeue is accounted for
+                if final_total_deq >= my_deq_rank {
+                    if my_deq_rank > final_total_enq {
+                        // Confirmed null dequeue
+                        return Err(());
+                    }
+                }
+            }
+
+            Err(())
+        }
     }
 
     #[inline(always)]
@@ -428,7 +431,7 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 return Err(());
             }
 
-            // Find the block containing the rank-th enqueue
+            // Binary search for the block containing the rank-th enqueue
             let mut left = 1;
             let mut right = root_head - 1;
             let mut target_block = 0;
@@ -453,7 +456,7 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
             }
 
             // Get the exact position within the block
-            let prev_sum_enq = if target_block > 0 {
+            let prev_sum_enq = if target_block > 1 {
                 root.get_block(target_block - 1)
                     .map(|b| b.sumenq.load(Ordering::Acquire))
                     .unwrap_or(0)
@@ -462,40 +465,29 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
             };
 
             let rank_in_block = rank - prev_sum_enq;
-
-            // Verify the block actually contains this enqueue
-            if let Some(block) = root.get_block(target_block) {
-                let block_num_enq = block.sumenq.load(Ordering::Acquire) - prev_sum_enq;
-                if rank_in_block > block_num_enq {
-                    return Err(());
-                }
-            }
-
             self.get_enqueue(root, target_block, rank_in_block)
         }
     }
 
     pub fn sync(&self) {
         unsafe {
-            // First pass: Help all leaves advance
+            // First: propagate all leaf operations
             for i in 0..self.num_processes {
                 let leaf = self.get_leaf(i);
                 let head = leaf.head.load(Ordering::Acquire);
 
-                if head > 0 {
+                if head > 1 {
                     self.advance(leaf, head - 1);
 
-                    // Also refresh the parent to propagate immediately
                     if !leaf.parent.is_null() {
                         self.refresh(&*leaf.parent);
                     }
                 }
             }
 
-            // Multiple passes through the tree
-            let max_passes = 5.min(self.tree_height + 2);
-            for pass in 0..max_passes {
-                // Bottom-up traversal to ensure child operations propagate
+            // Multiple complete tree traversals
+            for _ in 0..3 {
+                // Bottom-up to ensure children propagate before parents
                 for level in (0..=self.tree_height).rev() {
                     let start_idx = (1 << level) - 1;
                     let end_idx = (1 << (level + 1)) - 1;
@@ -503,36 +495,20 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                     for idx in start_idx..end_idx.min(start_idx + (1 << level)) {
                         let node = self.get_node(idx);
 
-                        // Multiple refresh attempts to ensure propagation
-                        let refresh_attempts = if node.is_root { 5 } else { 3 };
-                        for attempt in 0..refresh_attempts {
+                        // Multiple refresh attempts
+                        for _ in 0..3 {
                             self.refresh(node);
+                        }
 
-                            let h = node.head.load(Ordering::Acquire);
-                            if h > 0 {
-                                self.advance(node, h - 1);
-                            }
-
-                            // For root, also check children one more time
-                            if node.is_root && attempt == refresh_attempts - 1 {
-                                if !node.left.is_null() {
-                                    self.refresh(&*node.left);
-                                }
-                                if !node.right.is_null() {
-                                    self.refresh(&*node.right);
-                                }
-                            }
+                        let h = node.head.load(Ordering::Acquire);
+                        if h > 0 {
+                            self.advance(node, h - 1);
                         }
                     }
                 }
-
-                // Yield between passes to let other threads make progress
-                if pass < max_passes - 1 {
-                    std::thread::yield_now();
-                }
             }
 
-            // Final check: ensure root is fully up to date
+            // Final root refresh
             let root = &*self.root;
             for _ in 0..3 {
                 self.refresh(root);
@@ -572,18 +548,15 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 let block = node.get_block(block_idx).expect("Block must exist");
                 let mut super_idx = block.super_idx.load(Ordering::Acquire);
 
-                // FIXED: Bounded spin with helping
+                // Bounded spin with helping
                 let mut spin_count = 0;
                 while super_idx == 0 && spin_count < MAX_SPIN_ITERATIONS {
-                    // Help advance the parent
                     if !node.parent.is_null() {
                         let parent = &*node.parent;
                         let parent_head = parent.head.load(Ordering::Acquire);
                         if parent_head > 0 {
                             self.advance(parent, parent_head - 1);
                         }
-
-                        // Also help refresh the parent to propagate our block
                         self.refresh(parent);
                     }
 
@@ -595,7 +568,6 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                     super_idx = block.super_idx.load(Ordering::Acquire);
                 }
 
-                // If still 0 after bounded spinning, use conservative estimate
                 if super_idx == 0 {
                     let parent = &*node.parent;
                     super_idx = parent.head.load(Ordering::Acquire).max(1);
@@ -705,10 +677,8 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
         mut rank: usize,
     ) -> Result<T, ()> {
         unsafe {
-            // Bounded depth - at most tree_height iterations
             for _ in 0..=self.tree_height {
                 if node.is_leaf {
-                    // Bounded search through blocks in leaf
                     let max_leaf_search = self.num_processes.min(MAX_BLOCK_SEARCH_ITERATIONS);
                     for _ in 0..max_leaf_search {
                         let head_limit = node.head.load(Ordering::Acquire).saturating_sub(1);
@@ -731,10 +701,9 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                         }
                         return (*blk.element.get()).clone().ok_or(());
                     }
-                    return Err(()); // Not found after bounded search
+                    return Err(());
                 }
 
-                // For internal nodes, bounded search
                 let max_internal_search = (2 * self.num_processes).min(MAX_BLOCK_SEARCH_ITERATIONS);
                 let mut found = false;
                 for _ in 0..max_internal_search {
@@ -806,7 +775,6 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                         continue;
                     }
 
-                    // Found the block containing our element
                     if rank <= left_num && left_num > 0 {
                         node = &*node.left;
                         blk_idx = blk.endleft.load(Ordering::Acquire);
@@ -820,11 +788,11 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 }
 
                 if !found {
-                    return Err(()); // Element not found after bounded search
+                    return Err(());
                 }
             }
 
-            Err(()) // Tree too deep, shouldn't happen
+            Err(())
         }
     }
 
@@ -889,40 +857,21 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
 
     pub fn force_complete_sync(&self) {
         unsafe {
-            let mut changed = true;
-            let mut iterations = 0;
-            let max_iterations = (self.tree_height * 10).min(100); // Bounded iterations
+            // More aggressive sync
+            for _ in 0..3 {
+                self.sync();
+            }
 
-            while changed && iterations < max_iterations {
-                changed = false;
-                iterations += 1;
+            // Force refresh from leaves to root
+            for level in (0..=self.tree_height).rev() {
+                let start_idx = (1 << level) - 1;
+                let end_idx = (1 << (level + 1)) - 1;
 
-                let root = &*self.root;
-                let initial_root_head = root.head.load(Ordering::Acquire);
-                let initial_root_enq = if initial_root_head > 0 {
-                    root.get_block(initial_root_head - 1)
-                        .map(|b| b.sumenq.load(Ordering::Acquire))
-                        .unwrap_or(0)
-                } else {
-                    0
-                };
-
-                // Bounded number of sync attempts
-                for _ in 0..5 {
-                    self.sync();
-                }
-
-                let new_root_head = root.head.load(Ordering::Acquire);
-                let new_root_enq = if new_root_head > 0 {
-                    root.get_block(new_root_head - 1)
-                        .map(|b| b.sumenq.load(Ordering::Acquire))
-                        .unwrap_or(0)
-                } else {
-                    0
-                };
-
-                if new_root_head != initial_root_head || new_root_enq != initial_root_enq {
-                    changed = true;
+                for idx in start_idx..end_idx.min(start_idx + (1 << level)) {
+                    let node = self.get_node(idx);
+                    for _ in 0..2 {
+                        self.refresh(node);
+                    }
                 }
             }
         }

@@ -1,4 +1,4 @@
-// queues/src/mpmc/wf_queue.rs
+// queues/src/mpmc/verma_wf.rs
 // Wait-Free MPMC Queue based on Mudit Verma's thesis
 // "Scalable and Performance-Critical Data Structures for Multicores"
 
@@ -37,14 +37,6 @@ impl<T> Request<T> {
             element: UnsafeCell::new(None),
             is_completed: AtomicBool::new(false),
             _padding: [0; CACHE_LINE_SIZE - 17],
-        }
-    }
-
-    fn reset(&self) {
-        self.op_type.store(OpType::None as u8, Ordering::Release);
-        self.is_completed.store(false, Ordering::Release);
-        unsafe {
-            *self.element.get() = None;
         }
     }
 }
@@ -132,8 +124,6 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
     unsafe fn allocate_node(&self, value: Option<T>) -> usize {
         let index = self.next_free_node.fetch_add(1, Ordering::AcqRel);
         if index >= self.node_pool_size {
-            // In production, this should handle gracefully
-            // For benchmark, panic is acceptable to detect sizing issues
             panic!(
                 "Node pool exhausted: {} >= {} (num_threads: {})",
                 index, self.node_pool_size, self.num_threads
@@ -158,12 +148,12 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
                 match op_type {
                     1 => {
                         // Enqueue
-                        let element = (*request.element.get()).take();
+                        let element = (*request.element.get()).clone();
                         if let Some(elem) = element {
                             let new_node_index = self.allocate_node(Some(elem));
                             let tail_index = self.tail.load(Ordering::Acquire);
 
-                            // Append to tail (which always exists due to sentinel)
+                            // Append to tail
                             let tail_node = self.get_node(tail_index);
                             tail_node.next.store(new_node_index, Ordering::Release);
 
@@ -180,17 +170,17 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
                         let next_index = head_node.next.load(Ordering::Acquire);
 
                         if next_index != 0 {
-                            // Get the actual element (skip sentinel)
+                            // Get the actual element
                             let next_node = self.get_node(next_index);
                             let value = next_node.value.take();
 
-                            // Update head to point to next (new sentinel)
+                            // Update head
                             self.head.store(next_index, Ordering::Release);
 
                             *request.element.get() = value;
                             self.size.fetch_sub(1, Ordering::AcqRel);
                         } else {
-                            // Queue is empty (only sentinel remains)
+                            // Queue is empty
                             *request.element.get() = None;
                         }
                         request.is_completed.store(true, Ordering::Release);
@@ -202,9 +192,53 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
             // Move to next thread in round-robin fashion
             current_index = (current_index + 1) % self.num_threads;
 
-            // Yield to prevent busy spinning when idle
+            // Small yield to prevent busy spinning
             if current_index == 0 {
                 std::hint::spin_loop();
+            }
+        }
+
+        // Process any remaining requests before exiting
+        for _ in 0..self.num_threads {
+            for i in 0..self.num_threads {
+                let request = self.get_request(i);
+                let op_type = request.op_type.load(Ordering::Acquire);
+
+                if op_type != OpType::None as u8 && !request.is_completed.load(Ordering::Acquire) {
+                    match op_type {
+                        1 => {
+                            // Enqueue
+                            let element = (*request.element.get()).clone();
+                            if let Some(elem) = element {
+                                let new_node_index = self.allocate_node(Some(elem));
+                                let tail_index = self.tail.load(Ordering::Acquire);
+                                let tail_node = self.get_node(tail_index);
+                                tail_node.next.store(new_node_index, Ordering::Release);
+                                self.tail.store(new_node_index, Ordering::Release);
+                                self.size.fetch_add(1, Ordering::AcqRel);
+                            }
+                            request.is_completed.store(true, Ordering::Release);
+                        }
+                        2 => {
+                            // Dequeue
+                            let head_index = self.head.load(Ordering::Acquire);
+                            let head_node = self.get_node(head_index);
+                            let next_index = head_node.next.load(Ordering::Acquire);
+
+                            if next_index != 0 {
+                                let next_node = self.get_node(next_index);
+                                let value = next_node.value.take();
+                                self.head.store(next_index, Ordering::Release);
+                                *request.element.get() = value;
+                                self.size.fetch_sub(1, Ordering::AcqRel);
+                            } else {
+                                *request.element.get() = None;
+                            }
+                            request.is_completed.store(true, Ordering::Release);
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
 
@@ -225,10 +259,9 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
         let state_array_offset = queue_aligned;
         let state_array_aligned = (state_array_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
-        // Node pool - size based on expected workload
-        // Account for benchmark doing ~200k items per process
-        let items_per_thread = 250_000; // Conservative estimate
-        let node_pool_size = num_threads * items_per_thread * 2; // 2x safety margin
+        // Node pool
+        let items_per_thread = 250_000;
+        let node_pool_size = num_threads * items_per_thread * 2;
         let nodes_offset = state_array_offset + state_array_aligned;
         let nodes_size = node_pool_size * mem::size_of::<Node<T>>();
 
@@ -268,7 +301,7 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
             ptr::write(nodes_ptr.add(i), Node::new(None));
         }
 
-        // Initialize sentinel node (as per paper: "First node in the linked list is a sentinel (dummy) node")
+        // Initialize sentinel node
         let sentinel_index = queue.allocate_node(None);
         queue.head.store(sentinel_index, Ordering::Release);
         queue.tail.store(sentinel_index, Ordering::Release);
@@ -285,20 +318,12 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
             num_threads * FALSE_SHARING_MULTIPLIER * mem::size_of::<Request<T>>();
         let state_array_aligned = (state_array_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
-        // Same calculation as in init_in_shared
         let items_per_thread = 250_000;
         let node_pool_size = num_threads * items_per_thread * 2;
         let nodes_size = node_pool_size * mem::size_of::<Node<T>>();
 
         let total = queue_aligned + state_array_aligned + nodes_size;
         (total + 4095) & !4095 // Page align
-    }
-
-    // Wait for helper to be running
-    pub fn wait_for_helper(&self) {
-        while !self.helper_running.load(Ordering::Acquire) {
-            std::hint::spin_loop();
-        }
     }
 
     // Stop helper thread
@@ -309,7 +334,7 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
         }
     }
 
-    // Enqueue operation
+    // Enqueue operation (following paper's Listing 3.2)
     pub fn enqueue(&self, thread_id: usize, item: T) -> Result<(), ()> {
         unsafe {
             if thread_id >= self.num_threads {
@@ -318,31 +343,31 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
 
             let request = self.get_request(thread_id);
 
-            // Wait for any previous request to complete
-            while request.op_type.load(Ordering::Acquire) != OpType::None as u8 {
-                std::hint::spin_loop();
-            }
-
-            // Set up enqueue request
+            // Create request with element e and ENQUEUE type (lines 4-5 in paper)
             *request.element.get() = Some(item);
             request.is_completed.store(false, Ordering::Release);
+
+            // Post this request in state array (line 7 in paper)
             request
                 .op_type
                 .store(OpType::Enqueue as u8, Ordering::Release);
 
-            // Wait for completion
+            // Wait until the operation is completed (line 9 in paper)
             while !request.is_completed.load(Ordering::Acquire) {
                 std::hint::spin_loop();
             }
 
-            // Clear request
-            request.reset();
+            // Clear the request from state array (line 11 in paper - stateArr[id] = null)
+            request.op_type.store(OpType::None as u8, Ordering::Release);
+            unsafe {
+                *request.element.get() = None;
+            }
 
             Ok(())
         }
     }
 
-    // Dequeue operation
+    // Dequeue operation (following paper's Listing 3.3)
     pub fn dequeue(&self, thread_id: usize) -> Result<T, ()> {
         unsafe {
             if thread_id >= self.num_threads {
@@ -351,27 +376,25 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
 
             let request = self.get_request(thread_id);
 
-            // Wait for any previous request to complete
-            while request.op_type.load(Ordering::Acquire) != OpType::None as u8 {
-                std::hint::spin_loop();
-            }
-
-            // Set up dequeue request
+            // Create request with empty value field and DEQUEUE type (lines 4-5 in paper)
+            *request.element.get() = None;
             request.is_completed.store(false, Ordering::Release);
+
+            // Put the request in state array (line 7 in paper)
             request
                 .op_type
                 .store(OpType::Dequeue as u8, Ordering::Release);
 
-            // Wait for completion
+            // Wait until the operation completes (line 9 in paper)
             while !request.is_completed.load(Ordering::Acquire) {
                 std::hint::spin_loop();
             }
 
-            // Get result
+            // Get result before clearing (line 13 in paper - return req.e)
             let result = (*request.element.get()).take();
 
-            // Clear request
-            request.reset();
+            // Clear the request from state array (line 11 in paper)
+            request.op_type.store(OpType::None as u8, Ordering::Release);
 
             result.ok_or(())
         }

@@ -8,7 +8,7 @@ const SEGMENT_SIZE: usize = 1024;
 const PATIENCE: usize = 10;
 const CACHE_LINE_SIZE: usize = 64;
 
-// Use negative values that will never conflict with actual data
+// Using negative values that will never conflict with actual data
 const BOTTOM: usize = usize::MAX; // -1 in two's complement
 const TOP: usize = usize::MAX - 1; // -2 in two's complement
 const EMPTY_ENQ: *mut EnqReq = 1 as *mut EnqReq;

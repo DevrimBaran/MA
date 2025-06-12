@@ -5,7 +5,7 @@ use nix::{
     unistd::{fork, ForkResult},
 };
 use queues::mpmc::{self, polylog_queue, ymc_queue};
-use queues::mpmc::{BurdenWFQueue, KWQueue, NRQueue, WFQueue, YangCrummeyQueue};
+use queues::mpmc::{BurdenWFQueue, JKMQueue, KWQueue, NRQueue, WFQueue, YangCrummeyQueue};
 use queues::MpmcQueue;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -123,6 +123,24 @@ impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for NRQueue<T> {
 
     fn bench_pop(&self, process_id: usize) -> Result<T, ()> {
         self.simple_dequeue(process_id)
+    }
+
+    fn bench_is_empty(&self) -> bool {
+        self.is_empty()
+    }
+
+    fn bench_is_full(&self) -> bool {
+        self.is_full()
+    }
+}
+
+impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for JKMQueue<T> {
+    fn bench_push(&self, item: T, process_id: usize) -> Result<(), ()> {
+        self.enqueue(process_id, item)
+    }
+
+    fn bench_pop(&self, process_id: usize) -> Result<T, ()> {
+        self.dequeue(process_id)
     }
 
     fn bench_is_empty(&self) -> bool {
@@ -331,7 +349,7 @@ where
                 let my_target = target_items + extra_items;
 
                 let mut consecutive_empty_checks = 0;
-                const MAX_CONSECUTIVE_EMPTY_CHECKS: usize = 10000;
+                const MAX_CONSECUTIVE_EMPTY_CHECKS: usize = 40000;
 
                 while consumed_count < my_target {
                     match q.bench_pop(num_producers + consumer_id) {
@@ -859,6 +877,38 @@ fn bench_nr_queue(c: &mut Criterion) {
 
     group.finish();
 }
+
+fn bench_jkm_queue(c: &mut Criterion) {
+    let mut group = c.benchmark_group("JohnenKhattabiMilaniMPMC");
+
+    for &(num_prods, num_cons) in PROCESS_COUNTS_TO_TEST {
+        let items_per_process = ITEMS_PER_PROCESS_TARGET;
+
+        group.bench_function(
+            format!("{}P_{}C", num_prods, num_cons),
+            |b: &mut Bencher| {
+                b.iter_custom(|_iters| {
+                    fork_and_run_mpmc_with_helper::<JKMQueue<usize>, _>(
+                        || {
+                            let bytes = JKMQueue::<usize>::shared_size(num_prods, num_cons);
+                            let shm_ptr = unsafe { map_shared(bytes) };
+                            let q =
+                                unsafe { JKMQueue::init_in_shared(shm_ptr, num_prods, num_cons) };
+                            (q, shm_ptr, bytes)
+                        },
+                        num_prods,
+                        num_cons,
+                        items_per_process,
+                        false, // needs_helper = false
+                    )
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(2))
@@ -870,6 +920,7 @@ criterion_group! {
     name = benches;
     config = custom_criterion();
     targets =
+        bench_jkm_queue,
         bench_kw_queue,
         bench_burden_wf_queue,
         bench_nr_queue,

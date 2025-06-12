@@ -222,90 +222,123 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
     }
 
     // ---------- refresh a tree node (leaf or internal) ----------------------
-    unsafe fn refresh(&self, idx: usize, is_leaf: bool) {
+    unsafe fn refresh(&self, idx: usize, is_leaf: bool) -> bool {
         let node = (*self.tree).get_unchecked(idx);
-        loop {
-            let old = node.load();
+        let old = node.load();
 
-            let new = if is_leaf {
-                let p = idx - ((self.tree_size + 1) / 2 - 1);
-                let h = (*self.head).get_unchecked(p).max_read();
-                let t = (*self.tail).get_unchecked(p).load(Ordering::Acquire);
+        let new = if is_leaf {
+            let p = idx - ((self.tree_size + 1) / 2 - 1);
+            let h = (*self.head).get_unchecked(p).max_read();
+            let t = (*self.tail).get_unchecked(p).load(Ordering::Acquire);
 
-                if h == t {
-                    TIMESTAMP_EMPTY
-                } else {
-                    (*self.items)
-                        .get_unchecked(p * self.items_per_process + h)
-                        .timestamp
-                        .load() // SeqCst load
-                }
+            if h == t {
+                TIMESTAMP_EMPTY
             } else {
-                let l = (*self.tree).get_unchecked(Self::left(idx)).load();
-                let r = (*self.tree).get_unchecked(Self::right(idx)).load();
-                match (l == TIMESTAMP_EMPTY, r == TIMESTAMP_EMPTY) {
-                    (true, true) => TIMESTAMP_EMPTY,
-                    (true, false) => r,
-                    (false, true) => l,
-                    (false, false) => l.min(r),
-                }
-            };
+                (*self.items)
+                    .get_unchecked(p * self.items_per_process + h)
+                    .timestamp
+                    .load()
+            }
+        } else {
+            let l = (*self.tree).get_unchecked(Self::left(idx)).load();
+            let r = (*self.tree).get_unchecked(Self::right(idx)).load();
+            match (l == TIMESTAMP_EMPTY, r == TIMESTAMP_EMPTY) {
+                (true, true) => TIMESTAMP_EMPTY,
+                (true, false) => r,
+                (false, true) => l,
+                (false, false) => l.min(r),
+            }
+        };
 
-            if old == new {
-                return;
-            }
-            if node.compare_exchange(old, new).is_ok() {
-                return;
-            }
+        if old == new {
+            false
+        } else {
+            node.compare_exchange(old, new).is_ok()
         }
     }
 
     unsafe fn propagate(&self, p: usize) {
         let mut idx = self.leaf_for(p);
+
+        // Refresh leaf twice as per paper
         self.refresh(idx, true);
+        self.refresh(idx, true);
+
+        // Propagate up the tree
         while idx > 0 {
             idx = Self::parent(idx);
+            self.refresh(idx, false);
             self.refresh(idx, false);
         }
     }
 
     unsafe fn finish_deq(&self, num: usize) {
         let deq_op_node = (*self.deq_ops).get_unchecked(num);
-        if deq_op_node.load() != DEQ_OPS_INIT {
-            return;
+
+        // Use CAS loop to ensure atomic update
+        loop {
+            let current = deq_op_node.load();
+            if current != DEQ_OPS_INIT {
+                return; // Already completed by another thread
+            }
+
+            // Refresh tree to get current state
+            if self.tree_size == 1 {
+                // Single node tree - it's both root and leaf
+                self.refresh(0, true);
+            } else {
+                // Multi-node tree - refresh from leaves up
+                for p in 0..self.num_processes {
+                    let leaf_idx = self.leaf_for(p);
+                    self.refresh(leaf_idx, true);
+                }
+
+                // Propagate to ensure root is current
+                for p in 0..self.num_processes {
+                    let mut idx = self.leaf_for(p);
+                    while idx > 0 {
+                        idx = Self::parent(idx);
+                        self.refresh(idx, false);
+                    }
+                }
+            }
+
+            let root_ts = (*self.tree).get_unchecked(0).load();
+            let (_, id) = unpack_u128(root_ts);
+
+            let final_val = if id == TS_P_EMPTY {
+                DEQ_OPS_EMPTY
+            } else {
+                let h = (*self.head).get_unchecked(id).max_read();
+                pack_u128(h, id)
+            };
+
+            // Try to update - if it fails, another thread completed it
+            match deq_op_node.compare_exchange(DEQ_OPS_INIT, final_val) {
+                Ok(_) => return,
+                Err(actual) if actual != DEQ_OPS_INIT => return, // Completed by another thread
+                Err(_) => continue,                              // Retry
+            }
         }
-
-        // root is a leaf only when the entire tree has a single node
-        let root_is_leaf = self.tree_size == 1;
-        self.refresh(0, root_is_leaf);
-
-        let root_ts = (*self.tree).get_unchecked(0).load();
-        let (_, id) = unpack_u128(root_ts);
-        let final_val = if id == TS_P_EMPTY {
-            DEQ_OPS_EMPTY
-        } else {
-            let h = (*self.head).get_unchecked(id).max_read();
-            pack_u128(h, id)
-        };
-
-        // ---------- use the correct variable here ----------
-        deq_op_node.compare_exchange(DEQ_OPS_INIT, final_val).ok();
     }
 
     unsafe fn update_tree(&self, num: usize) {
-        let op = (*self.deq_ops).get_unchecked(num).load();
-        let (j, id) = unpack_u128(op);
-        if id == DEQ_ID_INIT || id == DEQ_ID_EMPTY {
-            return;
+        if num == 0 {
+            return; // No operation 0 to update
         }
 
-        // ----------- NEW: clamp head so we never exceed tail ------------------
-        let t = (*self.tail).get_unchecked(id).load(Ordering::Acquire);
-        let next = j + 1;
-        (*self.head).get_unchecked(id).max_write(next.min(t)); // <= tail always
-                                                               // ---------------------------------------------------------------------
+        let op = (*self.deq_ops).get_unchecked(num).load();
+        let (j, id) = unpack_u128(op);
 
-        self.propagate(id);
+        // Update tree even for empty dequeue to maintain consistency
+        if id != DEQ_ID_INIT {
+            if id != DEQ_ID_EMPTY {
+                // Normal case - advance head
+                (*self.head).get_unchecked(id).max_write(j + 1);
+                self.propagate(id);
+            }
+            // For empty dequeue, tree should already reflect empty state
+        }
     }
 
     // ---------- enqueue / dequeue -------------------------------------------
@@ -314,27 +347,28 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
             return Err(());
         }
         unsafe {
-            // reserve slot index WITHOUT publishing it yet
             let t = (*self.tail).get_unchecked(pid).load(Ordering::Relaxed);
             if t >= self.items_per_process {
                 return Err(());
             }
 
             let st = self.enq_counter.max_read();
+            let timestamp = pack_u128(st, pid);
             let item = (*self.items).get_unchecked(pid * self.items_per_process + t);
 
-            // 1. write value & timestamp
+            // Write value and timestamp
             *item.val.get() = Some(x);
-            item.timestamp.store(pack_u128(st, pid)); // SeqCst inside AtomicCell
+            item.timestamp.store(timestamp);
 
-            // 2. publish new tail (makes sub-queue visible) – Release
+            // Publish by incrementing tail
             (*self.tail)
                 .get_unchecked(pid)
                 .store(t + 1, Ordering::Release);
 
-            // 3. advance global stamp and propagate
+            // Update global counter and propagate
             self.enq_counter.max_write(st + 1);
             self.propagate(pid);
+
             Ok(())
         }
     }
@@ -342,45 +376,125 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
     pub fn dequeue(&self, _tid: usize) -> Result<T, ()> {
         unsafe {
             let num = self.deq_counter.fetch_inc();
+
+            // Calculate helping range
             let start = if num > self.num_dequeuers {
-                num - (self.num_dequeuers - 1)
+                num.saturating_sub(self.num_dequeuers - 1)
             } else {
                 1
             };
 
+            // Help pending operations
             for i in start..=num {
-                if (*self.deq_ops).get_unchecked(i).load() == DEQ_OPS_INIT {
+                let op_val = (*self.deq_ops).get_unchecked(i).load();
+                if op_val == DEQ_OPS_INIT {
                     if i > 1 {
                         self.update_tree(i - 1);
-                        atomic::fence(Ordering::SeqCst);
                     }
                     self.finish_deq(i);
                 }
             }
 
-            /* ---------- unchanged up to here ---------- */
-            let op = (*self.deq_ops).get_unchecked(num).load();
-            let (j, id) = unpack_u128(op);
-            if id == DEQ_ID_EMPTY || id == DEQ_ID_INIT {
-                return Err(());
+            // Wait for our operation to complete
+            let mut retry_count = 0;
+            loop {
+                let op = (*self.deq_ops).get_unchecked(num).load();
+                if op != DEQ_OPS_INIT {
+                    let (j, id) = unpack_u128(op);
+
+                    if id == DEQ_ID_EMPTY {
+                        return Err(());
+                    }
+
+                    if id == DEQ_ID_INIT {
+                        // This shouldn't happen after helping
+                        if retry_count > 100 {
+                            return Err(());
+                        }
+                        retry_count += 1;
+                        self.finish_deq(num);
+                        std::hint::spin_loop();
+                        continue;
+                    }
+
+                    // Bounds check
+                    if id >= self.num_processes || j >= self.items_per_process {
+                        return Err(());
+                    }
+
+                    // Get the item
+                    let item = (*self.items).get_unchecked(id * self.items_per_process + j);
+
+                    // Take the value
+                    match (*item.val.get()).take() {
+                        Some(val) => return Ok(val),
+                        None => {
+                            // Value was already taken - this indicates a bug
+                            return Err(());
+                        }
+                    }
+                }
+
+                retry_count += 1;
+                if retry_count > 10000 {
+                    // Something is wrong - our operation should have been completed
+                    return Err(());
+                }
+                std::hint::spin_loop();
             }
-
-            // ---------- moved order: take first ----------
-            let item = (*self.items).get_unchecked(id * self.items_per_process + j);
-            let res = (*item.val.get()).take().ok_or(());
-
-            // advertise the progress *after* we actually removed the value
-            self.update_tree(num);
-            res
         }
     }
 
     // ---------- observers ----------------------------------------------------
     pub fn is_empty(&self) -> bool {
-        unsafe { (*self.tree).get_unchecked(0).load() == TIMESTAMP_EMPTY }
+        unsafe {
+            // Refresh entire tree from leaves up
+            for p in 0..self.num_processes {
+                let leaf_idx = self.leaf_for(p);
+                self.refresh(leaf_idx, true);
+            }
+
+            // Propagate changes up
+            for p in 0..self.num_processes {
+                let mut idx = self.leaf_for(p);
+                while idx > 0 {
+                    idx = Self::parent(idx);
+                    self.refresh(idx, false);
+                }
+            }
+
+            (*self.tree).get_unchecked(0).load() == TIMESTAMP_EMPTY
+        }
     }
+
     pub fn is_full(&self) -> bool {
         false
+    }
+
+    // Debug helper
+    pub fn debug_state(&self) {
+        unsafe {
+            println!("=== JKM Queue Debug State ===");
+            println!("Enq counter: {}", self.enq_counter.max_read());
+            println!(
+                "Deq counter: {}",
+                self.deq_counter.v.load(Ordering::Acquire)
+            );
+
+            for p in 0..self.num_processes {
+                let h = (*self.head).get_unchecked(p).max_read();
+                let t = (*self.tail).get_unchecked(p).load(Ordering::Acquire);
+                println!(
+                    "Process {}: head={}, tail={}, items={}",
+                    p,
+                    h,
+                    t,
+                    t.saturating_sub(h)
+                );
+            }
+
+            println!("Tree root: {:?}", (*self.tree).get_unchecked(0).load());
+        }
     }
 }
 
@@ -390,9 +504,15 @@ impl<T: Send + Clone + 'static> MpmcQueue<T> for JKMQueue<T> {
     type PopError = ();
 
     fn push(&self, v: T, id: usize) -> Result<(), Self::PushError> {
-        self.enqueue(id, v)
+        // Ensure producer ID is in valid range
+        if id < self.num_processes {
+            self.enqueue(id, v)
+        } else {
+            Err(())
+        }
     }
     fn pop(&self, id: usize) -> Result<T, Self::PopError> {
+        // Dequeue doesn't actually use the thread ID in JKM algorithm
         self.dequeue(id)
     }
     fn is_empty(&self) -> bool {

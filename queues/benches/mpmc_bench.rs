@@ -840,7 +840,7 @@ where
                             if producers_done {
                                 // Producers are done, try a final drain aggressively
                                 let mut final_drain_attempts = 0;
-                                const MAX_FINAL_DRAIN_ATTEMPTS: usize = 10_000; // Increased for JKM
+                                const MAX_FINAL_DRAIN_ATTEMPTS: usize = 100_000; // Increased for JKM
 
                                 // Force sync before aggressive drain
                                 if let Some(jkm_queue) =

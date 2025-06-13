@@ -719,6 +719,228 @@ where
     duration
 }
 
+fn fork_and_run_jkm<Q, F>(
+    queue_init_fn: F,
+    num_producers: usize,
+    num_consumers: usize,
+    items_per_process: usize,
+) -> Duration
+where
+    Q: BenchMpmcQueue<usize> + 'static,
+    F: FnOnce() -> (&'static Q, *mut u8, usize),
+{
+    if num_producers == 0 || num_consumers == 0 {
+        return Duration::from_nanos(1);
+    }
+
+    let total_items = num_producers * items_per_process;
+
+    let (q, q_shm_ptr, q_shm_size) = queue_init_fn();
+
+    let startup_sync_size = MpmcStartupSync::shared_size();
+    let startup_sync_shm_ptr = unsafe { map_shared(startup_sync_size) };
+    let startup_sync = MpmcStartupSync::new_in_shm(startup_sync_shm_ptr);
+
+    let done_sync_size = MpmcDoneSync::shared_size();
+    let done_sync_shm_ptr = unsafe { map_shared(done_sync_size) };
+    let done_sync = MpmcDoneSync::new_in_shm(done_sync_shm_ptr);
+
+    let mut producer_pids = Vec::with_capacity(num_producers);
+    let mut consumer_pids = Vec::with_capacity(num_consumers);
+
+    // Fork producers
+    for producer_id in 0..num_producers {
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                startup_sync.producers_ready.fetch_add(1, Ordering::AcqRel);
+
+                while !startup_sync.go_signal.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+
+                let mut push_attempts = 0;
+                for i in 0..items_per_process {
+                    let item_value = producer_id * items_per_process + i;
+                    while q.bench_push(item_value, producer_id).is_err() {
+                        push_attempts += 1;
+                        if push_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS {
+                            panic!(
+                                "Producer {} exceeded max spin retry attempts for push",
+                                producer_id
+                            );
+                        }
+                        std::hint::spin_loop();
+                    }
+                }
+
+                done_sync.producers_done.fetch_add(1, Ordering::AcqRel);
+                unsafe { libc::_exit(0) };
+            }
+            Ok(ForkResult::Parent { child }) => {
+                producer_pids.push(child);
+            }
+            Err(e) => {
+                unsafe {
+                    if !q_shm_ptr.is_null() {
+                        unmap_shared(q_shm_ptr, q_shm_size);
+                    }
+                    unmap_shared(startup_sync_shm_ptr, startup_sync_size);
+                    unmap_shared(done_sync_shm_ptr, done_sync_size);
+                }
+                panic!("Fork failed for producer {}: {}", producer_id, e);
+            }
+        }
+    }
+
+    // Fork consumers with JKM-specific handling
+    for consumer_id in 0..num_consumers {
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                startup_sync.consumers_ready.fetch_add(1, Ordering::AcqRel);
+
+                while !startup_sync.go_signal.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+
+                let mut consumed_count = 0;
+                let target_items = total_items / num_consumers;
+                let extra_items = if consumer_id < (total_items % num_consumers) {
+                    1
+                } else {
+                    0
+                };
+                let my_target = target_items + extra_items;
+
+                let mut consecutive_empty_checks = 0;
+                const MAX_CONSECUTIVE_EMPTY_CHECKS: usize = 100000; // Much higher for JKM
+
+                while consumed_count < my_target {
+                    match q.bench_pop(consumer_id) {
+                        Ok(_item) => {
+                            consumed_count += 1;
+                            consecutive_empty_checks = 0;
+                        }
+                        Err(_) => {
+                            if done_sync.producers_done.load(Ordering::Acquire)
+                                == num_producers as u32
+                            {
+                                consecutive_empty_checks += 1;
+
+                                // JKM-specific: force sync periodically
+                                if let Some(jkm_queue) =
+                                    unsafe { (q as *const _ as *const JKMQueue<usize>).as_ref() }
+                                {
+                                    if consecutive_empty_checks % 5000 == 0 {
+                                        jkm_queue.force_sync();
+                                    }
+
+                                    // Check actual items in queue
+                                    if consecutive_empty_checks > 20000 {
+                                        let items_left = jkm_queue.total_items();
+                                        if items_left == 0 {
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                // Progressive backoff
+                                if consecutive_empty_checks < 1000 {
+                                    std::hint::spin_loop();
+                                } else if consecutive_empty_checks < 10000 {
+                                    std::thread::yield_now();
+                                } else if consecutive_empty_checks < 50000 {
+                                    std::thread::sleep(std::time::Duration::from_micros(10));
+                                } else if consecutive_empty_checks > MAX_CONSECUTIVE_EMPTY_CHECKS {
+                                    break;
+                                }
+                            } else {
+                                for _ in 0..100 {
+                                    std::hint::spin_loop();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                done_sync
+                    .total_consumed
+                    .fetch_add(consumed_count, Ordering::AcqRel);
+                done_sync.consumers_done.fetch_add(1, Ordering::AcqRel);
+
+                unsafe { libc::_exit(0) };
+            }
+            Ok(ForkResult::Parent { child }) => {
+                consumer_pids.push(child);
+            }
+            Err(e) => {
+                unsafe {
+                    if !q_shm_ptr.is_null() {
+                        unmap_shared(q_shm_ptr, q_shm_size);
+                    }
+                    unmap_shared(startup_sync_shm_ptr, startup_sync_size);
+                    unmap_shared(done_sync_shm_ptr, done_sync_size);
+                }
+                panic!("Fork failed for consumer {}: {}", consumer_id, e);
+            }
+        }
+    }
+
+    // Wait for all workers to be ready
+    while startup_sync.producers_ready.load(Ordering::Acquire) < num_producers as u32
+        || startup_sync.consumers_ready.load(Ordering::Acquire) < num_consumers as u32
+    {
+        std::hint::spin_loop();
+    }
+
+    // START TIMING HERE
+    let start_time = std::time::Instant::now();
+    startup_sync.go_signal.store(true, Ordering::Release);
+
+    // Wait for producers
+    for pid in producer_pids {
+        waitpid(pid, None).expect("waitpid for producer failed");
+    }
+
+    // JKM-specific synchronization after producers finish
+    if let Some(jkm_queue) = unsafe { (q as *const _ as *const JKMQueue<usize>).as_ref() } {
+        // Ensure all enqueued items are visible
+        jkm_queue.force_sync();
+
+        // Help any pending dequeue operations
+        jkm_queue.finalize_pending_dequeues();
+
+        // Give time for propagation
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    // Wait for consumers
+    for pid in consumer_pids {
+        waitpid(pid, None).expect("waitpid for consumer failed");
+    }
+
+    let duration = start_time.elapsed();
+
+    // Get the total consumed count
+    let total_consumed = done_sync.total_consumed.load(Ordering::Acquire);
+
+    if total_consumed != total_items {
+        eprintln!(
+            "Warning (JKM MPMC): Total consumed {}/{} items. Prods: {}, Cons: {}",
+            total_consumed, total_items, num_producers, num_consumers
+        );
+    }
+
+    unsafe {
+        if !q_shm_ptr.is_null() {
+            unmap_shared(q_shm_ptr, q_shm_size);
+        }
+        unmap_shared(startup_sync_shm_ptr, startup_sync_size);
+        unmap_shared(done_sync_shm_ptr, done_sync_size);
+    }
+
+    duration
+}
+
 // Add benchmark function
 fn bench_wf_queue(c: &mut Criterion) {
     let mut group = c.benchmark_group("VermaMPMC");
@@ -888,7 +1110,7 @@ fn bench_jkm_queue(c: &mut Criterion) {
             format!("{}P_{}C", num_prods, num_cons),
             |b: &mut Bencher| {
                 b.iter_custom(|_iters| {
-                    fork_and_run_mpmc_with_helper::<JKMQueue<usize>, _>(
+                    fork_and_run_jkm::<JKMQueue<usize>, _>(
                         || {
                             let bytes = JKMQueue::<usize>::shared_size(num_prods, num_cons);
                             let shm_ptr = unsafe { map_shared(bytes) };
@@ -899,7 +1121,6 @@ fn bench_jkm_queue(c: &mut Criterion) {
                         num_prods,
                         num_cons,
                         items_per_process,
-                        false, // needs_helper = false
                     )
                 })
             },

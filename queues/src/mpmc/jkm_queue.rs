@@ -74,8 +74,8 @@ impl MaxRegister {
 }
 
 #[repr(C, align(64))]
-struct FetchAndInc {
-    v: AtomicUsize,
+pub struct FetchAndInc {
+    pub v: AtomicUsize,
 }
 impl FetchAndInc {
     fn new(x: usize) -> Self {
@@ -92,7 +92,7 @@ impl FetchAndInc {
 #[repr(C)]
 pub struct JKMQueue<T: Send + Clone + 'static> {
     enq_counter: MaxRegister,
-    deq_counter: FetchAndInc,
+    pub deq_counter: FetchAndInc,
 
     head: *const [MaxRegister],
     tail: *const [AtomicUsize],
@@ -646,5 +646,150 @@ impl<T: Send + Clone + 'static> MpmcQueue<T> for JKMQueue<T> {
     }
     fn is_full(&self) -> bool {
         self.is_full()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::thread;
+
+    #[test]
+    fn test_single_producer_single_consumer() {
+        unsafe {
+            let mem_size = JKMQueue::<usize>::shared_size(1, 1);
+            let mem = libc::malloc(mem_size) as *mut u8;
+            let queue = JKMQueue::init_in_shared(mem, 1, 1);
+
+            // Enqueue 100 items
+            for i in 0..100 {
+                assert!(queue.enqueue(0, i).is_ok(), "Failed to enqueue item {}", i);
+            }
+
+            // Force sync to ensure visibility
+            queue.force_sync();
+
+            // Dequeue all items
+            let mut dequeued = Vec::new();
+            for _ in 0..100 {
+                match queue.dequeue(0) {
+                    Ok(val) => dequeued.push(val),
+                    Err(_) => break,
+                }
+            }
+
+            // Finalize to ensure no items are stuck
+            queue.finalize_pending_dequeues();
+
+            // Try to dequeue any remaining items
+            while let Ok(val) = queue.dequeue(0) {
+                dequeued.push(val);
+            }
+
+            assert_eq!(
+                dequeued.len(),
+                100,
+                "Expected 100 items, got {}",
+                dequeued.len()
+            );
+
+            // Verify all items are present
+            let dequeued_set: HashSet<_> = dequeued.into_iter().collect();
+            for i in 0..100 {
+                assert!(dequeued_set.contains(&i), "Missing item {}", i);
+            }
+
+            libc::free(mem as *mut libc::c_void);
+        }
+    }
+
+    #[test]
+    fn test_edge_case_last_dequeue() {
+        unsafe {
+            let mem_size = JKMQueue::<usize>::shared_size(1, 1);
+            let mem = libc::malloc(mem_size) as *mut u8;
+            let queue = JKMQueue::init_in_shared(mem, 1, 1);
+
+            // Enqueue exactly one item
+            queue.enqueue(0, 42).unwrap();
+            queue.force_sync();
+
+            // Dequeue it
+            let val = queue.dequeue(0).unwrap();
+            assert_eq!(val, 42);
+
+            // Finalize
+            queue.finalize_pending_dequeues();
+
+            // Verify queue is truly empty
+            assert!(queue.is_empty(), "Queue should be empty");
+            assert!(
+                queue.dequeue(0).is_err(),
+                "Should not be able to dequeue from empty queue"
+            );
+
+            // Check internal state
+            let total = queue.total_items();
+            assert_eq!(total, 0, "Total items should be 0, got {}", total);
+
+            libc::free(mem as *mut libc::c_void);
+        }
+    }
+
+    #[test]
+    fn test_benchmark_scenario() {
+        // Simulate the exact benchmark scenario
+        unsafe {
+            let mem_size = JKMQueue::<usize>::shared_size(2, 2);
+            let mem = libc::malloc(mem_size) as *mut u8;
+            let queue = JKMQueue::init_in_shared(mem, 2, 2);
+
+            // Producer 0 enqueues 5000 items
+            for i in 0..5000 {
+                queue.enqueue(0, i).unwrap();
+            }
+
+            // Producer 1 enqueues 5000 items
+            for i in 5000..10000 {
+                queue.enqueue(1, i).unwrap();
+            }
+
+            queue.force_sync();
+
+            // Consumer phase
+            let mut total_dequeued = 0;
+            let mut consecutive_empty = 0;
+
+            while total_dequeued < 10000 && consecutive_empty < 100000 {
+                match queue.dequeue(0) {
+                    Ok(_) => {
+                        total_dequeued += 1;
+                        consecutive_empty = 0;
+                    }
+                    Err(_) => {
+                        consecutive_empty += 1;
+                        if consecutive_empty % 5000 == 0 {
+                            queue.force_sync();
+                        }
+                    }
+                }
+            }
+
+            // Finalize
+            queue.finalize_pending_dequeues();
+
+            // Try to get remaining items
+            while let Ok(_) = queue.dequeue(0) {
+                total_dequeued += 1;
+            }
+
+            println!("Benchmark test: dequeued {}/10000 items", total_dequeued);
+            assert_eq!(total_dequeued, 10000, "Should dequeue all 10000 items");
+
+            libc::free(mem as *mut libc::c_void);
+        }
     }
 }

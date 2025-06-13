@@ -206,7 +206,7 @@ mod jkm_queue_tests {
             let mem_size = JKMQueue::<usize>::shared_size(NUM_PRODUCERS, NUM_CONSUMERS);
             let mem = libc::malloc(mem_size) as *mut u8;
             let queue = JKMQueue::init_in_shared(mem, NUM_PRODUCERS, NUM_CONSUMERS);
-            let queue_ptr = queue as *const JKMQueue<usize>;
+            let queue_arc = Arc::new(queue);
 
             // Shared set to track dequeued items
             let dequeued = Arc::new(Mutex::new(HashSet::new()));
@@ -214,8 +214,9 @@ mod jkm_queue_tests {
             // Spawn producers
             let mut producer_handles = vec![];
             for p in 0..NUM_PRODUCERS {
+                let queue_clone = queue_arc.clone();
                 let handle = thread::spawn(move || {
-                    let q = &*queue_ptr;
+                    let q = &*queue_clone;
                     let start = p * ITEMS_PER_PRODUCER;
                     let end = start + ITEMS_PER_PRODUCER;
 
@@ -227,14 +228,15 @@ mod jkm_queue_tests {
                 });
                 producer_handles.push(handle);
             }
-
             // Spawn consumers
             let mut consumer_handles = vec![];
             for c in 0..NUM_CONSUMERS {
                 let dequeued_clone = dequeued.clone();
+                let queue_clone = queue_arc.clone();
                 let handle = thread::spawn(move || {
-                    let q = &*queue_ptr;
+                    let q = &*queue_clone;
                     let mut local_count = 0;
+                    let mut empty_count = 0;
                     let mut empty_count = 0;
 
                     loop {
@@ -264,10 +266,9 @@ mod jkm_queue_tests {
             }
 
             // Give consumers time to finish
-            thread::sleep(std::time::Duration::from_millis(100));
-
             // Force finalization
-            queue.finalize_pending_dequeues();
+            queue_arc.finalize_pending_dequeues();
+            // No need to call finalize_pending_dequeues() on queue again as it's moved into queue_arc
 
             // Signal consumers to stop by checking if queue is truly empty
             thread::sleep(std::time::Duration::from_millis(100));
@@ -352,6 +353,87 @@ mod jkm_queue_tests {
 
             let after_first = queue.deq_counter.v.load(Ordering::Acquire);
             assert_eq!(after_first, 1, "After first dequeue, counter should be 1");
+
+            libc::free(mem as *mut libc::c_void);
+        }
+    }
+
+    #[test]
+    fn test_tree_propagation_debug() {
+        unsafe {
+            let mem_size = JKMQueue::<usize>::shared_size(2, 1);
+            let mem = libc::malloc(mem_size) as *mut u8;
+            let queue = JKMQueue::init_in_shared(mem, 2, 1);
+
+            println!("Initial state:");
+            queue.debug_state();
+
+            // Enqueue one item in each sub-queue
+            queue.enqueue(0, 100).unwrap();
+            println!("\nAfter enqueue(0, 100):");
+            queue.debug_state();
+
+            queue.enqueue(1, 200).unwrap();
+            println!("\nAfter enqueue(1, 200):");
+            queue.debug_state();
+
+            // Force propagation
+            queue.force_sync();
+            println!("\nAfter force_sync:");
+            queue.debug_state();
+
+            // First dequeue
+            println!("\nAttempting first dequeue...");
+            match queue.dequeue(0) {
+                Ok(val) => println!("First dequeue got: {}", val),
+                Err(_) => println!("First dequeue failed!"),
+            }
+            println!("\nAfter first dequeue:");
+            queue.debug_state();
+
+            // Second dequeue
+            println!("\nAttempting second dequeue...");
+            match queue.dequeue(0) {
+                Ok(val) => println!("Second dequeue got: {}", val),
+                Err(_) => println!("Second dequeue failed!"),
+            }
+            println!("\nAfter second dequeue:");
+            queue.debug_state();
+
+            queue.finalize_pending_dequeues();
+            println!("\nAfter finalize:");
+            queue.debug_state();
+
+            libc::free(mem as *mut libc::c_void);
+        }
+    }
+
+    #[test]
+    fn test_simple_two_items_same_queue() {
+        unsafe {
+            let mem_size = JKMQueue::<usize>::shared_size(1, 1);
+            let mem = libc::malloc(mem_size) as *mut u8;
+            let queue = JKMQueue::init_in_shared(mem, 1, 1);
+
+            // Enqueue two items in the same sub-queue
+            queue.enqueue(0, 100).unwrap();
+            queue.enqueue(0, 200).unwrap();
+            queue.force_sync();
+
+            println!("After enqueueing 100 and 200:");
+            queue.debug_state();
+
+            // Dequeue both
+            let val1 = queue.dequeue(0).unwrap();
+            println!("First dequeue: {}", val1);
+            queue.debug_state();
+
+            let val2 = queue.dequeue(0).unwrap();
+            println!("Second dequeue: {}", val2);
+            queue.debug_state();
+
+            assert_eq!(val1, 100);
+            assert_eq!(val2, 200);
 
             libc::free(mem as *mut libc::c_void);
         }

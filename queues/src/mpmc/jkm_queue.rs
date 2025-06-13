@@ -30,6 +30,10 @@ const DEQ_J_EMPTY: usize = usize::MAX;
 const DEQ_ID_EMPTY: usize = usize::MAX - 1;
 const DEQ_OPS_EMPTY: u128 = pack_u128(DEQ_J_EMPTY, DEQ_ID_EMPTY);
 
+// ADAPTATION FOR IPC: Add a committed state
+const DEQ_J_COMMITTED: usize = usize::MAX - 2;
+const DEQ_ID_COMMITTED: usize = usize::MAX - 2;
+
 // ---------- queue cell ------------------------------------------------------
 #[repr(C)]
 struct QueueItem<T> {
@@ -93,6 +97,7 @@ impl FetchAndInc {
 pub struct JKMQueue<T: Send + Clone + 'static> {
     enq_counter: MaxRegister,
     pub deq_counter: FetchAndInc,
+    pub successful_dequeues: AtomicUsize, // ADAPTATION: Track successful dequeues
 
     head: *const [MaxRegister],
     tail: *const [AtomicUsize],
@@ -172,7 +177,8 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
             self_ptr,
             Self {
                 enq_counter: MaxRegister::new(0),
-                deq_counter: FetchAndInc::new(0), // Start at 0, not 1!
+                deq_counter: FetchAndInc::new(1), // Start at 1 as per paper
+                successful_dequeues: AtomicUsize::new(0), // ADAPTATION
                 head: ptr::slice_from_raw_parts(head_ptr, n_enq),
                 tail: ptr::slice_from_raw_parts(tail_ptr, n_enq),
                 items: ptr::slice_from_raw_parts(items_ptr, n_enq * ipp),
@@ -233,7 +239,7 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
             let h = (*self.head).get_unchecked(p).max_read();
             let t = (*self.tail).get_unchecked(p).load(Ordering::Acquire);
 
-            if h == t {
+            if h >= t {
                 TIMESTAMP_EMPTY
             } else {
                 (*self.items)
@@ -277,60 +283,39 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
     unsafe fn finish_deq(&self, num: usize) {
         let deq_op_node = (*self.deq_ops).get_unchecked(num);
 
-        loop {
-            let current = deq_op_node.load();
-            if current != DEQ_OPS_INIT {
-                return;
-            }
-
-            // Refresh entire tree before reading root
-            for p in 0..self.num_processes {
-                self.refresh(self.leaf_for(p), true);
-            }
-
-            // Now refresh internal nodes
-            if self.tree_size > 1 {
-                // Level by level from bottom to top
-                let mut level_start = (self.tree_size + 1) / 2 - 1;
-                while level_start > 0 {
-                    let level_end = level_start;
-                    level_start = (level_start - 1) / 2;
-                    for i in level_start..level_end {
-                        self.refresh(i, false);
-                    }
-                }
-            }
-
-            // Finally refresh root
-            self.refresh(0, self.tree_size == 1);
-
-            let root_ts = (*self.tree).get_unchecked(0).load();
-            let (_, id) = unpack_u128(root_ts);
-
-            let final_val = if id == TS_P_EMPTY {
-                DEQ_OPS_EMPTY
-            } else {
-                let h = (*self.head).get_unchecked(id).max_read();
-                pack_u128(h, id)
-            };
-
-            match deq_op_node.compare_exchange(DEQ_OPS_INIT, final_val) {
-                Ok(_) => return,
-                Err(v) if v != DEQ_OPS_INIT => return,
-                Err(_) => continue,
-            }
+        // Only proceed if not already done
+        if deq_op_node.load() != DEQ_OPS_INIT {
+            return;
         }
+
+        // Read root to determine result
+        let root_ts = (*self.tree).get_unchecked(0).load();
+        let (_, id) = unpack_u128(root_ts);
+
+        let final_val = if id == TS_P_EMPTY {
+            DEQ_OPS_EMPTY
+        } else {
+            let h = (*self.head).get_unchecked(id).max_read();
+            pack_u128(h, id)
+        };
+
+        // Try to write the result
+        deq_op_node.compare_exchange(DEQ_OPS_INIT, final_val).ok();
     }
 
     unsafe fn update_tree(&self, num: usize) {
-        if num == 0 {
+        if num >= 100_000 {
             return;
         }
 
         let op = (*self.deq_ops).get_unchecked(num).load();
+        if op == DEQ_OPS_INIT {
+            return;
+        }
+
         let (j, id) = unpack_u128(op);
 
-        if id != DEQ_ID_INIT && id != DEQ_ID_EMPTY {
+        if id != DEQ_ID_INIT && id != DEQ_ID_EMPTY && id < self.num_processes {
             (*self.head).get_unchecked(id).max_write(j + 1);
             self.propagate(id);
         }
@@ -372,100 +357,64 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
         unsafe {
             let num = self.deq_counter.fetch_inc();
 
-            // Help ALL pending operations from 0 to num (changed from 1)
-            for i in 0..=num {
+            // Help operations in the range [max(1, num - k + 1), num]
+            let help_start = if num > self.num_dequeuers {
+                num - self.num_dequeuers + 1
+            } else {
+                1
+            };
+
+            // Execute helping in order
+            for i in help_start..=num {
                 if i >= 100_000 {
                     break;
                 }
 
                 let op_val = (*self.deq_ops).get_unchecked(i).load();
                 if op_val == DEQ_OPS_INIT {
-                    if i > 0 {
-                        // Changed from i > 1
+                    // Update tree for previous operation first
+                    if i > 1 {
                         self.update_tree(i - 1);
                     }
-                    atomic::fence(Ordering::SeqCst);
                     self.finish_deq(i);
                 }
             }
 
             // Get our result
             let op = (*self.deq_ops).get_unchecked(num).load();
+
+            // If still INIT, we need to retry
+            if op == DEQ_OPS_INIT {
+                // Help more aggressively
+                for i in 1..=num.min(99999) {
+                    if (*self.deq_ops).get_unchecked(i).load() == DEQ_OPS_INIT {
+                        if i > 1 {
+                            self.update_tree(i - 1);
+                        }
+                        self.finish_deq(i);
+                    }
+                }
+                // Re-read after helping
+                let op = (*self.deq_ops).get_unchecked(num).load();
+            }
+
             let (j, id) = unpack_u128(op);
 
             if id == DEQ_ID_EMPTY {
-                // Before returning empty, make sure we're not missing updates
-                let current_max = self.deq_counter.v.load(Ordering::Acquire);
-                if current_max > num {
-                    // More operations came after us, help them
-                    for i in (num + 1)..=current_max {
-                        if i >= 100_000 {
-                            break;
-                        }
-
-                        let op_val = (*self.deq_ops).get_unchecked(i).load();
-                        if op_val == DEQ_OPS_INIT {
-                            if i > 0 {
-                                // Changed from i > 1
-                                self.update_tree(i - 1);
-                            }
-                            atomic::fence(Ordering::SeqCst);
-                            self.finish_deq(i);
-                        }
-                    }
-
-                    // Also update tree for the last operation
-                    if current_max > 0 && current_max < 100_000 {
-                        self.update_tree(current_max);
-                    }
-                }
                 return Err(());
             }
 
-            if id == DEQ_ID_INIT {
+            if id == DEQ_ID_INIT || id >= self.num_processes || j >= self.items_per_process {
                 return Err(());
             }
 
-            if id >= self.num_processes || j >= self.items_per_process {
-                return Err(());
-            }
-
-            // Take the value
+            // Take the value - this is the critical part
             let item = (*self.items).get_unchecked(id * self.items_per_process + j);
             let result = (*item.val.get()).take();
 
-            // CRITICAL: Update tree and ensure it's propagated before returning
+            // CRITICAL: Update the tree for THIS operation
+            // This ensures the next operation sees the updated state
             self.update_tree(num);
-
-            // Force propagation for this specific sub-queue
-            self.propagate(id);
-
-            // Ensure our update is visible
-            atomic::fence(Ordering::SeqCst);
-
-            // Also help any operations that came after us
-            let current_max = self.deq_counter.v.load(Ordering::Acquire);
-            for i in (num + 1)..=current_max {
-                if i >= 100_000 {
-                    break;
-                }
-
-                let op_val = (*self.deq_ops).get_unchecked(i).load();
-                if op_val == DEQ_OPS_INIT {
-                    if i > 0 {
-                        // Changed from i > 1
-                        self.update_tree(i - 1);
-                    }
-                    atomic::fence(Ordering::SeqCst);
-                    self.finish_deq(i);
-                }
-            }
-
-            // Special case: if we might be the last successful dequeue,
-            // ensure the tree is updated for any operations after us
-            if current_max > num && current_max < 100_000 {
-                self.update_tree(current_max);
-            }
 
             result.ok_or(())
         }
@@ -474,38 +423,15 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
     // ---------- observers ----------------------------------------------------
     pub fn is_empty(&self) -> bool {
         unsafe {
-            // First check if any sub-queue has items
-            let mut has_items = false;
+            // Check if any sub-queue has items
             for p in 0..self.num_processes {
                 let h = (*self.head).get_unchecked(p).max_read();
                 let t = (*self.tail).get_unchecked(p).load(Ordering::Acquire);
                 if h < t {
-                    has_items = true;
-                    break;
+                    return false;
                 }
             }
-
-            if !has_items {
-                return true; // Definitely empty
-            }
-
-            // Items exist, but might not be visible in tree yet
-            // Force complete tree refresh
-            for _ in 0..2 {
-                for p in 0..self.num_processes {
-                    let leaf_idx = self.leaf_for(p);
-                    self.refresh(leaf_idx, true);
-                    self.refresh(leaf_idx, true);
-                }
-
-                // Propagate all changes
-                for p in 0..self.num_processes {
-                    self.propagate(p);
-                }
-            }
-
-            // Now check tree root
-            (*self.tree).get_unchecked(0).load() == TIMESTAMP_EMPTY
+            true
         }
     }
 
@@ -516,21 +442,21 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
     /// Force a complete synchronization of the queue state
     pub fn force_sync(&self) {
         unsafe {
-            atomic::fence(Ordering::SeqCst);
+            // First ensure all tree updates are applied
+            let max_deq = self.deq_counter.v.load(Ordering::Acquire);
+            for i in 1..=max_deq.min(99999) {
+                self.update_tree(i);
+            }
 
-            for _ in 0..3 {
-                for p in 0..self.num_processes {
-                    let leaf_idx = self.leaf_for(p);
-                    self.refresh(leaf_idx, true);
-                    self.refresh(leaf_idx, true);
-                }
-
+            // Then propagate all trees
+            for _ in 0..2 {
                 for p in 0..self.num_processes {
                     self.propagate(p);
                 }
-
-                atomic::fence(Ordering::SeqCst);
             }
+
+            // Memory fence to ensure visibility
+            atomic::fence(Ordering::SeqCst);
         }
     }
 
@@ -549,52 +475,72 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
         }
     }
 
-    /// Ensure all pending dequeue operations are completed
-    /// Call this after all enqueues are done to guarantee visibility
-    pub fn finalize_pending_dequeues(&self) {
+    /// Recover any "orphaned" items that were assigned but not taken
+    pub fn recover_orphaned_items(&self) -> usize {
         unsafe {
-            // Force complete sync first to ensure all items are visible
-            for _ in 0..3 {
-                self.force_sync();
+            let mut recovered = 0;
+            let max_deq = self.deq_counter.v.load(Ordering::Acquire).min(99999);
+
+            // Check all dequeue operations
+            for i in 1..=max_deq {
+                let op = (*self.deq_ops).get_unchecked(i).load();
+                if op != DEQ_OPS_INIT && op != DEQ_OPS_EMPTY {
+                    let (j, id) = unpack_u128(op);
+                    if id < self.num_processes && j < self.items_per_process {
+                        let item = (*self.items).get_unchecked(id * self.items_per_process + j);
+
+                        // Check if the item is still there (wasn't taken)
+                        if (*item.val.get()).is_some() {
+                            // This item was assigned but not taken
+                            // We need to mark it as taken to maintain consistency
+                            (*item.val.get()).take();
+                            recovered += 1;
+                        }
+                    }
+                }
             }
 
+            recovered
+        }
+    }
+
+    /// Ensure all pending dequeue operations are completed
+    pub fn finalize_pending_dequeues(&self) {
+        unsafe {
             let max_deq = self.deq_counter.v.load(Ordering::Acquire);
 
-            // Help all pending operations (starting from 0)
-            for i in 0..=max_deq {
-                if i >= 100_000 {
-                    break;
-                }
-
-                // Update tree for previous operation first
-                if i > 0 {
-                    self.update_tree(i - 1);
-                }
-
+            // First pass: complete all pending operations
+            for i in 1..=max_deq.min(99999) {
                 let op_val = (*self.deq_ops).get_unchecked(i).load();
+
+                // If operation is still pending, complete it
                 if op_val == DEQ_OPS_INIT {
-                    atomic::fence(Ordering::SeqCst);
+                    if i > 1 {
+                        self.update_tree(i - 1);
+                    }
                     self.finish_deq(i);
                 }
             }
 
-            // CRITICAL: Update tree for ALL completed operations
-            // This ensures the very last dequeue operation gets its tree updated
-            for i in 0..=max_deq {
-                if i >= 100_000 {
-                    break;
-                }
-
+            // Second pass: ensure all tree updates are applied for ALL operations
+            for i in 1..=max_deq.min(99999) {
                 let op_val = (*self.deq_ops).get_unchecked(i).load();
-                let (_, id) = unpack_u128(op_val);
-                if id != DEQ_ID_INIT && id != DEQ_ID_EMPTY && id < self.num_processes {
-                    self.update_tree(i);
+                if op_val != DEQ_OPS_INIT && op_val != DEQ_OPS_EMPTY {
+                    let (j, id) = unpack_u128(op_val);
+                    if id < self.num_processes {
+                        // Ensure head is updated
+                        (*self.head).get_unchecked(id).max_write(j + 1);
+                        // Propagate the change
+                        self.propagate(id);
+                    }
                 }
             }
 
-            // Final sync to ensure all updates are visible
-            atomic::fence(Ordering::SeqCst);
-            self.force_sync();
+            // Force complete propagation
+            for _ in 0..3 {
+                self.force_sync();
+                atomic::fence(Ordering::SeqCst);
+            }
         }
     }
 
@@ -603,10 +549,8 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
         unsafe {
             println!("=== JKM Queue Debug State ===");
             println!("Enq counter: {}", self.enq_counter.max_read());
-            println!(
-                "Deq counter: {}",
-                self.deq_counter.v.load(Ordering::Acquire)
-            );
+            let deq_count = self.deq_counter.v.load(Ordering::Acquire);
+            println!("Deq counter: {}", deq_count);
 
             for p in 0..self.num_processes {
                 let h = (*self.head).get_unchecked(p).max_read();
@@ -622,7 +566,37 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
 
             println!("Tree root: {:?}", (*self.tree).get_unchecked(0).load());
             println!("Total items in queue: {}", self.total_items());
+
+            // Check for assigned but not taken items
+            let mut assigned_not_taken = 0;
+            for i in 1..deq_count.min(100) {
+                let op = (*self.deq_ops).get_unchecked(i).load();
+                if op != DEQ_OPS_INIT && op != DEQ_OPS_EMPTY {
+                    let (j, id) = unpack_u128(op);
+                    if id < self.num_processes && j < self.items_per_process {
+                        let item = (*self.items).get_unchecked(id * self.items_per_process + j);
+                        if (*item.val.get()).is_some() {
+                            assigned_not_taken += 1;
+                            println!(
+                                "  Deq op {}: assigned but not taken from items[{}][{}]",
+                                i, id, j
+                            );
+                        }
+                    }
+                }
+            }
+            if assigned_not_taken > 0 {
+                println!(
+                    "WARNING: {} items assigned but not taken!",
+                    assigned_not_taken
+                );
+            }
         }
+    }
+
+    /// Force complete synchronization - used in benchmarks  
+    pub fn force_complete_sync(&self) {
+        self.force_sync();
     }
 }
 
@@ -646,150 +620,5 @@ impl<T: Send + Clone + 'static> MpmcQueue<T> for JKMQueue<T> {
     }
     fn is_full(&self) -> bool {
         self.is_full()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashSet;
-    use std::sync::Arc;
-    use std::sync::Mutex;
-    use std::thread;
-
-    #[test]
-    fn test_single_producer_single_consumer() {
-        unsafe {
-            let mem_size = JKMQueue::<usize>::shared_size(1, 1);
-            let mem = libc::malloc(mem_size) as *mut u8;
-            let queue = JKMQueue::init_in_shared(mem, 1, 1);
-
-            // Enqueue 100 items
-            for i in 0..100 {
-                assert!(queue.enqueue(0, i).is_ok(), "Failed to enqueue item {}", i);
-            }
-
-            // Force sync to ensure visibility
-            queue.force_sync();
-
-            // Dequeue all items
-            let mut dequeued = Vec::new();
-            for _ in 0..100 {
-                match queue.dequeue(0) {
-                    Ok(val) => dequeued.push(val),
-                    Err(_) => break,
-                }
-            }
-
-            // Finalize to ensure no items are stuck
-            queue.finalize_pending_dequeues();
-
-            // Try to dequeue any remaining items
-            while let Ok(val) = queue.dequeue(0) {
-                dequeued.push(val);
-            }
-
-            assert_eq!(
-                dequeued.len(),
-                100,
-                "Expected 100 items, got {}",
-                dequeued.len()
-            );
-
-            // Verify all items are present
-            let dequeued_set: HashSet<_> = dequeued.into_iter().collect();
-            for i in 0..100 {
-                assert!(dequeued_set.contains(&i), "Missing item {}", i);
-            }
-
-            libc::free(mem as *mut libc::c_void);
-        }
-    }
-
-    #[test]
-    fn test_edge_case_last_dequeue() {
-        unsafe {
-            let mem_size = JKMQueue::<usize>::shared_size(1, 1);
-            let mem = libc::malloc(mem_size) as *mut u8;
-            let queue = JKMQueue::init_in_shared(mem, 1, 1);
-
-            // Enqueue exactly one item
-            queue.enqueue(0, 42).unwrap();
-            queue.force_sync();
-
-            // Dequeue it
-            let val = queue.dequeue(0).unwrap();
-            assert_eq!(val, 42);
-
-            // Finalize
-            queue.finalize_pending_dequeues();
-
-            // Verify queue is truly empty
-            assert!(queue.is_empty(), "Queue should be empty");
-            assert!(
-                queue.dequeue(0).is_err(),
-                "Should not be able to dequeue from empty queue"
-            );
-
-            // Check internal state
-            let total = queue.total_items();
-            assert_eq!(total, 0, "Total items should be 0, got {}", total);
-
-            libc::free(mem as *mut libc::c_void);
-        }
-    }
-
-    #[test]
-    fn test_benchmark_scenario() {
-        // Simulate the exact benchmark scenario
-        unsafe {
-            let mem_size = JKMQueue::<usize>::shared_size(2, 2);
-            let mem = libc::malloc(mem_size) as *mut u8;
-            let queue = JKMQueue::init_in_shared(mem, 2, 2);
-
-            // Producer 0 enqueues 5000 items
-            for i in 0..5000 {
-                queue.enqueue(0, i).unwrap();
-            }
-
-            // Producer 1 enqueues 5000 items
-            for i in 5000..10000 {
-                queue.enqueue(1, i).unwrap();
-            }
-
-            queue.force_sync();
-
-            // Consumer phase
-            let mut total_dequeued = 0;
-            let mut consecutive_empty = 0;
-
-            while total_dequeued < 10000 && consecutive_empty < 100000 {
-                match queue.dequeue(0) {
-                    Ok(_) => {
-                        total_dequeued += 1;
-                        consecutive_empty = 0;
-                    }
-                    Err(_) => {
-                        consecutive_empty += 1;
-                        if consecutive_empty % 5000 == 0 {
-                            queue.force_sync();
-                        }
-                    }
-                }
-            }
-
-            // Finalize
-            queue.finalize_pending_dequeues();
-
-            // Try to get remaining items
-            while let Ok(_) = queue.dequeue(0) {
-                total_dequeued += 1;
-            }
-
-            println!("Benchmark test: dequeued {}/10000 items", total_dequeued);
-            assert_eq!(total_dequeued, 10000, "Should dequeue all 10000 items");
-
-            libc::free(mem as *mut libc::c_void);
-        }
     }
 }

@@ -811,54 +811,117 @@ where
                 };
                 let my_target = target_items + extra_items;
 
-                let mut consecutive_empty_checks = 0;
-                const MAX_CONSECUTIVE_EMPTY_CHECKS: usize = 100000; // Much higher for JKM
+                let mut pop_attempts_outer = 0;
 
                 while consumed_count < my_target {
                     match q.bench_pop(consumer_id) {
                         Ok(_item) => {
                             consumed_count += 1;
-                            consecutive_empty_checks = 0;
+                            pop_attempts_outer = 0; // Reset attempts on successful pop
                         }
                         Err(_) => {
-                            if done_sync.producers_done.load(Ordering::Acquire)
-                                == num_producers as u32
-                            {
-                                consecutive_empty_checks += 1;
+                            pop_attempts_outer += 1;
 
-                                // JKM-specific: force sync periodically
+                            // Check if we should panic (producers not done but we're spinning too long)
+                            if pop_attempts_outer > MAX_BENCH_SPIN_RETRY_ATTEMPTS
+                                && !(done_sync.producers_done.load(Ordering::Acquire)
+                                    == num_producers as u32)
+                            {
+                                panic!(
+                                    "Consumer {} exceeded max spin retry attempts for pop (producers not done)",
+                                    consumer_id
+                                );
+                            }
+
+                            // Pop returned error - check if producers are done
+                            let producers_done = done_sync.producers_done.load(Ordering::Acquire)
+                                == num_producers as u32;
+
+                            if producers_done {
+                                // Producers are done, try a final drain aggressively
+                                let mut final_drain_attempts = 0;
+                                const MAX_FINAL_DRAIN_ATTEMPTS: usize = 10_000; // Increased for JKM
+
+                                // Force sync before aggressive drain
                                 if let Some(jkm_queue) =
                                     unsafe { (q as *const _ as *const JKMQueue<usize>).as_ref() }
                                 {
-                                    if consecutive_empty_checks % 5000 == 0 {
-                                        jkm_queue.force_sync();
+                                    jkm_queue.force_sync();
+                                    jkm_queue.finalize_pending_dequeues();
+                                }
+
+                                while consumed_count < my_target
+                                    && final_drain_attempts < MAX_FINAL_DRAIN_ATTEMPTS
+                                {
+                                    // Periodic sync during drain
+                                    if final_drain_attempts % 1000 == 0 {
+                                        if let Some(jkm_queue) = unsafe {
+                                            (q as *const _ as *const JKMQueue<usize>).as_ref()
+                                        } {
+                                            jkm_queue.force_sync();
+                                        }
                                     }
 
-                                    // Check actual items in queue
-                                    if consecutive_empty_checks > 20000 {
-                                        let items_left = jkm_queue.total_items();
-                                        if items_left == 0 {
+                                    if q.bench_pop(consumer_id).is_ok() {
+                                        consumed_count += 1;
+                                        final_drain_attempts = 0; // Reset on success
+                                        if consumed_count >= my_target {
                                             break;
+                                        }
+                                    } else {
+                                        final_drain_attempts += 1;
+                                        if final_drain_attempts < 100 {
+                                            std::hint::spin_loop();
+                                        } else {
+                                            std::thread::yield_now(); // Give queue time if it was a near-miss
                                         }
                                     }
                                 }
 
-                                // Progressive backoff
-                                if consecutive_empty_checks < 1000 {
-                                    std::hint::spin_loop();
-                                } else if consecutive_empty_checks < 10000 {
-                                    std::thread::yield_now();
-                                } else if consecutive_empty_checks < 50000 {
-                                    std::thread::sleep(std::time::Duration::from_micros(10));
-                                } else if consecutive_empty_checks > MAX_CONSECUTIVE_EMPTY_CHECKS {
-                                    break;
+                                // After aggressive drain attempts, do one more check
+                                if consumed_count < my_target {
+                                    // Final sync and check
+                                    if let Some(jkm_queue) = unsafe {
+                                        (q as *const _ as *const JKMQueue<usize>).as_ref()
+                                    } {
+                                        jkm_queue.force_sync();
+                                        jkm_queue.finalize_pending_dequeues();
+
+                                        // Check if there are any uncompleted dequeue operations
+                                        // This handles the case where a dequeue was assigned but not taken
+                                        for attempt in 0..100 {
+                                            if q.bench_pop(consumer_id).is_ok() {
+                                                consumed_count += 1;
+                                                if consumed_count >= my_target {
+                                                    break;
+                                                }
+                                            } else {
+                                                std::thread::yield_now();
+                                            }
+                                        }
+
+                                        // Check if queue truly has no items
+                                        let items_left = jkm_queue.total_items();
+                                        if items_left == 0 && q.bench_is_empty() {
+                                            break;
+                                        }
+                                    }
                                 }
                             } else {
-                                for _ in 0..100 {
+                                // Producers not done - adaptive backoff
+                                if pop_attempts_outer < 100 {
                                     std::hint::spin_loop();
+                                } else if pop_attempts_outer < 1000 {
+                                    std::thread::yield_now();
+                                } else {
+                                    std::thread::sleep(std::time::Duration::from_micros(1));
                                 }
                             }
                         }
+                    }
+
+                    if consumed_count >= my_target {
+                        break;
                     }
                 }
 
@@ -928,6 +991,11 @@ where
             "Warning (JKM MPMC): Total consumed {}/{} items. Prods: {}, Cons: {}",
             total_consumed, total_items, num_producers, num_consumers
         );
+
+        // Debug state on data loss
+        if let Some(jkm_queue) = unsafe { (q as *const _ as *const JKMQueue<usize>).as_ref() } {
+            jkm_queue.debug_state();
+        }
     }
 
     unsafe {

@@ -341,18 +341,18 @@ mod jkm_queue_tests {
             let mem = libc::malloc(mem_size) as *mut u8;
             let queue = JKMQueue::init_in_shared(mem, 1, 1);
 
-            // Verify dequeue counter starts at 0
+            // Verify dequeue counter starts at 1 (as per paper)
             let initial_counter = queue.deq_counter.v.load(Ordering::Acquire);
-            assert_eq!(initial_counter, 0, "Dequeue counter should start at 0");
+            assert_eq!(initial_counter, 1, "Dequeue counter should start at 1");
 
-            // First dequeue should get number 0
+            // First dequeue should get number 1
             queue.enqueue(0, 1).unwrap();
             queue.force_sync();
 
             let _ = queue.dequeue(0);
 
             let after_first = queue.deq_counter.v.load(Ordering::Acquire);
-            assert_eq!(after_first, 1, "After first dequeue, counter should be 1");
+            assert_eq!(after_first, 2, "After first dequeue, counter should be 2");
 
             libc::free(mem as *mut libc::c_void);
         }

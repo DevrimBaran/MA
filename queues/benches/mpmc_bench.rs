@@ -719,17 +719,6 @@ where
             num_producers,
             num_consumers
         );
-
-        // Debug state on data loss for specific queue types
-        if is_jkm {
-            if let Some(jkm_queue) = unsafe { (q as *const _ as *const JKMQueue<usize>).as_ref() } {
-                jkm_queue.debug_state();
-            }
-        } else if is_nr {
-            if let Some(nr_queue) = unsafe { (q as *const _ as *const NRQueue<usize>).as_ref() } {
-                nr_queue.debug_state();
-            }
-        }
     }
 
     unsafe {

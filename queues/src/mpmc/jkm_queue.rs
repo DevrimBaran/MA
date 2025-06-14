@@ -6,7 +6,6 @@ use std::sync::atomic::{self, AtomicUsize, Ordering};
 use crate::MpmcQueue;
 use crossbeam_utils::atomic::AtomicCell;
 
-// ---------- helpers ---------------------------------------------------------
 #[inline(always)]
 const fn pack_u128(hi: usize, lo: usize) -> u128 {
     ((hi as u128) << 64) | lo as u128
@@ -16,7 +15,6 @@ fn unpack_u128(w: u128) -> (usize, usize) {
     ((w >> 64) as usize, w as usize)
 }
 
-// ---------- constants -------------------------------------------------------
 type Timestamp = u128;
 const TS_ST_EMPTY: usize = usize::MAX;
 const TS_P_EMPTY: usize = usize::MAX;
@@ -30,7 +28,6 @@ const DEQ_J_EMPTY: usize = usize::MAX;
 const DEQ_ID_EMPTY: usize = usize::MAX - 1;
 const DEQ_OPS_EMPTY: u128 = pack_u128(DEQ_J_EMPTY, DEQ_ID_EMPTY);
 
-// ---------- queue cell ------------------------------------------------------
 #[repr(C)]
 struct QueueItem<T> {
     val: UnsafeCell<Option<T>>,
@@ -45,7 +42,6 @@ impl<T> QueueItem<T> {
     }
 }
 
-// ---------- tiny atomics ----------------------------------------------------
 #[repr(C, align(64))]
 struct MaxRegister {
     v: AtomicUsize,
@@ -93,7 +89,6 @@ impl FetchAndInc {
     }
 }
 
-// ---------- main queue ------------------------------------------------------
 #[repr(C)]
 pub struct JKMQueue<T: Send + Clone + 'static> {
     enq_counter: MaxRegister,
@@ -526,7 +521,6 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
         }
     }
 
-    // ---------- observers ----------------------------------------------------
     pub fn is_empty(&self) -> bool {
         unsafe {
             atomic::fence(Ordering::SeqCst);
@@ -545,7 +539,6 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
         false
     }
 
-    /// Force a complete synchronization of the queue state
     pub fn force_sync(&self) {
         unsafe {
             for round in 0..5 {
@@ -579,7 +572,6 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
         }
     }
 
-    /// Get the total number of items currently in the queue
     pub fn total_items(&self) -> usize {
         unsafe {
             atomic::fence(Ordering::SeqCst);
@@ -595,7 +587,6 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
         }
     }
 
-    /// Ensure all pending dequeue operations are completed
     pub fn finalize_pending_dequeues(&self) {
         unsafe {
             for round in 0..5 {
@@ -644,63 +635,8 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
             }
         }
     }
-
-    // Debug helper
-    pub fn debug_state(&self) {
-        unsafe {
-            println!("=== JKM Queue Debug State ===");
-            println!("Enq counter: {}", self.enq_counter.max_read());
-            let deq_count = self.deq_counter.v.load(Ordering::SeqCst);
-            println!("Deq counter: {}", deq_count);
-
-            for p in 0..self.num_processes {
-                let h = (*self.head).get_unchecked(p).max_read();
-                let t = (*self.tail).get_unchecked(p).load(Ordering::SeqCst);
-                println!(
-                    "Process {}: head={}, tail={}, items={}",
-                    p,
-                    h,
-                    t,
-                    t.saturating_sub(h)
-                );
-            }
-
-            println!("Tree root: {:?}", (*self.tree).get_unchecked(0).load());
-            println!("Total items in queue: {}", self.total_items());
-
-            let mut assigned_not_taken = 0;
-            for i in 1..deq_count.min(100) {
-                let op = (*self.deq_ops).get_unchecked(i).load();
-                if op != DEQ_OPS_INIT && op != DEQ_OPS_EMPTY {
-                    let (j, id) = unpack_u128(op);
-                    if id < self.num_processes && j < self.items_per_process {
-                        let item = (*self.items).get_unchecked(id * self.items_per_process + j);
-                        if (*item.val.get()).is_some() {
-                            assigned_not_taken += 1;
-                            println!(
-                                "  Deq op {}: assigned but not taken from items[{}][{}]",
-                                i, id, j
-                            );
-                        }
-                    }
-                }
-            }
-            if assigned_not_taken > 0 {
-                println!(
-                    "WARNING: {} items assigned but not taken!",
-                    assigned_not_taken
-                );
-            }
-        }
-    }
-
-    /// Force complete synchronization - used in benchmarks  
-    pub fn force_complete_sync(&self) {
-        self.finalize_pending_dequeues();
-    }
 }
 
-// ---------- trait glue -------------------------------------------------------
 impl<T: Send + Clone + 'static> MpmcQueue<T> for JKMQueue<T> {
     type PushError = ();
     type PopError = ();

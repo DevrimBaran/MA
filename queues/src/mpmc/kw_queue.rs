@@ -1,7 +1,3 @@
-// queues/src/mpmc/kw_queue.rs
-// FIXED implementation of Khanchandani-Wattenhofer MPMC Queue
-// Addressing race conditions and data loss issues
-
 use std::cell::UnsafeCell;
 use std::mem;
 use std::ptr;
@@ -9,62 +5,58 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use crate::MpmcQueue;
 
-// Constants
 const MAX_OPS: usize = 2_000_000;
 
-// Algorithm 8: TH Register with half-increment and half-max operations
 #[repr(C, align(64))]
 struct THRegister {
-    value: AtomicU64, // Lower 32: tail, Upper 32: head
+    value: AtomicU64,
 }
 
 impl THRegister {
     fn new() -> Self {
         Self {
-            value: AtomicU64::new(1), // t=1, h=0 as per paper
+            value: AtomicU64::new(1),
         }
     }
 
-    // Algorithm 8: half-increment operation - FIXED to be truly atomic
     fn half_increment(&self) -> isize {
         loop {
-            let current = self.value.load(Ordering::SeqCst); // Stronger ordering
+            let current = self.value.load(Ordering::SeqCst);
             let t = (current & 0xFFFFFFFF) as u32;
             let h = (current >> 32) as u32;
 
             if t > h {
-                return -1; // Queue is empty
+                return -1;
             }
 
             let new_value = ((h as u64) << 32) | ((t + 1) as u64);
             match self.value.compare_exchange_weak(
                 current,
                 new_value,
-                Ordering::SeqCst, // Stronger ordering
+                Ordering::SeqCst,
                 Ordering::SeqCst,
             ) {
-                Ok(_) => return t as isize, // Return the slot we claimed
-                Err(_) => continue,         // Retry
+                Ok(_) => return t as isize,
+                Err(_) => continue,
             }
         }
     }
 
-    // Algorithm 8: half-max operation - FIXED to be truly atomic
     fn half_max(&self, i: u32) {
         loop {
-            let current = self.value.load(Ordering::SeqCst); // Stronger ordering
+            let current = self.value.load(Ordering::SeqCst);
             let t = (current & 0xFFFFFFFF) as u32;
             let h = (current >> 32) as u32;
 
             if h >= i {
-                return; // Already at or past this value
+                return;
             }
 
             let new_value = ((i as u64) << 32) | (t as u64);
             match self.value.compare_exchange_weak(
                 current,
                 new_value,
-                Ordering::SeqCst, // Stronger ordering
+                Ordering::SeqCst,
                 Ordering::SeqCst,
             ) {
                 Ok(_) => return,
@@ -74,11 +66,10 @@ impl THRegister {
     }
 }
 
-// Element wrapper for base case
 #[repr(C)]
 struct Element<T> {
     data: UnsafeCell<Option<T>>,
-    initialized: AtomicU64, // Add initialization flag
+    initialized: AtomicU64,
 }
 
 impl<T> Element<T> {
@@ -90,7 +81,6 @@ impl<T> Element<T> {
     }
 }
 
-// P register for base case (k=1) - FIXED with stronger synchronization
 #[repr(C)]
 struct PRegister<T> {
     counter: AtomicU64,
@@ -106,43 +96,40 @@ impl<T> PRegister<T> {
     }
 
     fn set_elements(&self, elements: *mut Element<T>) {
-        self.elements.store(elements, Ordering::SeqCst); // Stronger ordering
+        self.elements.store(elements, Ordering::SeqCst);
     }
 
     unsafe fn insert(&self, elem: T) -> u32 {
-        let elements = self.elements.load(Ordering::SeqCst); // Stronger ordering
+        let elements = self.elements.load(Ordering::SeqCst);
         if elements.is_null() {
             return 0;
         }
 
-        // FIXED: Atomically increment and get the new slot
-        let slot = self.counter.fetch_add(1, Ordering::SeqCst) + 1; // Stronger ordering
+        let slot = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
 
         if slot >= MAX_OPS as u64 {
             return 0;
         }
 
-        // Store element with full synchronization
         let elem_ptr = elements.add(slot as usize);
         let elem_ref = &*elem_ptr;
 
-        // CRITICAL: Set initialization flag BEFORE storing data
         elem_ref.initialized.store(1, Ordering::SeqCst);
-        std::sync::atomic::fence(Ordering::SeqCst); // Full fence
+        std::sync::atomic::fence(Ordering::SeqCst);
         *elem_ref.data.get() = Some(elem);
-        std::sync::atomic::fence(Ordering::SeqCst); // Full fence after write
-        elem_ref.initialized.store(2, Ordering::SeqCst); // Mark as fully written
+        std::sync::atomic::fence(Ordering::SeqCst);
+        elem_ref.initialized.store(2, Ordering::SeqCst);
 
         slot as u32
     }
 
     unsafe fn try_remove(&self, i: u32) -> Option<T> {
-        let elements = self.elements.load(Ordering::SeqCst); // Stronger ordering
+        let elements = self.elements.load(Ordering::SeqCst);
         if elements.is_null() || i == 0 || i >= MAX_OPS as u32 {
             return None;
         }
 
-        let current_counter = self.counter.load(Ordering::SeqCst); // Stronger ordering
+        let current_counter = self.counter.load(Ordering::SeqCst);
         if (i as u64) > current_counter {
             return None;
         }
@@ -150,23 +137,21 @@ impl<T> PRegister<T> {
         let elem_ptr = elements.add(i as usize);
         let elem_ref = &*elem_ptr;
 
-        // CRITICAL: Wait for initialization to complete
         let mut retries = 0;
         while elem_ref.initialized.load(Ordering::SeqCst) < 2 && retries < 10000 {
             std::hint::spin_loop();
             retries += 1;
         }
 
-        std::sync::atomic::fence(Ordering::SeqCst); // Full fence before read
+        std::sync::atomic::fence(Ordering::SeqCst);
         (*elem_ref.data.get()).take()
     }
 
     fn total(&self) -> u32 {
-        self.counter.load(Ordering::SeqCst) as u32 // Stronger ordering
+        self.counter.load(Ordering::SeqCst) as u32
     }
 }
 
-// C register storing l1|r1|l2|r2 - FIXED with stronger synchronization
 #[repr(C)]
 struct CRegister {
     value: AtomicU64,
@@ -180,7 +165,7 @@ impl CRegister {
     }
 
     fn read(&self) -> (u16, u16, u16, u16) {
-        let val = self.value.load(Ordering::SeqCst); // Stronger ordering
+        let val = self.value.load(Ordering::SeqCst);
         (
             ((val >> 48) & 0xFFFF) as u16,
             ((val >> 32) & 0xFFFF) as u16,
@@ -197,25 +182,21 @@ impl CRegister {
         let expected_val = Self::pack(expected.0, expected.1, expected.2, expected.3);
         let new_val = Self::pack(new.0, new.1, new.2, new.3);
         self.value
-            .compare_exchange(expected_val, new_val, Ordering::SeqCst, Ordering::SeqCst) // Stronger ordering
+            .compare_exchange(expected_val, new_val, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
     }
 }
 
-// Counting set structure - EXACTLY as in the paper but with FIXED synchronization
 #[repr(C)]
 struct CountingSet<T> {
-    // For k > 1
     c: CRegister,
     k: u32,
     sqrt_k: u32,
     left_k: u32,
     right_k: u32,
 
-    // For k = 1
     p: PRegister<T>,
 
-    // Offsets to sub-structures and arrays
     cl_offset: u32,
     cr_offset: u32,
     t_array_offset: u32,
@@ -264,7 +245,6 @@ impl<T: Send + Clone> CountingSet<T> {
         std::slice::from_raw_parts(ptr as *const AtomicU64, MAX_OPS)
     }
 
-    // Algorithm 3: insert operation - FIXED with stronger synchronization
     unsafe fn insert(&self, thread_id: usize, elem: T) -> usize {
         if self.k == 1 {
             let counter = self.p.insert(elem);
@@ -290,7 +270,6 @@ impl<T: Send + Clone> CountingSet<T> {
                 return 0;
             }
 
-            // FIXED: More aggressive retry with exponential backoff
             let mut retries = 0;
             loop {
                 let cb = self.c.read();
@@ -298,7 +277,7 @@ impl<T: Send + Clone> CountingSet<T> {
                 let tr = self.get_cr().total() as u16;
 
                 if tl > 32767 || tr > 32767 {
-                    return 0; // Overflow
+                    return 0;
                 }
 
                 self.log(cb);
@@ -309,14 +288,11 @@ impl<T: Send + Clone> CountingSet<T> {
                     break;
                 }
 
-                // Exponential backoff with more aggressive retry
                 retries += 1;
                 if retries > 100000 {
-                    // Much higher retry limit
-                    return 0; // Give up after many attempts
+                    return 0;
                 }
 
-                // Escalating backoff
                 if retries < 1000 {
                     std::hint::spin_loop();
                 } else if retries < 10000 {
@@ -332,7 +308,6 @@ impl<T: Send + Clone> CountingSet<T> {
         }
     }
 
-    // FIXED remove operation with stronger synchronization
     unsafe fn remove(&self, i: usize) -> Option<T> {
         if self.k == 1 {
             self.p.try_remove(i as u32)
@@ -343,9 +318,8 @@ impl<T: Send + Clone> CountingSet<T> {
             let t_array = self.get_t_array();
             let max_search = (i + self.sqrt_k as usize + 1).min(MAX_OPS);
 
-            // More aggressive search with stronger ordering
             while h < max_search {
-                std::sync::atomic::fence(Ordering::SeqCst); // Full fence
+                std::sync::atomic::fence(Ordering::SeqCst);
                 if t_array[h].load(Ordering::SeqCst) != 0 {
                     break;
                 }
@@ -356,7 +330,7 @@ impl<T: Send + Clone> CountingSet<T> {
                 return None;
             }
 
-            std::sync::atomic::fence(Ordering::SeqCst); // Full fence
+            std::sync::atomic::fence(Ordering::SeqCst);
             let packed = t_array[h].load(Ordering::SeqCst);
             if packed == 0 {
                 return None;
@@ -385,7 +359,6 @@ impl<T: Send + Clone> CountingSet<T> {
         }
     }
 
-    // Algorithm 4: total operation with stronger ordering
     unsafe fn total(&self) -> usize {
         if self.k == 1 {
             self.p.total() as usize
@@ -395,7 +368,6 @@ impl<T: Send + Clone> CountingSet<T> {
         }
     }
 
-    // FIXED log function with stronger synchronization
     unsafe fn log(&self, cb: (u16, u16, u16, u16)) {
         if self.k == 1 {
             return;
@@ -405,7 +377,6 @@ impl<T: Send + Clone> CountingSet<T> {
         let total = (cb.2 as usize).saturating_add(cb.3 as usize);
         let t_array = self.get_t_array();
 
-        // Store with stronger ordering
         if total < MAX_OPS {
             t_array[total].store(packed, Ordering::SeqCst);
         }
@@ -451,11 +422,9 @@ impl<T: Send + Clone> CountingSet<T> {
             }
         }
 
-        // Add full memory fence after all writes
         std::sync::atomic::fence(Ordering::SeqCst);
     }
 
-    // FIXED lookup function with stronger synchronization
     unsafe fn lookup(&self, r: usize, in_left: bool) -> usize {
         if r == 0 || r >= MAX_OPS {
             return 0;
@@ -473,9 +442,8 @@ impl<T: Send + Clone> CountingSet<T> {
             .saturating_add(1)
             .min(MAX_OPS);
 
-        // More aggressive search with stronger ordering
         while s < max_search {
-            std::sync::atomic::fence(Ordering::SeqCst); // Full fence
+            std::sync::atomic::fence(Ordering::SeqCst);
             if array[s].load(Ordering::SeqCst) != 0 {
                 break;
             }
@@ -486,7 +454,7 @@ impl<T: Send + Clone> CountingSet<T> {
             return 0;
         }
 
-        std::sync::atomic::fence(Ordering::SeqCst); // Full fence
+        std::sync::atomic::fence(Ordering::SeqCst);
         let packed = array[s].load(Ordering::SeqCst);
         if packed == 0 {
             return 0;
@@ -523,7 +491,6 @@ impl<T: Send + Clone> CountingSet<T> {
     }
 }
 
-// Main queue structure - FIXED with stronger synchronization
 #[repr(C)]
 pub struct KWQueue<T: Send + Clone + 'static> {
     th: THRegister,
@@ -547,47 +514,35 @@ impl<T: Send + Clone + 'static> KWQueue<T> {
         std::slice::from_raw_parts(ptr as *const UnsafeCell<Option<T>>, MAX_OPS)
     }
 
-    // CRITICAL FIX: Completely redesigned enqueue with proper sequencing
     pub fn enqueue(&self, thread_id: usize, x: T) -> Result<(), ()> {
         unsafe {
-            // Step 1: Insert into counting set and get slot number
             let i = self.get_counting_set().insert(thread_id, x.clone());
             if i == 0 || i >= MAX_OPS {
                 return Err(());
             }
 
-            // Step 2: CRITICAL - Update head pointer FIRST to reserve the slot
             self.th.half_max(i as u32);
 
-            // Step 3: Full memory fence to ensure head update is visible
             std::sync::atomic::fence(Ordering::SeqCst);
 
-            // Step 4: Write to array with full ordering
             (*self.get_array()[i].get()) = Some(x);
 
-            // Step 5: Full memory fence to ensure write is visible
             std::sync::atomic::fence(Ordering::SeqCst);
 
-            // Step 6: CRITICAL - Wait longer before cleanup to ensure visibility
             for _ in 0..5000 {
-                // Much longer wait
                 std::hint::spin_loop();
             }
 
-            // Step 7: Final fence before cleanup
             std::sync::atomic::fence(Ordering::SeqCst);
 
-            // Step 8: Remove from counting set (cleanup) - do this last
             self.get_counting_set().remove(i);
 
             Ok(())
         }
     }
 
-    // CRITICAL FIX: Completely redesigned dequeue with proper retry logic
     pub fn dequeue(&self, _thread_id: usize) -> Result<T, ()> {
         unsafe {
-            // Step 1: Get next slot using half-increment
             let i = self.th.half_increment();
             if i == -1 {
                 return Err(());
@@ -598,16 +553,13 @@ impl<T: Send + Clone + 'static> KWQueue<T> {
                 return Err(());
             }
 
-            // Step 2: Full memory fence before any access
             std::sync::atomic::fence(Ordering::SeqCst);
 
-            // Step 3: Try counting set first with multiple attempts
             for attempt in 0..1000 {
                 if let Some(value) = self.get_counting_set().remove(i) {
                     return Ok(value);
                 }
 
-                // Small delay between attempts
                 if attempt % 100 == 99 {
                     std::thread::yield_now();
                 } else {
@@ -615,16 +567,13 @@ impl<T: Send + Clone + 'static> KWQueue<T> {
                 }
             }
 
-            // Step 4: Now try array with very aggressive retry
             for retry in 0..200000 {
-                // Much higher retry count
-                std::sync::atomic::fence(Ordering::SeqCst); // Fence on each attempt
+                std::sync::atomic::fence(Ordering::SeqCst);
 
                 if let Some(value) = (*self.get_array()[i].get()).take() {
                     return Ok(value);
                 }
 
-                // Escalating backoff
                 if retry < 1000 {
                     std::hint::spin_loop();
                 } else if retry < 10000 {
@@ -634,11 +583,9 @@ impl<T: Send + Clone + 'static> KWQueue<T> {
                 } else if retry < 50000 {
                     std::thread::yield_now();
                 } else {
-                    // Very aggressive: small sleep to let enqueue complete
                     std::thread::sleep(std::time::Duration::from_nanos(1));
                 }
 
-                // Every 10000 retries, try counting set again with full fence
                 if retry % 10000 == 9999 {
                     std::sync::atomic::fence(Ordering::SeqCst);
                     if let Some(value) = self.get_counting_set().remove(i) {
@@ -647,12 +594,9 @@ impl<T: Send + Clone + 'static> KWQueue<T> {
                 }
             }
 
-            // Step 5: Final desperate attempts with maximum delays
             for final_attempt in 0..5000 {
-                // Maximum barriers
                 std::sync::atomic::fence(Ordering::SeqCst);
 
-                // Try both locations
                 if let Some(value) = self.get_counting_set().remove(i) {
                     return Ok(value);
                 }
@@ -661,7 +605,6 @@ impl<T: Send + Clone + 'static> KWQueue<T> {
                     return Ok(value);
                 }
 
-                // Maximum delays
                 if final_attempt < 1000 {
                     std::thread::yield_now();
                 } else if final_attempt < 3000 {
@@ -671,12 +614,10 @@ impl<T: Send + Clone + 'static> KWQueue<T> {
                 }
             }
 
-            // Should never reach here - return error instead of panic
             Err(())
         }
     }
 
-    // Rest of implementation remains the same but with stronger ordering...
     pub unsafe fn init_in_shared(mem: *mut u8, num_threads: usize) -> &'static mut Self {
         let queue_ptr = mem as *mut Self;
         let queue_size = mem::size_of::<Self>();
@@ -696,20 +637,17 @@ impl<T: Send + Clone + 'static> KWQueue<T> {
 
         (*queue_ptr).array_offset = array_offset as u32;
 
-        // Initialize main array with stronger initialization
         let array_ptr = mem.add(array_offset) as *mut [UnsafeCell<Option<T>>; MAX_OPS];
         for i in 0..MAX_OPS {
             let cell_ptr = &mut (*array_ptr)[i] as *mut UnsafeCell<Option<T>>;
             ptr::write(cell_ptr, UnsafeCell::new(None::<T>));
         }
 
-        // Full memory barrier after initialization
         std::sync::atomic::fence(Ordering::SeqCst);
 
         &mut *queue_ptr
     }
 
-    // [Rest of the init_counting_set and other methods remain the same but with stronger orderings]
     unsafe fn init_counting_set(
         mem: *mut u8,
         k: usize,
@@ -826,7 +764,7 @@ impl<T: Send + Clone + 'static> KWQueue<T> {
     }
 
     pub fn is_empty(&self) -> bool {
-        let val = self.th.value.load(Ordering::SeqCst); // Stronger ordering
+        let val = self.th.value.load(Ordering::SeqCst);
         let t = (val & 0xFFFFFFFF) as u32;
         let h = (val >> 32) as u32;
         t > h
@@ -859,7 +797,5 @@ impl<T: Send + Clone + 'static> MpmcQueue<T> for KWQueue<T> {
 }
 
 impl<T: Send + Clone> Drop for KWQueue<T> {
-    fn drop(&mut self) {
-        // Nothing to clean up in shared memory version
-    }
+    fn drop(&mut self) {}
 }

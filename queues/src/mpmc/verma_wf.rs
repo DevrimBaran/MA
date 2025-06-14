@@ -1,7 +1,3 @@
-// queues/src/mpmc/verma_wf.rs
-// Wait-Free MPMC Queue based on Mudit Verma's thesis
-// "Scalable and Performance-Critical Data Structures for Multicores"
-
 use std::cell::UnsafeCell;
 use std::mem;
 use std::ptr;
@@ -60,24 +56,24 @@ impl<T> Node<T> {
 #[repr(C)]
 pub struct WFQueue<T: Send + Clone + 'static> {
     // Queue state
-    head: AtomicUsize,  // Offset to head node
-    tail: AtomicUsize,  // Offset to tail node
-    size: AtomicUsize,  // Number of elements in queue
-    num_threads: usize, // Total number of worker threads
+    head: AtomicUsize,
+    tail: AtomicUsize,
+    size: AtomicUsize,
+    num_threads: usize,
 
     // Helper control
-    helper_should_stop: AtomicBool, // Signal helper to stop
-    helper_running: AtomicBool,     // Is helper currently running
+    helper_should_stop: AtomicBool,
+    helper_running: AtomicBool,
 
     // Memory layout offsets
-    state_array_offset: usize,   // Offset to state array
-    nodes_offset: usize,         // Offset to node pool
-    node_pool_size: usize,       // Size of node pool
-    next_free_node: AtomicUsize, // Next free node index
+    state_array_offset: usize,
+    nodes_offset: usize,
+    node_pool_size: usize,
+    next_free_node: AtomicUsize,
 
     // Shared memory info
-    base_ptr: *mut u8, // Base pointer for shared memory
-    total_size: usize, // Total allocated size
+    base_ptr: *mut u8,
+    total_size: usize,
 
     _phantom: std::marker::PhantomData<T>,
 }

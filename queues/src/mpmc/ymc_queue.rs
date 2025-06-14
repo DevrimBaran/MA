@@ -117,23 +117,6 @@ struct Segment {
 }
 
 impl Segment {
-    unsafe fn new(id: usize) -> *mut Self {
-        let ptr = std::alloc::alloc_zeroed(std::alloc::Layout::new::<Self>()) as *mut Self;
-        (*ptr).id = id;
-        (*ptr).next = AtomicPtr::new(null_mut());
-
-        let cells_ptr = (*ptr).cells.as_mut_ptr() as *mut Cell;
-        for i in 0..SEGMENT_SIZE {
-            ptr::write(cells_ptr.add(i), Cell::new());
-        }
-
-        ptr
-    }
-
-    unsafe fn cells(&self) -> &[Cell; SEGMENT_SIZE] {
-        &*(self.cells.as_ptr() as *const [Cell; SEGMENT_SIZE])
-    }
-
     unsafe fn cells_mut(&mut self) -> &mut [Cell; SEGMENT_SIZE] {
         &mut *(self.cells.as_mut_ptr() as *mut [Cell; SEGMENT_SIZE])
     }

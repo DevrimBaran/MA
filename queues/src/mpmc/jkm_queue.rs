@@ -57,17 +57,17 @@ impl MaxRegister {
         }
     }
     fn max_read(&self) -> usize {
-        self.v.load(Ordering::SeqCst) // STRICTER: Use SeqCst for reads
+        self.v.load(Ordering::SeqCst)
     }
     fn max_write(&self, val: usize) {
         let mut cur = self.v.load(Ordering::SeqCst);
         while val > cur {
             match self
                 .v
-                .compare_exchange(cur, val, Ordering::SeqCst, Ordering::SeqCst) // STRICTER: No weak CAS
+                .compare_exchange(cur, val, Ordering::SeqCst, Ordering::SeqCst)
             {
                 Ok(_) => {
-                    atomic::fence(Ordering::SeqCst); // STRICTER: Add fence after write
+                    atomic::fence(Ordering::SeqCst);
                     break;
                 }
                 Err(x) => cur = x,
@@ -87,8 +87,8 @@ impl FetchAndInc {
         }
     }
     fn fetch_inc(&self) -> usize {
-        let result = self.v.fetch_add(1, Ordering::SeqCst); // STRICTER: Use SeqCst
-        atomic::fence(Ordering::SeqCst); // STRICTER: Add fence
+        let result = self.v.fetch_add(1, Ordering::SeqCst);
+        atomic::fence(Ordering::SeqCst);
         result
     }
 }
@@ -106,10 +106,6 @@ pub struct JKMQueue<T: Send + Clone + 'static> {
     tree: *const [AtomicCell<u128>],
     deq_ops: *const [AtomicCell<u128>],
 
-    // STRICTER: Add version counters for synchronization
-    tree_version: AtomicUsize,
-    op_version: AtomicUsize,
-
     num_processes: usize,
     num_dequeuers: usize,
     items_per_process: usize,
@@ -121,7 +117,7 @@ unsafe impl<T: Send + Clone + 'static> Sync for JKMQueue<T> {}
 
 // ---------- layout helpers ---------------------------------------------------
 impl<T: Send + Clone + 'static> JKMQueue<T> {
-    fn layout(n_enq: usize) -> (Layout, [usize; 7]) {
+    fn layout(n_enq: usize) -> (Layout, [usize; 5]) {
         let ipp = 50_000;
         let deq_ops_sz = 100_000;
         let tree_sz = if n_enq == 0 {
@@ -143,15 +139,13 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
         let (l_tree, o_tree) = l_items
             .extend(Layout::array::<AtomicCell<u128>>(tree_sz).unwrap())
             .unwrap();
-        let (l_ops, o_ops) = l_tree
+        let (l_final, o_ops) = l_tree
             .extend(Layout::array::<AtomicCell<u128>>(deq_ops_sz).unwrap())
             .unwrap();
-        let (l_tv, o_tv) = l_ops.extend(Layout::new::<AtomicUsize>()).unwrap();
-        let (l_final, o_ov) = l_tv.extend(Layout::new::<AtomicUsize>()).unwrap();
 
         (
             l_final.pad_to_align(),
-            [o_head, o_tail, o_items, o_tree, o_ops, o_tv, o_ov],
+            [o_head, o_tail, o_items, o_tree, o_ops],
         )
     }
 
@@ -191,8 +185,6 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
                 items: ptr::slice_from_raw_parts(items_ptr, n_enq * ipp),
                 tree: ptr::slice_from_raw_parts(tree_ptr, tree_sz),
                 deq_ops: ptr::slice_from_raw_parts(ops_ptr, deq_ops_sz),
-                tree_version: AtomicUsize::new(0),
-                op_version: AtomicUsize::new(0),
                 num_processes: n_enq,
                 num_dequeuers: n_deq,
                 items_per_process: ipp,
@@ -215,7 +207,6 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
             ops_ptr.add(i).write(AtomicCell::new(DEQ_OPS_INIT));
         }
 
-        // STRICTER: Full fence after initialization
         atomic::fence(Ordering::SeqCst);
 
         &mut *self_ptr
@@ -241,7 +232,7 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
 
     // ---------- refresh a tree node (leaf or internal) ----------------------
     unsafe fn refresh(&self, idx: usize, is_leaf: bool) -> bool {
-        atomic::fence(Ordering::SeqCst); // STRICTER: Fence before refresh
+        atomic::fence(Ordering::SeqCst);
 
         let node = (*self.tree).get_unchecked(idx);
         let old = node.load();
@@ -249,7 +240,7 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
         let new = if is_leaf {
             let p = idx - ((self.tree_size + 1) / 2 - 1);
             let h = (*self.head).get_unchecked(p).max_read();
-            let t = (*self.tail).get_unchecked(p).load(Ordering::SeqCst); // STRICTER: SeqCst
+            let t = (*self.tail).get_unchecked(p).load(Ordering::SeqCst);
 
             if h >= t {
                 TIMESTAMP_EMPTY
@@ -275,25 +266,24 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
         } else {
             let result = node.compare_exchange(old, new).is_ok();
             if result {
-                atomic::fence(Ordering::SeqCst); // STRICTER: Fence after successful update
-                self.tree_version.fetch_add(1, Ordering::SeqCst); // STRICTER: Version increment
+                atomic::fence(Ordering::SeqCst);
             }
             result
         }
     }
 
     unsafe fn propagate(&self, p: usize) {
-        atomic::fence(Ordering::SeqCst); // STRICTER: Start with fence
+        atomic::fence(Ordering::SeqCst);
 
         let mut idx = self.leaf_for(p);
 
-        // STRICTER: Refresh leaf multiple times with barriers
+        // Refresh leaf multiple times
         for _ in 0..3 {
             self.refresh(idx, true);
             atomic::fence(Ordering::SeqCst);
         }
 
-        // Propagate up the tree with more synchronization
+        // Propagate up the tree
         while idx > 0 {
             idx = Self::parent(idx);
             for _ in 0..3 {
@@ -302,26 +292,25 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
             }
         }
 
-        atomic::fence(Ordering::SeqCst); // STRICTER: End with fence
+        atomic::fence(Ordering::SeqCst);
     }
 
     unsafe fn finish_deq(&self, num: usize) {
-        atomic::fence(Ordering::SeqCst); // STRICTER: Start with fence
-
         let deq_op_node = (*self.deq_ops).get_unchecked(num);
 
-        // STRICTER: Loop until we successfully write
+        // Loop until we successfully write
+        let mut attempts = 0;
         loop {
             let current = deq_op_node.load();
             if current != DEQ_OPS_INIT {
                 return;
             }
 
-            // Read root to determine result
+            // Multiple fences for strong synchronization
             atomic::fence(Ordering::SeqCst);
-            let root_ts = (*self.tree).get_unchecked(0).load();
             atomic::fence(Ordering::SeqCst);
 
+            let root_ts = (*self.tree).get_unchecked(0).load();
             let (_, id) = unpack_u128(root_ts);
 
             let final_val = if id == TS_P_EMPTY {
@@ -331,25 +320,33 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
                 pack_u128(h, id)
             };
 
-            // Try to write the result with strong CAS
+            // Try to write the result
             if deq_op_node
                 .compare_exchange(DEQ_OPS_INIT, final_val)
                 .is_ok()
             {
                 atomic::fence(Ordering::SeqCst);
-                self.op_version.fetch_add(1, Ordering::SeqCst);
                 break;
             }
 
-            // STRICTER: Spin a bit before retrying
-            for _ in 0..10 {
+            // Anti-hang: bounded retry with exponential backoff
+            attempts += 1;
+            if attempts > 1000 {
+                // Force write to prevent eternal waiting
+                deq_op_node.store(final_val);
+                atomic::fence(Ordering::SeqCst);
+                break;
+            }
+
+            // Exponential backoff
+            for _ in 0..(1 << attempts.min(10)) {
                 std::hint::spin_loop();
             }
         }
     }
 
     unsafe fn update_tree(&self, num: usize) {
-        atomic::fence(Ordering::SeqCst); // STRICTER: Start with fence
+        atomic::fence(Ordering::SeqCst);
 
         if num >= 100_000 {
             return;
@@ -364,9 +361,9 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
 
         if id != DEQ_ID_INIT && id != DEQ_ID_EMPTY && id < self.num_processes {
             (*self.head).get_unchecked(id).max_write(j + 1);
-            atomic::fence(Ordering::SeqCst); // STRICTER: Fence after head update
+            atomic::fence(Ordering::SeqCst);
 
-            // STRICTER: Multiple propagations with fences
+            // Multiple propagations
             for _ in 0..2 {
                 self.propagate(id);
                 atomic::fence(Ordering::SeqCst);
@@ -380,7 +377,7 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
             return Err(());
         }
         unsafe {
-            atomic::fence(Ordering::SeqCst); // STRICTER: Start with fence
+            atomic::fence(Ordering::SeqCst);
 
             let t = (*self.tail).get_unchecked(pid).load(Ordering::SeqCst);
             if t >= self.items_per_process {
@@ -391,23 +388,25 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
             let timestamp = pack_u128(st, pid);
             let item = (*self.items).get_unchecked(pid * self.items_per_process + t);
 
-            // Write value and timestamp with barriers
+            // Write value and timestamp with strong barriers
             *item.val.get() = Some(x);
-            atomic::fence(Ordering::SeqCst); // STRICTER: Fence between writes
+            atomic::fence(Ordering::SeqCst);
+            atomic::fence(Ordering::SeqCst);
             item.timestamp.store(timestamp);
-            atomic::fence(Ordering::SeqCst); // STRICTER: Fence before publish
+            atomic::fence(Ordering::SeqCst);
+            atomic::fence(Ordering::SeqCst);
 
             // Publish by incrementing tail
             (*self.tail)
                 .get_unchecked(pid)
-                .store(t + 1, Ordering::SeqCst); // STRICTER: SeqCst store
-            atomic::fence(Ordering::SeqCst); // STRICTER: Fence after publish
+                .store(t + 1, Ordering::SeqCst);
+            atomic::fence(Ordering::SeqCst);
 
             // Update global counter and propagate
             self.enq_counter.max_write(st + 1);
             atomic::fence(Ordering::SeqCst);
 
-            // STRICTER: Multiple propagations
+            // Triple propagation for maximum reliability
             for _ in 0..3 {
                 self.propagate(pid);
                 atomic::fence(Ordering::SeqCst);
@@ -419,62 +418,84 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
 
     pub fn dequeue(&self, _tid: usize) -> Result<T, ()> {
         unsafe {
-            atomic::fence(Ordering::SeqCst); // STRICTER: Start with fence
+            atomic::fence(Ordering::SeqCst);
 
             let num = self.deq_counter.fetch_inc();
 
-            // STRICTER: More aggressive helping with larger range
-            let help_start = if num > self.num_dequeuers * 2 {
-                num - self.num_dequeuers * 2
+            // Help operations in the range [max(1, num - k + 1), num]
+            let help_start = if num > self.num_dequeuers {
+                num - self.num_dequeuers + 1
             } else {
                 1
             };
 
-            // Execute helping in order with fences
-            for i in help_start..=num {
-                if i >= 100_000 {
-                    break;
-                }
+            // Execute helping in order with multiple passes
+            for pass in 0..2 {
+                for i in help_start..=num {
+                    if i >= 100_000 {
+                        break;
+                    }
 
-                atomic::fence(Ordering::SeqCst);
-                let op_val = (*self.deq_ops).get_unchecked(i).load();
-                if op_val == DEQ_OPS_INIT {
-                    // Update tree for previous operation first
-                    if i > 1 {
-                        self.update_tree(i - 1);
+                    atomic::fence(Ordering::SeqCst);
+                    let op_val = (*self.deq_ops).get_unchecked(i).load();
+                    if op_val == DEQ_OPS_INIT {
+                        // Update tree for all previous operations
+                        for j in (i.saturating_sub(10))..i {
+                            if j > 0 {
+                                self.update_tree(j);
+                            }
+                        }
+                        atomic::fence(Ordering::SeqCst);
+                        self.finish_deq(i);
                         atomic::fence(Ordering::SeqCst);
                     }
-                    self.finish_deq(i);
+                }
+
+                if pass == 0 {
                     atomic::fence(Ordering::SeqCst);
                 }
             }
 
-            // STRICTER: Wait for our operation with retries
-            let mut retry_count = 0;
+            // Get our result with very long waiting
             let mut op = (*self.deq_ops).get_unchecked(num).load();
+            let mut wait_cycles = 0;
+            const MAX_WAIT: usize = 100000; // Much longer wait
 
-            while op == DEQ_OPS_INIT && retry_count < 1000 {
-                atomic::fence(Ordering::SeqCst);
+            while op == DEQ_OPS_INIT && wait_cycles < MAX_WAIT {
+                // Help ALL operations multiple times
+                for _ in 0..3 {
+                    atomic::fence(Ordering::SeqCst);
 
-                // Help more aggressively
-                for i in 1..=num.min(99999) {
-                    let op_val = (*self.deq_ops).get_unchecked(i).load();
-                    if op_val == DEQ_OPS_INIT {
-                        if i > 1 {
-                            self.update_tree(i - 1);
+                    for i in 1..=num.min(99999) {
+                        let op_val = (*self.deq_ops).get_unchecked(i).load();
+                        if op_val == DEQ_OPS_INIT {
+                            if i > 1 {
+                                self.update_tree(i - 1);
+                            }
+                            self.finish_deq(i);
                         }
-                        self.finish_deq(i);
                     }
                 }
 
                 atomic::fence(Ordering::SeqCst);
+                atomic::fence(Ordering::SeqCst);
                 op = (*self.deq_ops).get_unchecked(num).load();
-                retry_count += 1;
 
-                // STRICTER: Exponential backoff
-                for _ in 0..(1 << retry_count.min(8)) {
-                    std::hint::spin_loop();
+                // Progressive backoff with occasional yields
+                if wait_cycles < 1000 {
+                    for _ in 0..10 {
+                        std::hint::spin_loop();
+                    }
+                } else if wait_cycles % 1000 == 0 {
+                    // Periodic yield to prevent deadlock
+                    std::thread::yield_now();
+                } else {
+                    for _ in 0..100 {
+                        std::hint::spin_loop();
+                    }
                 }
+
+                wait_cycles += 1;
             }
 
             let (j, id) = unpack_u128(op);
@@ -487,13 +508,15 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
                 return Err(());
             }
 
-            // STRICTER: Take the value with full synchronization
+            // Take the value with strong synchronization
+            atomic::fence(Ordering::SeqCst);
             atomic::fence(Ordering::SeqCst);
             let item = (*self.items).get_unchecked(id * self.items_per_process + j);
             let result = (*item.val.get()).take();
             atomic::fence(Ordering::SeqCst);
+            atomic::fence(Ordering::SeqCst);
 
-            // CRITICAL: Update the tree for THIS operation with multiple attempts
+            // Update the tree for THIS operation multiple times
             for _ in 0..3 {
                 self.update_tree(num);
                 atomic::fence(Ordering::SeqCst);
@@ -507,7 +530,6 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
     pub fn is_empty(&self) -> bool {
         unsafe {
             atomic::fence(Ordering::SeqCst);
-            // Check if any sub-queue has items
             for p in 0..self.num_processes {
                 let h = (*self.head).get_unchecked(p).max_read();
                 let t = (*self.tail).get_unchecked(p).load(Ordering::SeqCst);
@@ -526,7 +548,6 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
     /// Force a complete synchronization of the queue state
     pub fn force_sync(&self) {
         unsafe {
-            // STRICTER: Multiple rounds of synchronization
             for round in 0..5 {
                 atomic::fence(Ordering::SeqCst);
 
@@ -549,7 +570,6 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
                     atomic::fence(Ordering::SeqCst);
                 }
 
-                // STRICTER: Add delay between rounds
                 if round < 4 {
                     std::thread::sleep(std::time::Duration::from_micros(10));
                 }
@@ -578,7 +598,6 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
     /// Ensure all pending dequeue operations are completed
     pub fn finalize_pending_dequeues(&self) {
         unsafe {
-            // STRICTER: Multiple rounds with increasing aggressiveness
             for round in 0..5 {
                 atomic::fence(Ordering::SeqCst);
 
@@ -589,7 +608,6 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
                     atomic::fence(Ordering::SeqCst);
                     let op_val = (*self.deq_ops).get_unchecked(i).load();
 
-                    // If operation is still pending, complete it
                     if op_val == DEQ_OPS_INIT {
                         if i > 1 {
                             self.update_tree(i - 1);
@@ -607,10 +625,8 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
                     if op_val != DEQ_OPS_INIT && op_val != DEQ_OPS_EMPTY {
                         let (j, id) = unpack_u128(op_val);
                         if id < self.num_processes {
-                            // Ensure head is updated
                             (*self.head).get_unchecked(id).max_write(j + 1);
                             atomic::fence(Ordering::SeqCst);
-                            // Propagate the change multiple times
                             for _ in 0..3 {
                                 self.propagate(id);
                                 atomic::fence(Ordering::SeqCst);
@@ -622,7 +638,6 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
                 // Force complete propagation
                 self.force_sync();
 
-                // STRICTER: Add delay between rounds
                 if round < 4 {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
@@ -653,7 +668,6 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
             println!("Tree root: {:?}", (*self.tree).get_unchecked(0).load());
             println!("Total items in queue: {}", self.total_items());
 
-            // Check for assigned but not taken items
             let mut assigned_not_taken = 0;
             for i in 1..deq_count.min(100) {
                 let op = (*self.deq_ops).get_unchecked(i).load();

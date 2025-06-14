@@ -239,6 +239,9 @@ where
     let mut consumer_pids = Vec::with_capacity(num_consumers);
     let mut helper_pid = None;
 
+    // Detect if this is a JKM queue
+    let is_jkm = std::any::type_name::<Q>().contains("JKMQueue");
+
     // Fork helper process if needed - counts as a participant in startup sync
     if needs_helper {
         match unsafe { fork() } {
@@ -329,7 +332,7 @@ where
         }
     }
 
-    // Fork consumers
+    // Fork consumers - with queue-specific handling
     for consumer_id in 0..num_consumers {
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
@@ -348,33 +351,182 @@ where
                 };
                 let my_target = target_items + extra_items;
 
-                let mut consecutive_empty_checks = 0;
-                const MAX_CONSECUTIVE_EMPTY_CHECKS: usize = 40000;
+                if is_jkm {
+                    // JKM-specific consumer logic
+                    let mut pop_attempts_outer = 0;
 
-                while consumed_count < my_target {
-                    match q.bench_pop(num_producers + consumer_id) {
-                        Ok(_item) => {
-                            consumed_count += 1;
-                            consecutive_empty_checks = 0;
-                        }
-                        Err(_) => {
-                            // Only count it as truly empty if all producers are done
-                            // AND we've waited a reasonable time for propagation
-                            if done_sync.producers_done.load(Ordering::Acquire)
-                                == num_producers as u32
-                            {
-                                consecutive_empty_checks += 1;
+                    while consumed_count < my_target {
+                        match q.bench_pop(consumer_id) {
+                            Ok(_item) => {
+                                consumed_count += 1;
+                                pop_attempts_outer = 0;
+                            }
+                            Err(_) => {
+                                pop_attempts_outer += 1;
 
-                                // Give more time for propagation
-                                if consecutive_empty_checks < 100 {
-                                    std::thread::sleep(std::time::Duration::from_micros(1));
-                                } else if consecutive_empty_checks > MAX_CONSECUTIVE_EMPTY_CHECKS {
-                                    break;
+                                // Check if we should panic (producers not done but we're spinning too long)
+                                if pop_attempts_outer > MAX_BENCH_SPIN_RETRY_ATTEMPTS
+                                    && !(done_sync.producers_done.load(Ordering::Acquire)
+                                        == num_producers as u32)
+                                {
+                                    panic!(
+                                        "Consumer {} exceeded max spin retry attempts for pop (producers not done)",
+                                        consumer_id
+                                    );
+                                }
+
+                                // Pop returned error - check if producers are done
+                                let producers_done =
+                                    done_sync.producers_done.load(Ordering::Acquire)
+                                        == num_producers as u32;
+
+                                if producers_done {
+                                    // Producers are done, try a final drain aggressively
+                                    let mut final_drain_attempts = 0;
+                                    const MAX_FINAL_DRAIN_ATTEMPTS: usize = 100_000;
+
+                                    // Force sync before aggressive drain
+                                    if let Some(jkm_queue) = unsafe {
+                                        (q as *const _ as *const JKMQueue<usize>).as_ref()
+                                    } {
+                                        // Multiple rounds of synchronization
+                                        for _ in 0..3 {
+                                            jkm_queue.force_sync();
+                                            std::thread::sleep(std::time::Duration::from_micros(
+                                                10,
+                                            ));
+                                        }
+                                        jkm_queue.finalize_pending_dequeues();
+                                    }
+
+                                    while consumed_count < my_target
+                                        && final_drain_attempts < MAX_FINAL_DRAIN_ATTEMPTS
+                                    {
+                                        // More aggressive periodic sync during drain
+                                        if final_drain_attempts % 500 == 0 {
+                                            if let Some(jkm_queue) = unsafe {
+                                                (q as *const _ as *const JKMQueue<usize>).as_ref()
+                                            } {
+                                                jkm_queue.force_sync();
+                                                // Give time for propagation
+                                                if final_drain_attempts % 2000 == 0 {
+                                                    std::thread::sleep(
+                                                        std::time::Duration::from_micros(100),
+                                                    );
+                                                }
+                                            }
+                                        }
+
+                                        if q.bench_pop(consumer_id).is_ok() {
+                                            consumed_count += 1;
+                                            final_drain_attempts = 0;
+                                            if consumed_count >= my_target {
+                                                break;
+                                            }
+                                        } else {
+                                            final_drain_attempts += 1;
+                                            if final_drain_attempts < 100 {
+                                                std::hint::spin_loop();
+                                            } else {
+                                                std::thread::yield_now();
+                                            }
+                                        }
+                                    }
+
+                                    // After aggressive drain attempts, do more thorough checks
+                                    if consumed_count < my_target {
+                                        // Multiple final sync rounds
+                                        if let Some(jkm_queue) = unsafe {
+                                            (q as *const _ as *const JKMQueue<usize>).as_ref()
+                                        } {
+                                            for sync_round in 0..5 {
+                                                jkm_queue.force_sync();
+                                                jkm_queue.finalize_pending_dequeues();
+
+                                                // Give time between syncs
+                                                std::thread::sleep(
+                                                    std::time::Duration::from_millis(1),
+                                                );
+
+                                                // Try to drain after each sync
+                                                for attempt in 0..1000 {
+                                                    if q.bench_pop(consumer_id).is_ok() {
+                                                        consumed_count += 1;
+                                                        if consumed_count >= my_target {
+                                                            break;
+                                                        }
+                                                    } else if attempt % 100 == 0 {
+                                                        std::thread::yield_now();
+                                                    } else {
+                                                        std::hint::spin_loop();
+                                                    }
+                                                }
+
+                                                if consumed_count >= my_target {
+                                                    break;
+                                                }
+                                            }
+
+                                            // Final check if queue truly has no items
+                                            let items_left = jkm_queue.total_items();
+                                            if items_left == 0 && q.bench_is_empty() {
+                                                break;
+                                            } else if items_left > 0 {
+                                                // Queue still has items, keep trying
+                                                eprintln!("JKM Queue still has {} items, consumer {} only got {}/{}", 
+                                                    items_left, consumer_id, consumed_count, my_target);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // Producers not done - adaptive backoff
+                                    if pop_attempts_outer < 100 {
+                                        std::hint::spin_loop();
+                                    } else if pop_attempts_outer < 1000 {
+                                        std::thread::yield_now();
+                                    } else {
+                                        std::thread::sleep(std::time::Duration::from_micros(1));
+                                    }
                                 }
                             }
-                            // Don't yield immediately - spin a bit first
-                            for _ in 0..100 {
-                                std::hint::spin_loop();
+                        }
+
+                        if consumed_count >= my_target {
+                            break;
+                        }
+                    }
+                } else {
+                    // Standard consumer logic for non-JKM queues
+                    let mut consecutive_empty_checks = 0;
+                    const MAX_CONSECUTIVE_EMPTY_CHECKS: usize = 40000;
+
+                    while consumed_count < my_target {
+                        match q.bench_pop(num_producers + consumer_id) {
+                            Ok(_item) => {
+                                consumed_count += 1;
+                                consecutive_empty_checks = 0;
+                            }
+                            Err(_) => {
+                                // Only count it as truly empty if all producers are done
+                                // AND we've waited a reasonable time for propagation
+                                if done_sync.producers_done.load(Ordering::Acquire)
+                                    == num_producers as u32
+                                {
+                                    consecutive_empty_checks += 1;
+
+                                    // Give more time for propagation
+                                    if consecutive_empty_checks < 100 {
+                                        std::thread::sleep(std::time::Duration::from_micros(1));
+                                    } else if consecutive_empty_checks
+                                        > MAX_CONSECUTIVE_EMPTY_CHECKS
+                                    {
+                                        break;
+                                    }
+                                }
+                                // Don't yield immediately - spin a bit first
+                                for _ in 0..100 {
+                                    std::hint::spin_loop();
+                                }
                             }
                         }
                     }
@@ -426,6 +578,26 @@ where
         waitpid(pid, None).expect("waitpid for producer failed");
     }
 
+    // JKM-specific synchronization after producers finish
+    if is_jkm {
+        if let Some(jkm_queue) = unsafe { (q as *const _ as *const JKMQueue<usize>).as_ref() } {
+            // Multiple rounds of synchronization
+            for round in 0..3 {
+                // Ensure all enqueued items are visible
+                jkm_queue.force_sync();
+
+                // Help any pending dequeue operations
+                jkm_queue.finalize_pending_dequeues();
+
+                // Give time for propagation between rounds
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+
+            // Final longer wait for propagation
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     for pid in consumer_pids {
         waitpid(pid, None).expect("waitpid for consumer failed");
     }
@@ -453,6 +625,13 @@ where
             num_producers,
             num_consumers
         );
+
+        // Debug state on data loss for JKM
+        if is_jkm {
+            if let Some(jkm_queue) = unsafe { (q as *const _ as *const JKMQueue<usize>).as_ref() } {
+                jkm_queue.debug_state();
+            }
+        }
     }
 
     unsafe {
@@ -719,296 +898,6 @@ where
     duration
 }
 
-fn fork_and_run_jkm<Q, F>(
-    queue_init_fn: F,
-    num_producers: usize,
-    num_consumers: usize,
-    items_per_process: usize,
-) -> Duration
-where
-    Q: BenchMpmcQueue<usize> + 'static,
-    F: FnOnce() -> (&'static Q, *mut u8, usize),
-{
-    if num_producers == 0 || num_consumers == 0 {
-        return Duration::from_nanos(1);
-    }
-
-    let total_items = num_producers * items_per_process;
-
-    let (q, q_shm_ptr, q_shm_size) = queue_init_fn();
-
-    let startup_sync_size = MpmcStartupSync::shared_size();
-    let startup_sync_shm_ptr = unsafe { map_shared(startup_sync_size) };
-    let startup_sync = MpmcStartupSync::new_in_shm(startup_sync_shm_ptr);
-
-    let done_sync_size = MpmcDoneSync::shared_size();
-    let done_sync_shm_ptr = unsafe { map_shared(done_sync_size) };
-    let done_sync = MpmcDoneSync::new_in_shm(done_sync_shm_ptr);
-
-    let mut producer_pids = Vec::with_capacity(num_producers);
-    let mut consumer_pids = Vec::with_capacity(num_consumers);
-
-    // Fork producers
-    for producer_id in 0..num_producers {
-        match unsafe { fork() } {
-            Ok(ForkResult::Child) => {
-                startup_sync.producers_ready.fetch_add(1, Ordering::AcqRel);
-
-                while !startup_sync.go_signal.load(Ordering::Acquire) {
-                    std::hint::spin_loop();
-                }
-
-                let mut push_attempts = 0;
-                for i in 0..items_per_process {
-                    let item_value = producer_id * items_per_process + i;
-                    while q.bench_push(item_value, producer_id).is_err() {
-                        push_attempts += 1;
-                        if push_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS {
-                            panic!(
-                                "Producer {} exceeded max spin retry attempts for push",
-                                producer_id
-                            );
-                        }
-                        std::hint::spin_loop();
-                    }
-                }
-
-                done_sync.producers_done.fetch_add(1, Ordering::AcqRel);
-                unsafe { libc::_exit(0) };
-            }
-            Ok(ForkResult::Parent { child }) => {
-                producer_pids.push(child);
-            }
-            Err(e) => {
-                unsafe {
-                    if !q_shm_ptr.is_null() {
-                        unmap_shared(q_shm_ptr, q_shm_size);
-                    }
-                    unmap_shared(startup_sync_shm_ptr, startup_sync_size);
-                    unmap_shared(done_sync_shm_ptr, done_sync_size);
-                }
-                panic!("Fork failed for producer {}: {}", producer_id, e);
-            }
-        }
-    }
-
-    // Fork consumers with JKM-specific handling
-    for consumer_id in 0..num_consumers {
-        match unsafe { fork() } {
-            Ok(ForkResult::Child) => {
-                startup_sync.consumers_ready.fetch_add(1, Ordering::AcqRel);
-
-                while !startup_sync.go_signal.load(Ordering::Acquire) {
-                    std::hint::spin_loop();
-                }
-
-                let mut consumed_count = 0;
-                let target_items = total_items / num_consumers;
-                let extra_items = if consumer_id < (total_items % num_consumers) {
-                    1
-                } else {
-                    0
-                };
-                let my_target = target_items + extra_items;
-
-                let mut pop_attempts_outer = 0;
-
-                while consumed_count < my_target {
-                    match q.bench_pop(consumer_id) {
-                        Ok(_item) => {
-                            consumed_count += 1;
-                            pop_attempts_outer = 0; // Reset attempts on successful pop
-                        }
-                        Err(_) => {
-                            pop_attempts_outer += 1;
-
-                            // Check if we should panic (producers not done but we're spinning too long)
-                            if pop_attempts_outer > MAX_BENCH_SPIN_RETRY_ATTEMPTS
-                                && !(done_sync.producers_done.load(Ordering::Acquire)
-                                    == num_producers as u32)
-                            {
-                                panic!(
-                                    "Consumer {} exceeded max spin retry attempts for pop (producers not done)",
-                                    consumer_id
-                                );
-                            }
-
-                            // Pop returned error - check if producers are done
-                            let producers_done = done_sync.producers_done.load(Ordering::Acquire)
-                                == num_producers as u32;
-
-                            if producers_done {
-                                // Producers are done, try a final drain aggressively
-                                let mut final_drain_attempts = 0;
-                                const MAX_FINAL_DRAIN_ATTEMPTS: usize = 100_000; // Increased for JKM
-
-                                // Force sync before aggressive drain
-                                if let Some(jkm_queue) =
-                                    unsafe { (q as *const _ as *const JKMQueue<usize>).as_ref() }
-                                {
-                                    jkm_queue.force_sync();
-                                    jkm_queue.finalize_pending_dequeues();
-                                }
-
-                                while consumed_count < my_target
-                                    && final_drain_attempts < MAX_FINAL_DRAIN_ATTEMPTS
-                                {
-                                    // Periodic sync during drain
-                                    if final_drain_attempts % 1000 == 0 {
-                                        if let Some(jkm_queue) = unsafe {
-                                            (q as *const _ as *const JKMQueue<usize>).as_ref()
-                                        } {
-                                            jkm_queue.force_sync();
-                                        }
-                                    }
-
-                                    if q.bench_pop(consumer_id).is_ok() {
-                                        consumed_count += 1;
-                                        final_drain_attempts = 0; // Reset on success
-                                        if consumed_count >= my_target {
-                                            break;
-                                        }
-                                    } else {
-                                        final_drain_attempts += 1;
-                                        if final_drain_attempts < 100 {
-                                            std::hint::spin_loop();
-                                        } else {
-                                            std::thread::yield_now(); // Give queue time if it was a near-miss
-                                        }
-                                    }
-                                }
-
-                                // After aggressive drain attempts, do one more check
-                                if consumed_count < my_target {
-                                    // Final sync and check
-                                    if let Some(jkm_queue) = unsafe {
-                                        (q as *const _ as *const JKMQueue<usize>).as_ref()
-                                    } {
-                                        jkm_queue.force_sync();
-                                        jkm_queue.finalize_pending_dequeues();
-
-                                        // Check if there are any uncompleted dequeue operations
-                                        // This handles the case where a dequeue was assigned but not taken
-                                        for attempt in 0..100 {
-                                            if q.bench_pop(consumer_id).is_ok() {
-                                                consumed_count += 1;
-                                                if consumed_count >= my_target {
-                                                    break;
-                                                }
-                                            } else {
-                                                std::thread::yield_now();
-                                            }
-                                        }
-
-                                        // Check if queue truly has no items
-                                        let items_left = jkm_queue.total_items();
-                                        if items_left == 0 && q.bench_is_empty() {
-                                            break;
-                                        }
-                                    }
-                                }
-                            } else {
-                                // Producers not done - adaptive backoff
-                                if pop_attempts_outer < 100 {
-                                    std::hint::spin_loop();
-                                } else if pop_attempts_outer < 1000 {
-                                    std::thread::yield_now();
-                                } else {
-                                    std::thread::sleep(std::time::Duration::from_micros(1));
-                                }
-                            }
-                        }
-                    }
-
-                    if consumed_count >= my_target {
-                        break;
-                    }
-                }
-
-                done_sync
-                    .total_consumed
-                    .fetch_add(consumed_count, Ordering::AcqRel);
-                done_sync.consumers_done.fetch_add(1, Ordering::AcqRel);
-
-                unsafe { libc::_exit(0) };
-            }
-            Ok(ForkResult::Parent { child }) => {
-                consumer_pids.push(child);
-            }
-            Err(e) => {
-                unsafe {
-                    if !q_shm_ptr.is_null() {
-                        unmap_shared(q_shm_ptr, q_shm_size);
-                    }
-                    unmap_shared(startup_sync_shm_ptr, startup_sync_size);
-                    unmap_shared(done_sync_shm_ptr, done_sync_size);
-                }
-                panic!("Fork failed for consumer {}: {}", consumer_id, e);
-            }
-        }
-    }
-
-    // Wait for all workers to be ready
-    while startup_sync.producers_ready.load(Ordering::Acquire) < num_producers as u32
-        || startup_sync.consumers_ready.load(Ordering::Acquire) < num_consumers as u32
-    {
-        std::hint::spin_loop();
-    }
-
-    // START TIMING HERE
-    let start_time = std::time::Instant::now();
-    startup_sync.go_signal.store(true, Ordering::Release);
-
-    // Wait for producers
-    for pid in producer_pids {
-        waitpid(pid, None).expect("waitpid for producer failed");
-    }
-
-    // JKM-specific synchronization after producers finish
-    if let Some(jkm_queue) = unsafe { (q as *const _ as *const JKMQueue<usize>).as_ref() } {
-        // Ensure all enqueued items are visible
-        jkm_queue.force_sync();
-
-        // Help any pending dequeue operations
-        jkm_queue.finalize_pending_dequeues();
-
-        // Give time for propagation
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-
-    // Wait for consumers
-    for pid in consumer_pids {
-        waitpid(pid, None).expect("waitpid for consumer failed");
-    }
-
-    let duration = start_time.elapsed();
-
-    // Get the total consumed count
-    let total_consumed = done_sync.total_consumed.load(Ordering::Acquire);
-
-    if total_consumed != total_items {
-        eprintln!(
-            "Warning (JKM MPMC): Total consumed {}/{} items. Prods: {}, Cons: {}",
-            total_consumed, total_items, num_producers, num_consumers
-        );
-
-        // Debug state on data loss
-        if let Some(jkm_queue) = unsafe { (q as *const _ as *const JKMQueue<usize>).as_ref() } {
-            jkm_queue.debug_state();
-        }
-    }
-
-    unsafe {
-        if !q_shm_ptr.is_null() {
-            unmap_shared(q_shm_ptr, q_shm_size);
-        }
-        unmap_shared(startup_sync_shm_ptr, startup_sync_size);
-        unmap_shared(done_sync_shm_ptr, done_sync_size);
-    }
-
-    duration
-}
-
 // Add benchmark function
 fn bench_wf_queue(c: &mut Criterion) {
     let mut group = c.benchmark_group("VermaMPMC");
@@ -1178,7 +1067,7 @@ fn bench_jkm_queue(c: &mut Criterion) {
             format!("{}P_{}C", num_prods, num_cons),
             |b: &mut Bencher| {
                 b.iter_custom(|_iters| {
-                    fork_and_run_jkm::<JKMQueue<usize>, _>(
+                    fork_and_run_mpmc_with_helper::<JKMQueue<usize>, _>(
                         || {
                             let bytes = JKMQueue::<usize>::shared_size(num_prods, num_cons);
                             let shm_ptr = unsafe { map_shared(bytes) };
@@ -1189,6 +1078,7 @@ fn bench_jkm_queue(c: &mut Criterion) {
                         num_prods,
                         num_cons,
                         items_per_process,
+                        false, // needs_helper = false
                     )
                 })
             },
@@ -1200,7 +1090,7 @@ fn bench_jkm_queue(c: &mut Criterion) {
 
 fn custom_criterion() -> Criterion {
     Criterion::default()
-        .warm_up_time(Duration::from_secs(2))
+        .warm_up_time(Duration::from_secs(5))
         .measurement_time(Duration::from_secs(10))
         .sample_size(10)
 }

@@ -261,9 +261,11 @@ where
     let queue_type_name = std::any::type_name::<Q>();
     let is_jkm = queue_type_name.contains("JKMQueue");
     let is_nr = queue_type_name.contains("NRQueue");
+    let is_wcq = queue_type_name.contains("WCQueue");
 
     // Fork helper process if needed - counts as a participant in startup sync
-    if needs_helper {
+    if needs_helper && !is_wcq {
+        // WCQ doesn't need external helper
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
                 // Helper process - pin to last core
@@ -321,7 +323,11 @@ where
                 let mut push_attempts = 0;
                 for i in 0..items_per_process {
                     let item_value = producer_id * items_per_process + i;
-                    while q.bench_push(item_value, producer_id).is_err() {
+
+                    // WCQ uses producer_id directly, others might need adjustment
+                    let thread_id = producer_id;
+
+                    while q.bench_push(item_value, thread_id).is_err() {
                         push_attempts += 1;
                         if push_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS {
                             panic!(
@@ -371,8 +377,76 @@ where
                 };
                 let my_target = target_items + extra_items;
 
-                if is_jkm {
-                    // JKM-specific consumer logic
+                // WCQ-specific consumer handling
+                if is_wcq {
+                    let mut consecutive_empty = 0;
+                    let mut total_attempts = 0;
+                    let start_time = std::time::Instant::now();
+                    let timeout_duration = std::time::Duration::from_secs(30);
+
+                    while consumed_count < my_target {
+                        if start_time.elapsed() > timeout_duration {
+                            break;
+                        }
+
+                        total_attempts += 1;
+
+                        // WCQ expects consumer thread_id from num_producers to num_producers + num_consumers - 1
+                        let thread_id = num_producers + consumer_id;
+
+                        match q.bench_pop(thread_id) {
+                            Ok(_) => {
+                                consumed_count += 1;
+                                consecutive_empty = 0;
+                            }
+                            Err(_) => {
+                                consecutive_empty += 1;
+
+                                if consecutive_empty > 10_000 {
+                                    let producers_done =
+                                        done_sync.producers_done.load(Ordering::Acquire)
+                                            == num_producers as u32;
+
+                                    if producers_done && consecutive_empty > 50_000 {
+                                        let mut final_attempts = 0;
+                                        while final_attempts < 10_000 && consumed_count < my_target
+                                        {
+                                            if let Ok(_) = q.bench_pop(thread_id) {
+                                                consumed_count += 1;
+                                                final_attempts = 0;
+                                            } else {
+                                                final_attempts += 1;
+                                                if final_attempts % 100 == 0 {
+                                                    std::thread::yield_now();
+                                                }
+                                            }
+                                        }
+
+                                        if consumed_count < my_target {
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                // Adaptive backoff
+                                if consecutive_empty < 100 {
+                                    std::hint::spin_loop();
+                                } else if consecutive_empty < 1000 {
+                                    std::thread::yield_now();
+                                } else if consecutive_empty < 10_000 {
+                                    std::thread::sleep(std::time::Duration::from_micros(1));
+                                } else {
+                                    std::thread::sleep(std::time::Duration::from_micros(10));
+
+                                    if consecutive_empty > 1_000_000 {
+                                        consecutive_empty = 10_000;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if is_jkm {
+                    // JKM-specific consumer logic (existing code)
                     let mut pop_attempts_outer = 0;
 
                     while consumed_count < my_target {
@@ -668,7 +742,7 @@ where
     }
 
     // Wait for all workers AND helper to be ready
-    let expected_producers = if needs_helper {
+    let expected_producers = if needs_helper && !is_wcq {
         num_producers as u32 + 1 // +1 for helper counted as producer
     } else {
         num_producers as u32
@@ -952,7 +1026,7 @@ fn bench_wcq_queue(c: &mut Criterion) {
             format!("{}P_{}C", num_prods, num_cons),
             |b: &mut Bencher| {
                 b.iter_custom(|_iters| {
-                    fork_and_run_wcq(
+                    fork_and_run_mpmc_with_helper::<WCQueue<usize>, _>(
                         || {
                             let bytes = WCQueue::<usize>::shared_size(total_processes);
                             let shm_ptr = unsafe { map_shared(bytes) };
@@ -962,6 +1036,7 @@ fn bench_wcq_queue(c: &mut Criterion) {
                         num_prods,
                         num_cons,
                         items_per_process,
+                        false,
                     )
                 })
             },
@@ -969,255 +1044,6 @@ fn bench_wcq_queue(c: &mut Criterion) {
     }
 
     group.finish();
-}
-
-fn fork_and_run_wcq<F>(
-    queue_init_fn: F,
-    num_producers: usize,
-    num_consumers: usize,
-    items_per_process: usize,
-) -> Duration
-where
-    F: FnOnce() -> (&'static WCQueue<usize>, *mut u8, usize),
-{
-    if num_producers == 0 || num_consumers == 0 {
-        return Duration::from_nanos(1);
-    }
-
-    let total_items = num_producers * items_per_process;
-
-    let (q, q_shm_ptr, q_shm_size) = queue_init_fn();
-
-    let startup_sync_size = MpmcStartupSync::shared_size();
-    let startup_sync_shm_ptr = unsafe { map_shared(startup_sync_size) };
-    let startup_sync = MpmcStartupSync::new_in_shm(startup_sync_shm_ptr);
-
-    let done_sync_size = MpmcDoneSync::shared_size();
-    let done_sync_shm_ptr = unsafe { map_shared(done_sync_size) };
-    let done_sync = MpmcDoneSync::new_in_shm(done_sync_shm_ptr);
-
-    let mut producer_pids = Vec::with_capacity(num_producers);
-    let mut consumer_pids = Vec::with_capacity(num_consumers);
-
-    // Fork producers
-    for producer_id in 0..num_producers {
-        match unsafe { fork() } {
-            Ok(ForkResult::Child) => {
-                startup_sync.producers_ready.fetch_add(1, Ordering::AcqRel);
-
-                while !startup_sync.go_signal.load(Ordering::Acquire) {
-                    std::hint::spin_loop();
-                }
-
-                for i in 0..items_per_process {
-                    let item_value = producer_id * items_per_process + i;
-                    let mut attempts = 0;
-                    while q.push(item_value, producer_id).is_err() {
-                        attempts += 1;
-                        if attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS {
-                            panic!("Producer {} failed to push", producer_id);
-                        }
-                        std::hint::spin_loop();
-                    }
-                }
-
-                done_sync.producers_done.fetch_add(1, Ordering::AcqRel);
-                unsafe { libc::_exit(0) };
-            }
-            Ok(ForkResult::Parent { child }) => {
-                producer_pids.push(child);
-            }
-            Err(e) => {
-                unsafe {
-                    if !q_shm_ptr.is_null() {
-                        unmap_shared(q_shm_ptr, q_shm_size);
-                    }
-                    unmap_shared(startup_sync_shm_ptr, startup_sync_size);
-                    unmap_shared(done_sync_shm_ptr, done_sync_size);
-                }
-                panic!("Fork failed for producer {}: {}", producer_id, e);
-            }
-        }
-    }
-
-    // Fork consumers with proper timeout
-    for consumer_id in 0..num_consumers {
-        match unsafe { fork() } {
-            Ok(ForkResult::Child) => {
-                startup_sync.consumers_ready.fetch_add(1, Ordering::AcqRel);
-
-                while !startup_sync.go_signal.load(Ordering::Acquire) {
-                    std::hint::spin_loop();
-                }
-
-                let mut consumed_count = 0;
-                let target_items = total_items / num_consumers;
-                let extra_items = if consumer_id < (total_items % num_consumers) {
-                    1
-                } else {
-                    0
-                };
-                let my_target = target_items + extra_items;
-
-                let mut consecutive_empty = 0;
-                let mut total_attempts = 0;
-                let start_time = std::time::Instant::now();
-
-                // Timeout based on expected workload
-                let timeout_duration = std::time::Duration::from_secs(30);
-
-                while consumed_count < my_target {
-                    // Check timeout
-                    if start_time.elapsed() > timeout_duration {
-                        break; // Exit gracefully
-                    }
-
-                    total_attempts += 1;
-
-                    match q.pop(consumer_id) {
-                        Ok(_) => {
-                            consumed_count += 1;
-                            consecutive_empty = 0;
-                        }
-                        Err(_) => {
-                            consecutive_empty += 1;
-
-                            // Check if producers are done and we've waited enough
-                            if consecutive_empty > 10_000 {
-                                let producers_done =
-                                    done_sync.producers_done.load(Ordering::Acquire)
-                                        == num_producers as u32;
-
-                                if producers_done && consecutive_empty > 50_000 {
-                                    // Do a final burst attempt
-                                    let mut final_attempts = 0;
-                                    while final_attempts < 10_000 && consumed_count < my_target {
-                                        if let Ok(_) = q.pop(consumer_id) {
-                                            consumed_count += 1;
-                                            final_attempts = 0;
-                                        } else {
-                                            final_attempts += 1;
-                                            if final_attempts % 100 == 0 {
-                                                std::thread::yield_now();
-                                            }
-                                        }
-                                    }
-
-                                    // Exit if we can't get more items
-                                    if consumed_count < my_target {
-                                        break;
-                                    }
-                                }
-                            }
-
-                            // Adaptive backoff
-                            if consecutive_empty < 100 {
-                                std::hint::spin_loop();
-                            } else if consecutive_empty < 1000 {
-                                std::thread::yield_now();
-                            } else if consecutive_empty < 10_000 {
-                                std::thread::sleep(std::time::Duration::from_micros(1));
-                            } else {
-                                std::thread::sleep(std::time::Duration::from_micros(10));
-
-                                // Prevent counter overflow
-                                if consecutive_empty > 1_000_000 {
-                                    consecutive_empty = 10_000;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                done_sync
-                    .total_consumed
-                    .fetch_add(consumed_count, Ordering::AcqRel);
-                done_sync.consumers_done.fetch_add(1, Ordering::AcqRel);
-
-                unsafe { libc::_exit(0) };
-            }
-            Ok(ForkResult::Parent { child }) => {
-                consumer_pids.push(child);
-            }
-            Err(e) => {
-                unsafe {
-                    if !q_shm_ptr.is_null() {
-                        unmap_shared(q_shm_ptr, q_shm_size);
-                    }
-                    unmap_shared(startup_sync_shm_ptr, startup_sync_size);
-                    unmap_shared(done_sync_shm_ptr, done_sync_size);
-                }
-                panic!("Fork failed for consumer {}: {}", consumer_id, e);
-            }
-        }
-    }
-
-    // Wait for all workers to be ready
-    while startup_sync.producers_ready.load(Ordering::Acquire) < num_producers as u32
-        || startup_sync.consumers_ready.load(Ordering::Acquire) < num_consumers as u32
-    {
-        std::hint::spin_loop();
-    }
-
-    // START TIMING HERE
-    let start_time = std::time::Instant::now();
-    startup_sync.go_signal.store(true, Ordering::Release);
-
-    // Wait for all processes with timeout
-    for pid in producer_pids {
-        waitpid(pid, None).expect("waitpid for producer failed");
-    }
-
-    // Set a maximum wait time for consumers
-    let consumer_timeout = std::time::Duration::from_secs(60);
-    let consumer_start = std::time::Instant::now();
-
-    for pid in consumer_pids {
-        // Use waitpid with WNOHANG in a loop to implement timeout
-        loop {
-            match waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
-                Ok(nix::sys::wait::WaitStatus::StillAlive) => {
-                    if consumer_start.elapsed() > consumer_timeout {
-                        // Force kill the consumer
-                        unsafe {
-                            libc::kill(pid.as_raw(), libc::SIGKILL);
-                        }
-                        waitpid(pid, None).ok();
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                _ => break,
-            }
-        }
-    }
-
-    let duration = start_time.elapsed();
-
-    // Report results
-    let total_consumed = done_sync.total_consumed.load(Ordering::Acquire);
-    if total_consumed != total_items {
-        let loss = total_items.saturating_sub(total_consumed);
-        let loss_rate = loss as f64 / total_items as f64 * 100.0;
-
-        // Only print warning if loss is significant
-        if loss > 0 {
-            eprintln!(
-                "Warning (WCQ): Total consumed {}/{} items ({} lost, {:.2}%). Prods: {}, Cons: {}",
-                total_consumed, total_items, loss, loss_rate, num_producers, num_consumers
-            );
-        }
-    }
-
-    unsafe {
-        if !q_shm_ptr.is_null() {
-            unmap_shared(q_shm_ptr, q_shm_size);
-        }
-        unmap_shared(startup_sync_shm_ptr, startup_sync_size);
-        unmap_shared(done_sync_shm_ptr, done_sync_size);
-    }
-
-    duration
 }
 
 fn custom_criterion() -> Criterion {

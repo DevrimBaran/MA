@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use crate::MpmcQueue;
 
-// Constants from the paper
 const MAX_PATIENCE: usize = 16;
 const MAX_PATIENCE_DEQ: usize = 64;
 const HELP_DELAY: usize = 8;
@@ -16,9 +15,8 @@ const FIN_BIT: u64 = 1 << 63;
 const INC_BIT: u64 = 1 << 62;
 const COUNTER_MASK: u64 = (1 << 62) - 1;
 
-// Special index values - must fit in 30 bits
-const IDX_BOTTOM: usize = 0x3FFFFFFE; // ⊥c
-const IDX_EMPTY: usize = 0x3FFFFFFD; // ⊥
+const IDX_BOTTOM: usize = 0x3FFFFFFE;
+const IDX_EMPTY: usize = 0x3FFFFFFD;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -43,7 +41,7 @@ impl Entry {
 #[repr(C)]
 pub struct EntryPair {
     note: AtomicU32,
-    pub value: AtomicU64, // Packed Entry
+    pub value: AtomicU64,
 }
 
 impl EntryPair {
@@ -73,11 +71,10 @@ impl EntryPair {
     }
 }
 
-// Enhanced data entry with ready flag
 #[repr(C)]
 struct DataEntry<T> {
     value: UnsafeCell<Option<T>>,
-    ready: AtomicBool, // Indicates data is ready to be consumed
+    ready: AtomicBool,
 }
 
 impl<T> DataEntry<T> {
@@ -110,11 +107,9 @@ impl Phase2Rec {
 
 #[repr(C)]
 struct ThreadRecord {
-    // Private fields
     next_check: AtomicUsize,
     next_tid: AtomicUsize,
 
-    // Shared fields
     phase2: Phase2Rec,
     seq1: AtomicU32,
     enqueue: AtomicBool,
@@ -195,7 +190,6 @@ pub struct WCQueue<T: Send + Clone + 'static> {
     num_threads: usize,
     num_indices: usize,
 
-    // Track total enqueued/dequeued for debugging
     total_enqueued: AtomicUsize,
     total_dequeued: AtomicUsize,
 
@@ -284,20 +278,17 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
 
                 let new_packed = EntryPair::pack_entry(new_entry);
 
-                // CRITICAL: Add fence before CAS
                 fence(Ordering::SeqCst);
 
                 match entry.value.compare_exchange_weak(
                     packed,
                     new_packed,
-                    Ordering::SeqCst, // Use SeqCst for stronger guarantee
+                    Ordering::SeqCst,
                     Ordering::SeqCst,
                 ) {
                     Ok(_) => {
-                        // CRITICAL: Add fence after successful CAS
                         fence(Ordering::SeqCst);
 
-                        // Only update threshold for aq when it's negative (empty)
                         if entries_offset == self.aq_entries_offset {
                             let current_threshold = wq.threshold.load(Ordering::Acquire);
                             if current_threshold < 0 {
@@ -330,12 +321,10 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         let head = wq.head.cnt.fetch_add(1, Ordering::AcqRel);
         let j = Self::cache_remap(head as usize, wq.capacity);
 
-        // Strong synchronization before reading
         fence(Ordering::SeqCst);
 
         let entry = self.get_entry(wq, entries_offset, j);
 
-        // CRITICAL FIX: Retry loop for reading entry value
         let mut retry_count = 0;
         let mut packed;
         let mut e;
@@ -345,38 +334,30 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             e = EntryPair::unpack_entry(packed);
 
             if e.cycle == Self::cycle(head, wq.ring_size) {
-                // Valid entry - consume it
                 self.consume_inner(wq, entries_offset, head, j, &e);
                 *index_out = e.index;
                 return Ok(());
             }
 
-            // If entry is not ready yet, retry a few times before checking empty
             retry_count += 1;
             if retry_count > 20 {
-                // Increased from 10
                 break;
             }
 
-            // Spin briefly to allow enqueuer to complete
             for _ in 0..10 {
                 std::hint::spin_loop();
             }
             fence(Ordering::SeqCst);
         }
 
-        // Entry not ready after retries - check if queue is empty
         fence(Ordering::SeqCst);
         let tail = wq.tail.cnt.load(Ordering::SeqCst);
 
-        // CRITICAL FIX: Correct empty check with proper comparison
         if tail <= head + 1 {
-            // CRITICAL: Extra synchronization before final check
             fence(Ordering::SeqCst);
             std::thread::yield_now();
             fence(Ordering::SeqCst);
 
-            // Triple-check the entry one more time before declaring empty
             for final_check in 0..5 {
                 fence(Ordering::SeqCst);
                 packed = entry.value.load(Ordering::SeqCst);
@@ -386,7 +367,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                     && e.index != IDX_EMPTY
                     && e.index != IDX_BOTTOM
                 {
-                    // The entry appeared! Consume it
                     self.consume_inner(wq, entries_offset, head, j, &e);
                     *index_out = e.index;
                     return Ok(());
@@ -397,11 +377,9 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                 }
             }
 
-            // Queue is truly empty
             self.catchup_inner(wq, tail, head + 1);
 
             if entries_offset == self.aq_entries_offset {
-                // Only set threshold to -1 if truly empty
                 fence(Ordering::SeqCst);
                 let current_tail = wq.tail.cnt.load(Ordering::SeqCst);
                 if current_tail <= head + 1 {
@@ -413,7 +391,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             return Ok(());
         }
 
-        // Try to update entry if it's old
         let mut new_val = Entry {
             cycle: e.cycle,
             is_safe: false,
@@ -434,11 +411,10 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             let new_packed = EntryPair::pack_entry(new_val);
             entry
                 .value
-                .compare_exchange(packed, new_packed, Ordering::SeqCst, Ordering::SeqCst) // Changed to SeqCst
+                .compare_exchange(packed, new_packed, Ordering::SeqCst, Ordering::SeqCst)
                 .ok();
         }
 
-        // Update threshold for aq
         if entries_offset == self.aq_entries_offset {
             let new_threshold = wq.threshold.fetch_sub(1, Ordering::AcqRel) - 1;
             if new_threshold < 0 {
@@ -458,26 +434,21 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         j: usize,
         e: &Entry,
     ) {
-        // CRITICAL: Add synchronization before consume
         fence(Ordering::SeqCst);
 
-        // First finalize if needed
         if !e.enq && entries_offset == self.aq_entries_offset {
             self.finalize_request_inner(h);
         }
 
         let entry = self.get_entry_mut(wq, entries_offset, j);
 
-        // CRITICAL FIX: Use stronger atomic operations
         let expected = EntryPair::pack_entry(*e);
         let mut consumed_entry = *e;
         consumed_entry.index = IDX_BOTTOM;
         let new_packed = EntryPair::pack_entry(consumed_entry);
 
-        // Strong synchronization before consume
         fence(Ordering::SeqCst);
 
-        // Use a loop to ensure consumption succeeds
         let mut retry_count = 0;
         loop {
             match entry.value.compare_exchange(
@@ -487,22 +458,17 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                 Ordering::SeqCst,
             ) {
                 Ok(_) => {
-                    // Additional fence after successful consume
                     fence(Ordering::SeqCst);
 
-                    // CRITICAL: Update threshold immediately after consume for aq
                     if entries_offset == self.aq_entries_offset {
-                        // Force synchronization before checking
                         fence(Ordering::SeqCst);
 
-                        // Check if queue is now empty with retries
                         let mut empty_check_attempts = 0;
                         loop {
                             let current_head = wq.head.cnt.load(Ordering::SeqCst);
                             let current_tail = wq.tail.cnt.load(Ordering::SeqCst);
 
                             if current_tail <= current_head {
-                                // Queue is now empty
                                 wq.threshold.store(-1, Ordering::SeqCst);
                                 break;
                             }
@@ -522,17 +488,14 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                 Err(current) => {
                     retry_count += 1;
                     if retry_count > 100 {
-                        // Entry was modified - someone else consumed it
                         break;
                     }
 
-                    // Check if it's already consumed
                     let current_entry = EntryPair::unpack_entry(current);
                     if current_entry.index == IDX_BOTTOM {
-                        break; // Already consumed
+                        break;
                     }
 
-                    // Very brief spin
                     std::hint::spin_loop();
                 }
             }
@@ -540,7 +503,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
     }
 
     unsafe fn finalize_request_inner(&self, h: u64) {
-        // Try to find and finalize the matching request
         for round in 0..2 {
             for i in 0..self.num_threads {
                 let tid = i;
@@ -579,7 +541,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                 }
             }
 
-            // Brief synchronization between rounds
             if round == 0 {
                 std::hint::spin_loop();
             }
@@ -591,14 +552,12 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         const MAX_ATTEMPTS: usize = 10000;
 
         while attempts < MAX_ATTEMPTS {
-            // CRITICAL: Use SeqCst for catchup
             match wq
                 .tail
                 .cnt
                 .compare_exchange_weak(tail, head, Ordering::SeqCst, Ordering::SeqCst)
             {
                 Ok(_) => {
-                    // Success - also update threshold if needed
                     if wq as *const _ == &self.aq as *const _ {
                         fence(Ordering::SeqCst);
                         wq.threshold.store(-1, Ordering::SeqCst);
@@ -609,7 +568,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                 Err(new_tail) => {
                     tail = new_tail;
                     if tail >= head {
-                        // Someone else updated it - but ensure threshold is correct
                         if wq as *const _ == &self.aq as *const _ && tail == head {
                             fence(Ordering::SeqCst);
                             wq.threshold.store(-1, Ordering::SeqCst);
@@ -629,7 +587,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         }
     }
 
-    // Fixed slow_faa with proper synchronization
     unsafe fn slow_faa(
         &self,
         global: &GlobalPair,
@@ -643,12 +600,10 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         loop {
             attempts += 1;
             if attempts > 200 {
-                // Force finalization before giving up
                 local.fetch_or(FIN_BIT, Ordering::SeqCst);
                 return false;
             }
 
-            // Load global with full synchronization
             fence(Ordering::SeqCst);
             let cnt = self.load_global_help_phase2(global, local, phase2);
             if cnt == u64::MAX {
@@ -657,7 +612,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
 
             let old_v = *v;
 
-            // Phase 1: Set INC bit
             match local.compare_exchange(old_v, cnt | INC_BIT, Ordering::SeqCst, Ordering::Acquire)
             {
                 Ok(_) => {
@@ -675,10 +629,8 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                 }
             }
 
-            // Prepare phase2 request
             self.prepare_phase2(phase2, local as *const _ as u64, cnt);
 
-            // Try to increment global with retry
             let mut global_attempts = 0;
             let mut success = false;
 
@@ -691,7 +643,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                         .compare_exchange(cnt, cnt + 1, Ordering::SeqCst, Ordering::Acquire)
                         .is_ok()
                     {
-                        // Set phase2 pointer
                         global
                             .ptr
                             .store(phase2 as *const _ as u64, Ordering::SeqCst);
@@ -699,7 +650,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                         break;
                     }
                 } else if old_cnt > cnt {
-                    // Someone else advanced
                     break;
                 }
 
@@ -711,7 +661,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                 threshold.fetch_sub(1, Ordering::SeqCst);
             }
 
-            // Phase 2: Clear INC bit with retry
             fence(Ordering::SeqCst);
 
             for _ in 0..10 {
@@ -724,7 +673,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                 std::hint::spin_loop();
             }
 
-            // Clear phase2 pointer if we set it
             if success {
                 let mut clear_attempts = 0;
                 while clear_attempts < 100 {
@@ -774,7 +722,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                 return gp_cnt;
             }
 
-            // Help complete phase 2
             let phase2_ptr = gp_ptr as *const Phase2Rec;
             if phase2_ptr.is_null() {
                 continue;
@@ -792,7 +739,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                     .ok();
             }
 
-            // Clear phase2 pointer
             global
                 .ptr
                 .compare_exchange(gp_ptr, 0, Ordering::Release, Ordering::Acquire)
@@ -820,10 +766,8 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         let j = Self::cache_remap(t as usize, wq.capacity);
         let entry = self.get_entry_mut(wq, entries_offset, j);
 
-        // Strong synchronization before slow path operation
         fence(Ordering::SeqCst);
 
-        // Try multiple times with backoff
         for attempt in 0..20 {
             let packed = entry.value.load(Ordering::SeqCst);
             let e = EntryPair::unpack_entry(packed);
@@ -833,14 +777,12 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                 if !(e.is_safe || wq.head.cnt.load(Ordering::SeqCst) <= t)
                     || (e.index != IDX_EMPTY && e.index != IDX_BOTTOM)
                 {
-                    // Update note to prevent other helpers
                     entry
                         .note
                         .store(Self::cycle(t, wq.ring_size), Ordering::SeqCst);
                     return false;
                 }
 
-                // Produce entry with enq=0
                 let new_entry = Entry {
                     cycle: Self::cycle(t, wq.ring_size),
                     is_safe: true,
@@ -850,7 +792,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
 
                 let new_packed = EntryPair::pack_entry(new_entry);
 
-                // Strong synchronization before CAS
                 fence(Ordering::SeqCst);
 
                 match entry.value.compare_exchange_weak(
@@ -860,13 +801,10 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                     Ordering::SeqCst,
                 ) {
                     Ok(_) => {
-                        // Strong synchronization after successful CAS
                         fence(Ordering::SeqCst);
 
-                        // Try to finalize - with retry logic
                         let mut finalized = false;
                         for fin_attempt in 0..50 {
-                            // Increased attempts
                             let local_tail = r.local_tail.load(Ordering::SeqCst);
                             if local_tail & FIN_BIT != 0 {
                                 finalized = true;
@@ -886,7 +824,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                                 break;
                             }
 
-                            // More aggressive synchronization
                             fence(Ordering::SeqCst);
 
                             if fin_attempt < 10 {
@@ -897,27 +834,22 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                         }
 
                         if finalized {
-                            // CRITICAL: Ensure enq=1 is visible with multiple attempts
                             let mut final_entry = new_entry;
                             final_entry.enq = true;
                             let final_packed = EntryPair::pack_entry(final_entry);
 
-                            // Try multiple times to ensure the update succeeds
                             for update_attempt in 0..10 {
                                 fence(Ordering::SeqCst);
 
-                                // Read current value
                                 let current = entry.value.load(Ordering::SeqCst);
                                 let current_entry = EntryPair::unpack_entry(current);
 
-                                // If it matches our entry (except enq), update it
                                 if current_entry.cycle == new_entry.cycle
                                     && current_entry.index == new_entry.index
                                 {
                                     entry.value.store(final_packed, Ordering::SeqCst);
                                     fence(Ordering::SeqCst);
 
-                                    // Verify the store succeeded
                                     let verify = entry.value.load(Ordering::SeqCst);
                                     let verify_entry = EntryPair::unpack_entry(verify);
                                     if verify_entry.enq {
@@ -930,11 +862,9 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                                 }
                             }
 
-                            // Final synchronization
                             fence(Ordering::SeqCst);
                         }
 
-                        // Update threshold with synchronization
                         if entries_offset == self.aq_entries_offset {
                             fence(Ordering::SeqCst);
                             let current = wq.threshold.load(Ordering::SeqCst);
@@ -947,7 +877,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                         return true;
                     }
                     Err(_) => {
-                        // Backoff before retry
                         if attempt < 5 {
                             std::hint::spin_loop();
                         } else if attempt < 10 {
@@ -961,7 +890,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                     }
                 }
             } else if e.cycle == Self::cycle(t, wq.ring_size) {
-                // Someone else got this slot
                 return false;
             }
         }
@@ -981,31 +909,25 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         let max_attempts = 1000;
 
         loop {
-            // Check if operation was already completed
             let local_tail = r.local_tail.load(Ordering::Acquire);
             if local_tail & FIN_BIT != 0 {
-                return; // Already finalized
+                return;
             }
 
-            // Try to increment tail
             if !self.slow_faa(&wq.tail, &r.local_tail, &mut tail, None, &r.phase2) {
-                return; // FIN bit was set
+                return;
             }
 
-            // Try to insert
             if self.try_enq_slow(wq, entries_offset, tail, index, r) {
-                return; // Success
+                return;
             }
 
             attempts += 1;
             if attempts > max_attempts {
-                // Force synchronization
                 fence(Ordering::SeqCst);
 
-                // Try with current tail
                 let current_tail = wq.tail.cnt.load(Ordering::Acquire);
                 if current_tail > tail {
-                    // Try recent positions
                     for t in (tail..current_tail.min(tail + 10)) {
                         if self.try_enq_slow(wq, entries_offset, t, index, r) {
                             return;
@@ -1013,12 +935,10 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                     }
                 }
 
-                // Final attempt to mark as complete
                 r.local_tail.fetch_or(FIN_BIT, Ordering::Release);
                 return;
             }
 
-            // Backoff
             if attempts < 10 {
                 std::hint::spin_loop();
             } else {
@@ -1037,15 +957,12 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         let j = Self::cache_remap(h as usize, wq.capacity);
         let entry = self.get_entry(wq, entries_offset, j);
 
-        // Stronger synchronization before reading
         fence(Ordering::Acquire);
 
         let packed = entry.value.load(Ordering::Acquire);
         let e = EntryPair::unpack_entry(packed);
 
-        // Ready or consumed by helper
         if e.cycle == Self::cycle(h, wq.ring_size) && e.index != IDX_EMPTY {
-            // Set FIN bit with strong ordering
             r.local_head
                 .compare_exchange(h, h | FIN_BIT, Ordering::SeqCst, Ordering::Acquire)
                 .ok();
@@ -1081,23 +998,16 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             let new_packed = EntryPair::pack_entry(val);
             entry
                 .value
-                .compare_exchange(
-                    packed,
-                    new_packed,
-                    Ordering::SeqCst, // Stronger ordering
-                    Ordering::Acquire,
-                )
+                .compare_exchange(packed, new_packed, Ordering::SeqCst, Ordering::Acquire)
                 .ok();
         }
 
-        // Enhanced empty check with synchronization
         fence(Ordering::SeqCst);
         let tail = wq.tail.cnt.load(Ordering::SeqCst);
 
         if tail <= h + 1 {
             self.catchup_inner(wq, tail, h + 1);
 
-            // For AQ, check threshold
             if entries_offset == self.aq_entries_offset {
                 fence(Ordering::SeqCst);
 
@@ -1128,37 +1038,30 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
 
         let mut attempts = 0;
         let max_attempts = 200;
-        let original_head = head; // Remember the original head position
+        let original_head = head;
 
         loop {
             attempts += 1;
 
-            // Check if we've been finalized
             let local_head = r.local_head.load(Ordering::Acquire);
             if local_head & FIN_BIT != 0 {
                 return;
             }
 
             if attempts > max_attempts {
-                // Before giving up, do a final synchronization
                 fence(Ordering::SeqCst);
 
-                // Check if queue is truly empty
                 let mut current_head = wq.head.cnt.load(Ordering::SeqCst);
                 let current_tail = wq.tail.cnt.load(Ordering::SeqCst);
 
                 if current_tail <= current_head {
-                    // Queue is empty, finalize
                     r.local_head.fetch_or(FIN_BIT, Ordering::SeqCst);
                     return;
                 }
 
-                // CRITICAL: Check if there's an item at our original head position
-                // This handles the case where we incremented head but didn't get the item
                 let original_j = Self::cache_remap(original_head as usize, wq.capacity);
                 let original_entry = self.get_entry(wq, entries_offset, original_j);
 
-                // Strong synchronization before checking
                 fence(Ordering::SeqCst);
                 let original_packed = original_entry.value.load(Ordering::SeqCst);
                 let original_e = EntryPair::unpack_entry(original_packed);
@@ -1167,16 +1070,13 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                     && original_e.index != IDX_EMPTY
                     && original_e.index != IDX_BOTTOM
                 {
-                    // Found the item! Try to consume it
                     self.consume_inner(wq, entries_offset, original_head, original_j, &original_e);
 
-                    // Update the record with the index
                     r.index.store(original_e.index, Ordering::SeqCst);
                     r.local_head.fetch_or(FIN_BIT, Ordering::SeqCst);
                     return;
                 }
 
-                // Also check any intermediate positions we might have tried
                 for check_head in original_head..head {
                     let check_j = Self::cache_remap(check_head as usize, wq.capacity);
                     let check_entry = self.get_entry(wq, entries_offset, check_j);
@@ -1189,7 +1089,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                         && check_e.index != IDX_EMPTY
                         && check_e.index != IDX_BOTTOM
                     {
-                        // Found an item!
                         self.consume_inner(wq, entries_offset, check_head, check_j, &check_e);
                         r.index.store(check_e.index, Ordering::SeqCst);
                         r.local_head.fetch_or(FIN_BIT, Ordering::SeqCst);
@@ -1197,7 +1096,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                     }
                 }
 
-                // Try a few more times with current head
                 for _ in 0..10 {
                     if self.try_deq_slow(wq, entries_offset, current_head, r) {
                         return;
@@ -1205,23 +1103,19 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                     current_head = wq.head.cnt.load(Ordering::Acquire);
                 }
 
-                // Force complete synchronization before final check
                 fence(Ordering::SeqCst);
 
-                // Help all threads aggressively
                 for tid in 0..self.num_threads {
                     self.help_threads(tid);
                 }
 
                 fence(Ordering::SeqCst);
 
-                // Get result - check both the initial head and any updates with retries
                 let final_head = r.local_head.load(Ordering::Acquire);
                 let h = final_head & COUNTER_MASK;
                 let j = Self::cache_remap(h as usize, wq.capacity);
                 let entry = self.get_entry(wq, entries_offset, j);
 
-                // Try multiple times to read the entry
                 let mut packed = 0;
                 for _ in 0..10 {
                     fence(Ordering::SeqCst);
@@ -1239,27 +1133,22 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                     return;
                 }
 
-                // Check if FIN was set, indicating we should stop
                 if final_head & FIN_BIT != 0 {
                     return;
                 }
 
-                // Final finalization
                 r.local_head.fetch_or(FIN_BIT, Ordering::SeqCst);
                 return;
             }
 
-            // Try to advance head
             if !self.slow_faa(&wq.head, &r.local_head, &mut head, thld, &r.phase2) {
                 return;
             }
 
-            // Try to dequeue at this position
             if self.try_deq_slow(wq, entries_offset, head, r) {
                 return;
             }
 
-            // Backoff strategy
             if attempts < 50 {
                 std::hint::spin_loop();
             } else if attempts < 100 {
@@ -1270,41 +1159,30 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         }
     }
 
-    // Help operations
     unsafe fn help_threads(&self, tid: usize) {
         let r = self.get_record_mut(tid);
 
-        // Check if we should help
         let check_count = r.next_check.load(Ordering::Acquire);
         if check_count > 0 {
             r.next_check.store(check_count - 1, Ordering::Release);
 
-            // But still help if there's a significant imbalance
             let total_enqueued = self.total_enqueued.load(Ordering::Acquire);
             let total_dequeued = self.total_dequeued.load(Ordering::Acquire);
 
             if total_enqueued <= total_dequeued + 10 {
-                // Not many pending items, skip helping
                 return;
             }
-
-            // There are many pending items, help anyway
         }
 
-        // Reset counter
         r.next_check.store(HELP_DELAY, Ordering::Release);
 
-        // Strong synchronization
         fence(Ordering::SeqCst);
 
-        // Help multiple threads aggressively
         let base_tid = r.next_tid.load(Ordering::Acquire);
 
-        // CRITICAL: Help more threads when we detect potential issues
         let help_count = if self.total_enqueued.load(Ordering::Acquire)
             > self.total_dequeued.load(Ordering::Acquire)
         {
-            // There are pending items, help more aggressively
             self.num_threads.min(4)
         } else {
             2
@@ -1313,7 +1191,7 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         for offset in 0..help_count {
             let next_tid = (base_tid + offset) % self.num_threads;
             if next_tid == tid {
-                continue; // Don't help ourselves
+                continue;
             }
 
             let thr = self.get_record(next_tid);
@@ -1323,7 +1201,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                 let seq2 = thr.seq2.load(Ordering::Acquire);
 
                 if seq1 == seq2 {
-                    // Extra synchronization before helping
                     fence(Ordering::SeqCst);
 
                     if thr.enqueue.load(Ordering::Acquire) {
@@ -1348,7 +1225,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
 
         if enqueue && thr.seq1.load(Ordering::Acquire) == seq && thr.pending.load(Ordering::Acquire)
         {
-            // Additional synchronization before helping
             fence(Ordering::SeqCst);
 
             if queue_id == 0 {
@@ -1369,7 +1245,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             && thr.seq1.load(Ordering::Acquire) == seq
             && thr.pending.load(Ordering::Acquire)
         {
-            // Additional synchronization before helping
             fence(Ordering::SeqCst);
 
             if queue_id == 0 {
@@ -1380,7 +1255,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         }
     }
 
-    // Inner queue operations
     unsafe fn enqueue_inner_wcq(
         &self,
         wq: &InnerWCQ,
@@ -1391,7 +1265,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
     ) -> Result<(), ()> {
         self.help_threads(thread_id);
 
-        // Fast path
         let mut count = MAX_PATIENCE;
         while count > 0 {
             match self.try_enq_inner(wq, entries_offset, index) {
@@ -1399,7 +1272,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                 Err(tail) => {
                     count -= 1;
                     if count == 0 {
-                        // Slow path
                         let r = self.get_record_mut(thread_id);
                         let seq = r.seq1.load(Ordering::Acquire);
 
@@ -1433,21 +1305,16 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         thread_id: usize,
         queue_id: usize,
     ) -> Result<usize, ()> {
-        // Don't check threshold for fq
         if queue_id == 0 {
-            // CRITICAL: Use stronger synchronization for threshold check
             fence(Ordering::SeqCst);
             let threshold = wq.threshold.load(Ordering::SeqCst);
 
             if threshold < 0 {
-                // Triple-check with tail/head
                 fence(Ordering::SeqCst);
                 let head = wq.head.cnt.load(Ordering::SeqCst);
                 let tail = wq.tail.cnt.load(Ordering::SeqCst);
 
-                // If tail > head, there might be items still
                 if tail > head {
-                    // Give it more chances - items might be in transition
                     for _ in 0..100 {
                         fence(Ordering::SeqCst);
                         let new_threshold = wq.threshold.load(Ordering::SeqCst);
@@ -1472,9 +1339,8 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
 
         self.help_threads(thread_id);
 
-        // Fast path with increased retries for edge cases
         let mut count = if queue_id == 0 {
-            MAX_PATIENCE_DEQ * 4 // Even more retries for aq
+            MAX_PATIENCE_DEQ * 4
         } else {
             MAX_PATIENCE_DEQ
         };
@@ -1484,15 +1350,12 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             match self.try_deq_inner(wq, entries_offset, &mut idx) {
                 Ok(()) => {
                     if idx == usize::MAX {
-                        // Empty result - but double-check if we should retry
                         if queue_id == 0 && count > MAX_PATIENCE_DEQ {
-                            // For aq, give it more chances
                             fence(Ordering::SeqCst);
                             let head = wq.head.cnt.load(Ordering::SeqCst);
                             let tail = wq.tail.cnt.load(Ordering::SeqCst);
 
                             if tail > head {
-                                // Force help all threads
                                 for tid in 0..self.num_threads {
                                     self.help_threads(tid);
                                 }
@@ -1510,7 +1373,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                 Err(head) => {
                     count -= 1;
                     if count == 0 {
-                        // Before going to slow path, try aggressive helping
                         for _ in 0..5 {
                             for tid in 0..self.num_threads {
                                 self.help_threads(tid);
@@ -1518,7 +1380,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                             fence(Ordering::SeqCst);
                         }
 
-                        // Slow path...
                         let r = self.get_record_mut(thread_id);
                         let seq = r.seq1.load(Ordering::Acquire);
 
@@ -1536,20 +1397,17 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                         r.pending.store(false, Ordering::Release);
                         r.seq1.fetch_add(1, Ordering::AcqRel);
 
-                        // Check if we stored an index during slow path
                         let stored_index = r.index.load(Ordering::SeqCst);
                         if stored_index != usize::MAX {
                             return Ok(stored_index);
                         }
 
-                        // Get result with more thorough checking
                         fence(Ordering::SeqCst);
                         let final_head = r.local_head.load(Ordering::Acquire);
                         let h = final_head & COUNTER_MASK;
                         let j = Self::cache_remap(h as usize, wq.capacity);
                         let entry = self.get_entry(wq, entries_offset, j);
 
-                        // Multiple attempts to read
                         for read_attempt in 0..10 {
                             fence(Ordering::SeqCst);
                             let packed = entry.value.load(Ordering::SeqCst);
@@ -1570,7 +1428,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                             }
                         }
 
-                        // Check if FIN was set, indicating we should stop
                         if final_head & FIN_BIT != 0 {
                             return Err(());
                         }
@@ -1584,10 +1441,8 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         Err(())
     }
 
-    // Fixed enqueue with ready flag
     pub fn enqueue(&self, value: T, thread_id: usize) -> Result<(), ()> {
         unsafe {
-            // Get free index from fq
             match self.dequeue_inner_wcq(&self.fq, self.fq_entries_offset, thread_id, 1) {
                 Ok(index) => {
                     if index >= self.num_indices {
@@ -1597,26 +1452,18 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
 
                     let data_entry = self.get_data(index);
 
-                    // Critical: Set value and ready flag atomically
-                    // First ensure the slot is clean
                     fence(Ordering::SeqCst);
 
-                    // Store value with proper synchronization
                     *data_entry.value.get() = Some(value);
 
-                    // Compiler barrier to prevent reordering
                     std::sync::atomic::compiler_fence(Ordering::SeqCst);
 
-                    // Full memory barrier before setting ready
                     fence(Ordering::SeqCst);
 
-                    // Set ready flag - this MUST happen after value is stored
                     data_entry.ready.store(true, Ordering::SeqCst);
 
-                    // Another full barrier to ensure visibility
                     fence(Ordering::SeqCst);
 
-                    // Now enqueue the index
                     match self.enqueue_inner_wcq(
                         &self.aq,
                         self.aq_entries_offset,
@@ -1625,20 +1472,17 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                         0,
                     ) {
                         Ok(()) => {
-                            // Final fence to ensure everything is visible
                             fence(Ordering::SeqCst);
                             self.total_enqueued.fetch_add(1, Ordering::SeqCst);
                             Ok(())
                         }
                         Err(()) => {
-                            // Cleanup on failure with proper synchronization
                             fence(Ordering::SeqCst);
                             data_entry.ready.store(false, Ordering::SeqCst);
                             fence(Ordering::SeqCst);
                             *data_entry.value.get() = None;
                             fence(Ordering::SeqCst);
 
-                            // Return index to free queue
                             let mut retry = 0;
                             while self
                                 .enqueue_inner_wcq(
@@ -1686,7 +1530,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
 
                     let data_entry = self.get_data(index);
 
-                    // Wait for ready
                     let mut spin_count = 0;
                     while !data_entry.ready.load(Ordering::SeqCst) {
                         spin_count += 1;
@@ -1707,7 +1550,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                         std::hint::spin_loop();
                     }
 
-                    // Take value
                     fence(Ordering::SeqCst);
                     std::sync::atomic::compiler_fence(Ordering::SeqCst);
                     fence(Ordering::SeqCst);
@@ -1718,7 +1560,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                     data_entry.ready.store(false, Ordering::SeqCst);
                     fence(Ordering::SeqCst);
 
-                    // Return index to fq
                     self.enqueue_inner_wcq(&self.fq, self.fq_entries_offset, index, thread_id, 1)
                         .ok();
 
@@ -1748,7 +1589,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
     pub fn debug_enqueue(&self, value: T, thread_id: usize) -> Result<(), ()> {
         eprintln!("[Thread {}] DEBUG: Starting enqueue", thread_id);
 
-        // Get free index from fq
         match unsafe { self.dequeue_inner_wcq(&self.fq, self.fq_entries_offset, thread_id, 1) } {
             Ok(index) => {
                 eprintln!("[Thread {}] DEBUG: Got free index {}", thread_id, index);
@@ -1756,7 +1596,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                 unsafe {
                     let data_entry = self.get_data(index);
 
-                    // Store value
                     fence(Ordering::SeqCst);
                     *data_entry.value.get() = Some(value);
                     std::sync::atomic::compiler_fence(Ordering::SeqCst);
@@ -1769,7 +1608,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                         thread_id, index
                     );
 
-                    // Now enqueue the index
                     match self.enqueue_inner_wcq(
                         &self.aq,
                         self.aq_entries_offset,
@@ -1788,14 +1626,13 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                                 "[Thread {}] DEBUG: Failed to enqueue index {} to aq",
                                 thread_id, index
                             );
-                            // Cleanup
+
                             fence(Ordering::SeqCst);
                             data_entry.ready.store(false, Ordering::SeqCst);
                             fence(Ordering::SeqCst);
                             *data_entry.value.get() = None;
                             fence(Ordering::SeqCst);
 
-                            // Return index to fq
                             self.enqueue_inner_wcq(
                                 &self.fq,
                                 self.fq_entries_offset,
@@ -1819,16 +1656,12 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         }
     }
 
-    // Fixed dequeue with ready flag
     pub fn dequeue(&self, thread_id: usize) -> Result<T, ()> {
         unsafe {
-            // Full synchronization before starting
             fence(Ordering::SeqCst);
 
-            // Help other threads first
             self.help_threads(thread_id);
 
-            // Add synchronization before dequeue
             fence(Ordering::SeqCst);
 
             match self.dequeue_inner_wcq(&self.aq, self.aq_entries_offset, thread_id, 0) {
@@ -1840,36 +1673,30 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
 
                     let data_entry = self.get_data(index);
 
-                    // Enhanced ready wait with aggressive synchronization
                     let mut spin_count = 0;
                     let start_time = std::time::Instant::now();
 
                     while !data_entry.ready.load(Ordering::SeqCst) {
                         spin_count += 1;
 
-                        // Aggressive memory synchronization
                         if spin_count % 100 == 0 {
                             fence(Ordering::SeqCst);
                             std::sync::atomic::compiler_fence(Ordering::SeqCst);
                         }
 
-                        // Periodic strong synchronization
                         if spin_count % 1000 == 0 {
                             fence(Ordering::SeqCst);
 
-                            // Help other threads more aggressively
                             for _ in 0..self.num_threads {
                                 self.help_threads(thread_id);
                             }
 
-                            // Re-check after helping
                             fence(Ordering::SeqCst);
                             if data_entry.ready.load(Ordering::SeqCst) {
                                 break;
                             }
                         }
 
-                        // Check for timeout
                         if spin_count > 10_000_000 || start_time.elapsed() > Duration::from_secs(30)
                         {
                             eprintln!(
@@ -1879,15 +1706,12 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                                 start_time.elapsed()
                             );
 
-                            // Debug queue state
                             self.debug_state();
 
-                            // Final aggressive synchronization attempt
                             for _ in 0..10 {
                                 fence(Ordering::SeqCst);
                                 std::thread::sleep(Duration::from_millis(1));
 
-                                // Help all threads
                                 for tid in 0..self.num_threads {
                                     self.help_threads(tid);
                                 }
@@ -1900,7 +1724,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                             }
 
                             if !data_entry.ready.load(Ordering::SeqCst) {
-                                // Return index to fq
                                 self.enqueue_inner_wcq(
                                     &self.fq,
                                     self.fq_entries_offset,
@@ -1913,7 +1736,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                             }
                         }
 
-                        // Adaptive spinning
                         if spin_count < 10 {
                             std::hint::spin_loop();
                         } else if spin_count < 100 {
@@ -1929,20 +1751,16 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                         }
                     }
 
-                    // Triple fence before taking value
                     fence(Ordering::SeqCst);
                     std::sync::atomic::compiler_fence(Ordering::SeqCst);
                     fence(Ordering::SeqCst);
 
-                    // Take value atomically
                     let value = (*data_entry.value.get()).take();
 
-                    // Clear ready flag with full synchronization
                     fence(Ordering::SeqCst);
                     data_entry.ready.store(false, Ordering::SeqCst);
                     fence(Ordering::SeqCst);
 
-                    // Return index to fq with retry
                     let mut retry = 0;
                     while self
                         .enqueue_inner_wcq(&self.fq, self.fq_entries_offset, index, thread_id, 1)
@@ -1965,24 +1783,19 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                     }
                 }
                 Err(()) => {
-                    // CRITICAL: Add recovery mechanism for edge cases
                     fence(Ordering::SeqCst);
 
-                    // Check if there really are no items
                     let total_enqueued = self.total_enqueued.load(Ordering::SeqCst);
                     let total_dequeued = self.total_dequeued.load(Ordering::SeqCst);
 
                     if total_enqueued > total_dequeued {
-                        // There should be items - try harder
                         for recovery_attempt in 0..100 {
-                            // Aggressive helping
                             for tid in 0..self.num_threads {
                                 self.help_threads(tid);
                             }
 
                             fence(Ordering::SeqCst);
 
-                            // Try dequeue again
                             match self.dequeue_inner_wcq(
                                 &self.aq,
                                 self.aq_entries_offset,
@@ -1990,14 +1803,12 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                                 0,
                             ) {
                                 Ok(index) => {
-                                    // Process the item as normal
                                     if index >= self.num_indices {
                                         return Err(());
                                     }
 
                                     let data_entry = self.get_data(index);
 
-                                    // Wait for ready with timeout
                                     let mut wait_count = 0;
                                     while !data_entry.ready.load(Ordering::SeqCst)
                                         && wait_count < 1000
@@ -2007,18 +1818,15 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                                     }
 
                                     if !data_entry.ready.load(Ordering::SeqCst) {
-                                        // Skip this one, try again
                                         continue;
                                     }
 
-                                    // Take value
                                     fence(Ordering::SeqCst);
                                     let value = (*data_entry.value.get()).take();
                                     fence(Ordering::SeqCst);
                                     data_entry.ready.store(false, Ordering::SeqCst);
                                     fence(Ordering::SeqCst);
 
-                                    // Return index to fq
                                     self.enqueue_inner_wcq(
                                         &self.fq,
                                         self.fq_entries_offset,
@@ -2034,17 +1842,14 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                                             return Ok(v);
                                         }
                                         None => {
-                                            // Try again
                                             continue;
                                         }
                                     }
                                 }
                                 Err(()) => {
-                                    // Final recovery check - scan all entries directly
                                     if total_enqueued > total_dequeued && recovery_attempt == 99 {
                                         fence(Ordering::SeqCst);
 
-                                        // Try aggressive helping for all threads
                                         for _ in 0..10 {
                                             for tid in 0..self.num_threads {
                                                 self.help_threads(tid);
@@ -2053,7 +1858,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                                             std::thread::sleep(Duration::from_micros(100));
                                         }
 
-                                        // One more attempt after aggressive helping
                                         continue;
                                     }
 
@@ -2074,44 +1878,33 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
     }
 
     pub fn is_empty(&self) -> bool {
-        // Help threads to ensure pending operations complete
         for tid in 0..self.num_threads {
             unsafe {
                 self.help_threads(tid);
             }
         }
 
-        // Strong synchronization
         fence(Ordering::SeqCst);
 
-        // Method 1: Check the total counters
         let total_enqueued = self.total_enqueued.load(Ordering::Acquire);
         let total_dequeued = self.total_dequeued.load(Ordering::Acquire);
 
-        // If counters match, queue is definitely empty
         if total_enqueued == total_dequeued {
             return true;
         }
 
-        // Method 2: Check queue state (for when counters might be out of sync)
         let aq_head = self.aq.head.cnt.load(Ordering::Acquire);
         let aq_tail = self.aq.tail.cnt.load(Ordering::Acquire);
         let aq_threshold = self.aq.threshold.load(Ordering::Acquire);
 
-        // In a circular queue, when empty:
-        // 1. head should equal tail (they've caught up)
-        // 2. threshold should be negative (no pending dequeues)
         if aq_head == aq_tail && aq_threshold < 0 {
             return true;
         }
 
-        // Additional check: if we've wrapped around many times,
-        // use modular arithmetic to check
         let ring_size = self.aq.ring_size;
         let head_pos = aq_head % (ring_size as u64 * 2);
         let tail_pos = aq_tail % (ring_size as u64 * 2);
 
-        // If positions are equal and threshold is negative, queue is empty
         if head_pos == tail_pos && aq_threshold < 0 {
             return true;
         }
@@ -2120,7 +1913,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
     }
 
     pub fn is_full(&self) -> bool {
-        // Help all threads first to ensure pending operations complete
         for _ in 0..2 {
             for tid in 0..self.num_threads {
                 unsafe {
@@ -2131,19 +1923,14 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
 
         fence(Ordering::SeqCst);
 
-        // Check if free queue is empty
         let fq_head = self.fq.head.cnt.load(Ordering::Acquire);
         let fq_tail = self.fq.tail.cnt.load(Ordering::Acquire);
         let fq_threshold = self.fq.threshold.load(Ordering::Acquire);
 
-        // Also check how many items are in use
         let total_enqueued = self.total_enqueued.load(Ordering::Acquire);
         let total_dequeued = self.total_dequeued.load(Ordering::Acquire);
         let items_in_use = total_enqueued.saturating_sub(total_dequeued);
 
-        // Queue is full if:
-        // 1. Free queue has no available indices (head >= tail AND threshold < 0)
-        // 2. OR we've used all available slots
         (fq_head >= fq_tail && fq_threshold < 0) || items_in_use >= self.num_indices
     }
 
@@ -2152,13 +1939,11 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         let mut consecutive_empty = 0;
         const MAX_EMPTY_ATTEMPTS: usize = 100_000;
 
-        // Get initial state
         let initial_enqueued = self.total_enqueued.load(Ordering::SeqCst);
         let initial_dequeued = self.total_dequeued.load(Ordering::SeqCst);
         let expected_items = initial_enqueued.saturating_sub(initial_dequeued);
 
         loop {
-            // Aggressive helping
             for _ in 0..self.num_threads {
                 unsafe {
                     self.help_threads(thread_id);
@@ -2170,7 +1955,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                     items.push(item);
                     consecutive_empty = 0;
 
-                    // Check if we've gotten everything
                     if items.len() >= expected_items {
                         break;
                     }
@@ -2178,33 +1962,27 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                 Err(_) => {
                     consecutive_empty += 1;
 
-                    // Periodic aggressive synchronization
                     if consecutive_empty % 1000 == 0 {
                         fence(Ordering::SeqCst);
 
-                        // Help all threads again
                         for tid in 0..self.num_threads {
                             unsafe {
                                 self.help_threads(tid);
                             }
                         }
 
-                        // Re-check counters
                         let current_enqueued = self.total_enqueued.load(Ordering::SeqCst);
                         let current_dequeued = self.total_dequeued.load(Ordering::SeqCst);
 
                         if current_dequeued + items.len() >= current_enqueued {
-                            // We've gotten everything
                             break;
                         }
                     }
 
-                    // Check if we should stop
                     if consecutive_empty > MAX_EMPTY_ATTEMPTS {
                         break;
                     }
 
-                    // Backoff
                     if consecutive_empty < 100 {
                         std::hint::spin_loop();
                     } else if consecutive_empty < 1000 {
@@ -2226,17 +2004,14 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         let mut empty_rounds = 0;
 
         while items.len() < max_items && empty_rounds < 10 {
-            // Force complete synchronization
             fence(Ordering::SeqCst);
 
-            // Help all threads aggressively
             for _ in 0..self.num_threads {
                 unsafe {
                     self.help_threads(thread_id);
                 }
             }
 
-            // Try to dequeue
             let mut found_item = false;
             for _ in 0..100 {
                 match self.pop(thread_id) {
@@ -2255,17 +2030,14 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             if !found_item {
                 empty_rounds += 1;
 
-                // Aggressive synchronization between rounds
                 fence(Ordering::SeqCst);
                 std::thread::sleep(Duration::from_micros(100));
                 fence(Ordering::SeqCst);
 
-                // Check if there are still items
                 let total_enqueued = self.total_enqueued.load(Ordering::SeqCst);
                 let total_dequeued = self.total_dequeued.load(Ordering::SeqCst);
 
                 if total_enqueued == total_dequeued + items.len() {
-                    // We've gotten everything
                     break;
                 }
             }
@@ -2274,7 +2046,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         items
     }
 
-    // Memory layout
     fn layout(num_threads: usize, num_indices: usize) -> (Layout, [usize; 4]) {
         let ring_size = num_indices.next_power_of_two();
         let capacity = ring_size * 2;
@@ -2330,7 +2101,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
 
         let queue = &mut *self_ptr;
 
-        // Initialize aq entries with proper empty state
         let aq_entries = mem.add(offsets[0]) as *mut EntryPair;
         for i in 0..queue.aq.capacity {
             let entry_pair = EntryPair {
@@ -2345,7 +2115,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             ptr::write(aq_entries.add(i), entry_pair);
         }
 
-        // Initialize fq entries
         let fq_entries = mem.add(offsets[1]) as *mut EntryPair;
         for i in 0..queue.fq.capacity {
             let entry_pair = EntryPair {
@@ -2360,7 +2129,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             ptr::write(fq_entries.add(i), entry_pair);
         }
 
-        // Pre-populate fq with all indices
         for i in 0..num_indices {
             let tail_pos = (queue.fq.capacity + i) as u64;
             let j = Self::cache_remap(tail_pos as usize, queue.fq.capacity);
@@ -2376,7 +2144,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                 .store(EntryPair::pack_entry(e), Ordering::Release);
         }
 
-        // Initialize queue pointers - fq starts with all indices
         queue
             .fq
             .head
@@ -2388,13 +2155,11 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             .cnt
             .store((queue.fq.capacity + num_indices) as u64, Ordering::Release);
 
-        // Set fq threshold to indicate it has items
         queue
             .fq
             .threshold
             .store(3 * ring_size as i32 - 1, Ordering::Release);
 
-        // Initialize thread records
         let records = mem.add(offsets[2]) as *mut ThreadRecord;
         for i in 0..num_threads {
             ptr::write(records.add(i), ThreadRecord::new());
@@ -2402,7 +2167,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             record.next_tid.store(i, Ordering::Release);
         }
 
-        // Initialize data storage
         let data = mem.add(offsets[3]) as *mut DataEntry<T>;
         for i in 0..num_indices {
             ptr::write(data.add(i), DataEntry::new());
@@ -2435,7 +2199,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
     }
 }
 
-// Implement MpmcQueue trait
 impl<T: Send + Clone + 'static> MpmcQueue<T> for WCQueue<T> {
     type PushError = ();
     type PopError = ();

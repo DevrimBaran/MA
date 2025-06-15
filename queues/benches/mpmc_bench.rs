@@ -1011,7 +1011,12 @@ where
 
                 for i in 0..items_per_process {
                     let item_value = producer_id * items_per_process + i;
+                    let mut attempts = 0;
                     while q.push(item_value, producer_id).is_err() {
+                        attempts += 1;
+                        if attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS {
+                            panic!("Producer {} failed to push", producer_id);
+                        }
                         std::hint::spin_loop();
                     }
                 }
@@ -1035,7 +1040,7 @@ where
         }
     }
 
-    // Fork consumers - WCQ specific logic
+    // Fork consumers with proper timeout
     for consumer_id in 0..num_consumers {
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
@@ -1054,69 +1059,76 @@ where
                 };
                 let my_target = target_items + extra_items;
 
-                // Main consumption loop
+                let mut consecutive_empty = 0;
+                let mut total_attempts = 0;
+                let start_time = std::time::Instant::now();
+
+                // Timeout based on expected workload
+                let timeout_duration = std::time::Duration::from_secs(30);
+
                 while consumed_count < my_target {
+                    // Check timeout
+                    if start_time.elapsed() > timeout_duration {
+                        break; // Exit gracefully
+                    }
+
+                    total_attempts += 1;
+
                     match q.pop(consumer_id) {
-                        Ok(_item) => {
+                        Ok(_) => {
                             consumed_count += 1;
+                            consecutive_empty = 0;
                         }
                         Err(_) => {
-                            // Check if producers are done
-                            if done_sync.producers_done.load(Ordering::Acquire)
-                                == num_producers as u32
-                            {
-                                // Producers done - try harder to get remaining items
-                                let mut empty_checks = 0;
-                                const MAX_EMPTY_CHECKS: usize = 1000;
+                            consecutive_empty += 1;
 
-                                while consumed_count < my_target && empty_checks < MAX_EMPTY_CHECKS
-                                {
-                                    // Try to dequeue
-                                    match q.pop(consumer_id) {
-                                        Ok(_item) => {
+                            // Check if producers are done and we've waited enough
+                            if consecutive_empty > 10_000 {
+                                let producers_done =
+                                    done_sync.producers_done.load(Ordering::Acquire)
+                                        == num_producers as u32;
+
+                                if producers_done && consecutive_empty > 50_000 {
+                                    // Do a final burst attempt
+                                    let mut final_attempts = 0;
+                                    while final_attempts < 10_000 && consumed_count < my_target {
+                                        if let Ok(_) = q.pop(consumer_id) {
                                             consumed_count += 1;
-                                            empty_checks = 0; // Reset on success
-                                        }
-                                        Err(_) => {
-                                            empty_checks += 1;
-
-                                            // Progressive backoff
-                                            if empty_checks < 10 {
-                                                std::hint::spin_loop();
-                                            } else if empty_checks < 100 {
+                                            final_attempts = 0;
+                                        } else {
+                                            final_attempts += 1;
+                                            if final_attempts % 100 == 0 {
                                                 std::thread::yield_now();
-                                            } else {
-                                                std::thread::sleep(
-                                                    std::time::Duration::from_micros(10),
-                                                );
                                             }
                                         }
                                     }
-                                }
 
-                                // Final aggressive attempt
-                                if consumed_count < my_target {
-                                    for _ in 0..1000 {
-                                        if let Ok(_item) = q.pop(consumer_id) {
-                                            consumed_count += 1;
-                                            if consumed_count >= my_target {
-                                                break;
-                                            }
-                                        }
-                                        std::thread::yield_now();
+                                    // Exit if we can't get more items
+                                    if consumed_count < my_target {
+                                        break;
                                     }
                                 }
+                            }
 
-                                break; // Exit main loop
-                            } else {
-                                // Producers not done yet
+                            // Adaptive backoff
+                            if consecutive_empty < 100 {
                                 std::hint::spin_loop();
+                            } else if consecutive_empty < 1000 {
+                                std::thread::yield_now();
+                            } else if consecutive_empty < 10_000 {
+                                std::thread::sleep(std::time::Duration::from_micros(1));
+                            } else {
+                                std::thread::sleep(std::time::Duration::from_micros(10));
+
+                                // Prevent counter overflow
+                                if consecutive_empty > 1_000_000 {
+                                    consecutive_empty = 10_000;
+                                }
                             }
                         }
                     }
                 }
 
-                // Report what we consumed
                 done_sync
                     .total_consumed
                     .fetch_add(consumed_count, Ordering::AcqRel);
@@ -1151,25 +1163,50 @@ where
     let start_time = std::time::Instant::now();
     startup_sync.go_signal.store(true, Ordering::Release);
 
-    // Wait for all processes
+    // Wait for all processes with timeout
     for pid in producer_pids {
         waitpid(pid, None).expect("waitpid for producer failed");
     }
 
+    // Set a maximum wait time for consumers
+    let consumer_timeout = std::time::Duration::from_secs(60);
+    let consumer_start = std::time::Instant::now();
+
     for pid in consumer_pids {
-        waitpid(pid, None).expect("waitpid for consumer failed");
+        // Use waitpid with WNOHANG in a loop to implement timeout
+        loop {
+            match waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+                Ok(nix::sys::wait::WaitStatus::StillAlive) => {
+                    if consumer_start.elapsed() > consumer_timeout {
+                        // Force kill the consumer
+                        unsafe {
+                            libc::kill(pid.as_raw(), libc::SIGKILL);
+                        }
+                        waitpid(pid, None).ok();
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                _ => break,
+            }
+        }
     }
 
     let duration = start_time.elapsed();
 
-    // Get the total consumed count
+    // Report results
     let total_consumed = done_sync.total_consumed.load(Ordering::Acquire);
-
     if total_consumed != total_items {
-        eprintln!(
-            "Warning (WCQ): Total consumed {}/{} items. Prods: {}, Cons: {}",
-            total_consumed, total_items, num_producers, num_consumers
-        );
+        let loss = total_items.saturating_sub(total_consumed);
+        let loss_rate = loss as f64 / total_items as f64 * 100.0;
+
+        // Only print warning if loss is significant
+        if loss > 0 {
+            eprintln!(
+                "Warning (WCQ): Total consumed {}/{} items ({} lost, {:.2}%). Prods: {}, Cons: {}",
+                total_consumed, total_items, loss, loss_rate, num_producers, num_consumers
+            );
+        }
     }
 
     unsafe {

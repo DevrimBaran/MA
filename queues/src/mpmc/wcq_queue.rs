@@ -237,7 +237,7 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         (val / ring_size as u64) as u32
     }
 
-    // Fast path operations
+    // Fast path operations - keep original but add fence only where needed
     unsafe fn try_enq_inner(
         &self,
         wq: &InnerWCQ,
@@ -265,7 +265,11 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             entry
                 .value
                 .store(EntryPair::pack_entry(new_entry), Ordering::Release);
-            fence(Ordering::SeqCst); // Ensure visibility
+
+            // Add fence only for aq operations to ensure data visibility
+            if entries_offset == self.aq_entries_offset {
+                fence(Ordering::SeqCst);
+            }
 
             if wq.threshold.load(Ordering::Acquire) != (3 * wq.ring_size as i32 - 1) {
                 wq.threshold
@@ -292,6 +296,11 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         let e = EntryPair::unpack_entry(packed);
 
         if e.cycle == Self::cycle(head, wq.ring_size) {
+            // Add fence before consuming for aq
+            if entries_offset == self.aq_entries_offset {
+                fence(Ordering::SeqCst);
+            }
+
             self.consume_inner(wq, entries_offset, head, j, &e);
             *index_out = e.index;
             return Ok(());
@@ -366,8 +375,10 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             .value
             .store(EntryPair::pack_entry(e_mut), Ordering::Release);
 
-        // Strong fence to ensure visibility
-        fence(Ordering::SeqCst);
+        // Strong fence only for aq to ensure index is consumed
+        if entries_offset == self.aq_entries_offset {
+            fence(Ordering::SeqCst);
+        }
     }
 
     unsafe fn finalize_request_inner(&self, h: u64) {
@@ -925,7 +936,7 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         Err(())
     }
 
-    // Public interface with indirection
+    // Public interface with indirection - targeted synchronization
     pub fn enqueue(&self, value: T, thread_id: usize) -> Result<(), ()> {
         unsafe {
             // Get free index from fq
@@ -935,10 +946,10 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                         return Err(());
                     }
 
-                    // Store value with strong ordering
+                    // Store value with fence to ensure visibility
                     let data_cell = self.get_data(index);
                     *data_cell.get() = Some(value);
-                    fence(Ordering::SeqCst);
+                    fence(Ordering::Release); // Ensure value is visible before index
 
                     // Enqueue index to aq
                     match self.enqueue_inner_wcq(
@@ -948,14 +959,10 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                         thread_id,
                         0,
                     ) {
-                        Ok(()) => {
-                            fence(Ordering::SeqCst);
-                            Ok(())
-                        }
+                        Ok(()) => Ok(()),
                         Err(()) => {
                             // Return index to fq on failure
                             *data_cell.get() = None;
-                            fence(Ordering::SeqCst);
                             self.enqueue_inner_wcq(
                                 &self.fq,
                                 self.fq_entries_offset,
@@ -978,14 +985,13 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             // Dequeue index from aq
             match self.dequeue_inner_wcq(&self.aq, self.aq_entries_offset, thread_id, 0) {
                 Ok(index) => {
-                    fence(Ordering::SeqCst);
+                    fence(Ordering::Acquire); // Ensure we see the latest value
 
-                    // Get value with strong ordering
+                    // Get value
                     let data_cell = self.get_data(index);
                     let value = (*data_cell.get()).take();
-                    fence(Ordering::SeqCst);
 
-                    // Return index to fq
+                    // Return index to fq before returning value
                     self.enqueue_inner_wcq(&self.fq, self.fq_entries_offset, index, thread_id, 1)
                         .ok();
 

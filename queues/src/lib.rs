@@ -25,6 +25,7 @@ pub use mpmc::BurdenWFQueue;
 pub use mpmc::JKMQueue;
 pub use mpmc::KWQueue;
 pub use mpmc::NRQueue;
+pub use mpmc::WCQueue;
 pub use mpmc::WFQueue;
 pub use mpmc::YangCrummeyQueue;
 

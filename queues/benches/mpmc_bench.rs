@@ -5,7 +5,7 @@ use nix::{
     unistd::{fork, ForkResult},
 };
 use queues::mpmc::{self, polylog_queue, ymc_queue};
-use queues::mpmc::{BurdenWFQueue, JKMQueue, KWQueue, NRQueue, WFQueue, YangCrummeyQueue};
+use queues::mpmc::{BurdenWFQueue, JKMQueue, KWQueue, NRQueue, WCQueue, WFQueue, YangCrummeyQueue};
 use queues::MpmcQueue;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -141,6 +141,24 @@ impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for JKMQueue<T> {
 
     fn bench_pop(&self, process_id: usize) -> Result<T, ()> {
         self.dequeue(process_id)
+    }
+
+    fn bench_is_empty(&self) -> bool {
+        self.is_empty()
+    }
+
+    fn bench_is_full(&self) -> bool {
+        self.is_full()
+    }
+}
+
+impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for WCQueue<T> {
+    fn bench_push(&self, item: T, process_id: usize) -> Result<(), ()> {
+        self.push(item, process_id)
+    }
+
+    fn bench_pop(&self, process_id: usize) -> Result<T, ()> {
+        self.pop(process_id)
     }
 
     fn bench_is_empty(&self) -> bool {
@@ -923,6 +941,37 @@ fn bench_jkm_queue(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_wcq_queue(c: &mut Criterion) {
+    let mut group = c.benchmark_group("WCQueueMPMC");
+
+    for &(num_prods, num_cons) in PROCESS_COUNTS_TO_TEST {
+        let items_per_process = ITEMS_PER_PROCESS_TARGET;
+        let total_processes = num_prods + num_cons;
+
+        group.bench_function(
+            format!("{}P_{}C", num_prods, num_cons),
+            |b: &mut Bencher| {
+                b.iter_custom(|_iters| {
+                    fork_and_run_mpmc_with_helper::<WCQueue<usize>, _>(
+                        || {
+                            let bytes = WCQueue::<usize>::shared_size(total_processes);
+                            let shm_ptr = unsafe { map_shared(bytes) };
+                            let q = unsafe { WCQueue::init_in_shared(shm_ptr, total_processes) };
+                            (q, shm_ptr, bytes)
+                        },
+                        num_prods,
+                        num_cons,
+                        items_per_process,
+                        false,
+                    )
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(5))
@@ -934,6 +983,7 @@ criterion_group! {
     name = benches;
     config = custom_criterion();
     targets =
+        bench_wcq_queue,
         bench_wf_queue,
         bench_yang_crummey,
         bench_kw_queue,

@@ -152,13 +152,13 @@ impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for JKMQueue<T> {
     }
 }
 
-impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for WCQueue<T> {
-    fn bench_push(&self, item: T, process_id: usize) -> Result<(), ()> {
-        self.push(item, process_id)
+impl<T: Send + Clone + 'static> crate::BenchMpmcQueue<T> for WCQueue<T> {
+    fn bench_push(&self, item: T, producer_id: usize) -> Result<(), ()> {
+        self.push(item, producer_id)
     }
 
-    fn bench_pop(&self, process_id: usize) -> Result<T, ()> {
-        self.pop(process_id)
+    fn bench_pop(&self, consumer_id: usize) -> Result<T, ()> {
+        self.pop(consumer_id)
     }
 
     fn bench_is_empty(&self) -> bool {

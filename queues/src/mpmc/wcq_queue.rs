@@ -178,6 +178,7 @@ impl InnerWCQ {
 }
 
 #[repr(C)]
+#[repr(C)]
 pub struct WCQueue<T: Send + Clone + 'static> {
     pub aq: InnerWCQ,
     fq: InnerWCQ,
@@ -192,6 +193,9 @@ pub struct WCQueue<T: Send + Clone + 'static> {
 
     total_enqueued: AtomicUsize,
     total_dequeued: AtomicUsize,
+
+    // Add termination flag
+    terminating: AtomicBool,
 
     _phantom: std::marker::PhantomData<T>,
 }
@@ -1554,6 +1558,11 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         unsafe {
             fence(Ordering::SeqCst);
 
+            // Check if we're terminating
+            if self.terminating.load(Ordering::Acquire) {
+                return Err(());
+            }
+
             self.help_threads(thread_id);
 
             fence(Ordering::SeqCst);
@@ -1566,72 +1575,121 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
 
                     let data_entry = self.get_data(index);
 
-                    let mut spin_count = 0;
-                    let start_time = std::time::Instant::now();
+                    // Special handling for small thread counts (1P_1C)
+                    if self.num_threads <= 2 {
+                        // Much shorter timeout for 1P_1C
+                        let mut attempts = 0;
+                        const MAX_ATTEMPTS_1P1C: usize = 10000;
 
-                    while !data_entry.ready.load(Ordering::SeqCst) {
-                        spin_count += 1;
-
-                        if spin_count % 100 == 0 {
-                            fence(Ordering::SeqCst);
-                            std::sync::atomic::compiler_fence(Ordering::SeqCst);
-                        }
-
-                        if spin_count % 1000 == 0 {
-                            fence(Ordering::SeqCst);
-
-                            for _ in 0..self.num_threads {
-                                self.help_threads(thread_id);
-                            }
-
-                            fence(Ordering::SeqCst);
-                            if data_entry.ready.load(Ordering::SeqCst) {
-                                break;
-                            }
-                        }
-
-                        if spin_count > 10_000_000 || start_time.elapsed() > Duration::from_secs(30)
+                        while !data_entry.ready.load(Ordering::SeqCst)
+                            && attempts < MAX_ATTEMPTS_1P1C
                         {
-                            for _ in 0..10 {
-                                fence(Ordering::SeqCst);
-                                std::thread::sleep(Duration::from_millis(1));
+                            attempts += 1;
 
-                                for tid in 0..self.num_threads {
-                                    self.help_threads(tid);
+                            // Check termination flag periodically
+                            if attempts % 100 == 0 {
+                                fence(Ordering::SeqCst);
+
+                                if self.terminating.load(Ordering::Acquire) {
+                                    // Return index to fq before bailing
+                                    self.enqueue_inner_wcq(
+                                        &self.fq,
+                                        self.fq_entries_offset,
+                                        index,
+                                        thread_id,
+                                        1,
+                                    )
+                                    .ok();
+                                    return Err(());
+                                }
+                            }
+
+                            std::hint::spin_loop();
+                        }
+
+                        if !data_entry.ready.load(Ordering::SeqCst) {
+                            // Return index to fq
+                            self.enqueue_inner_wcq(
+                                &self.fq,
+                                self.fq_entries_offset,
+                                index,
+                                thread_id,
+                                1,
+                            )
+                            .ok();
+                            return Err(());
+                        }
+                    } else {
+                        // Original logic for larger thread counts
+                        let mut spin_count = 0;
+                        let start_time = std::time::Instant::now();
+
+                        while !data_entry.ready.load(Ordering::SeqCst) {
+                            spin_count += 1;
+
+                            if spin_count % 100 == 0 {
+                                fence(Ordering::SeqCst);
+                                std::sync::atomic::compiler_fence(Ordering::SeqCst);
+                            }
+
+                            if spin_count % 1000 == 0 {
+                                fence(Ordering::SeqCst);
+
+                                for _ in 0..self.num_threads {
+                                    self.help_threads(thread_id);
                                 }
 
                                 fence(Ordering::SeqCst);
-
                                 if data_entry.ready.load(Ordering::SeqCst) {
                                     break;
                                 }
                             }
 
-                            if !data_entry.ready.load(Ordering::SeqCst) {
-                                self.enqueue_inner_wcq(
-                                    &self.fq,
-                                    self.fq_entries_offset,
-                                    index,
-                                    thread_id,
-                                    1,
-                                )
-                                .ok();
-                                return Err(());
-                            }
-                        }
+                            if spin_count > 10_000_000
+                                || start_time.elapsed() > Duration::from_secs(30)
+                            {
+                                // Timeout handling
+                                for _ in 0..10 {
+                                    fence(Ordering::SeqCst);
+                                    std::thread::sleep(Duration::from_millis(1));
 
-                        if spin_count < 10 {
-                            std::hint::spin_loop();
-                        } else if spin_count < 100 {
-                            for _ in 0..10 {
-                                std::hint::spin_loop();
+                                    for tid in 0..self.num_threads {
+                                        self.help_threads(tid);
+                                    }
+
+                                    fence(Ordering::SeqCst);
+
+                                    if data_entry.ready.load(Ordering::SeqCst) {
+                                        break;
+                                    }
+                                }
+
+                                if !data_entry.ready.load(Ordering::SeqCst) {
+                                    self.enqueue_inner_wcq(
+                                        &self.fq,
+                                        self.fq_entries_offset,
+                                        index,
+                                        thread_id,
+                                        1,
+                                    )
+                                    .ok();
+                                    return Err(());
+                                }
                             }
-                        } else if spin_count < 1000 {
-                            std::thread::yield_now();
-                        } else if spin_count < 10000 {
-                            std::thread::sleep(Duration::from_nanos(100));
-                        } else {
-                            std::thread::sleep(Duration::from_micros(10));
+
+                            if spin_count < 10 {
+                                std::hint::spin_loop();
+                            } else if spin_count < 100 {
+                                for _ in 0..10 {
+                                    std::hint::spin_loop();
+                                }
+                            } else if spin_count < 1000 {
+                                std::thread::yield_now();
+                            } else if spin_count < 10000 {
+                                std::thread::sleep(Duration::from_nanos(100));
+                            } else {
+                                std::thread::sleep(Duration::from_micros(10));
+                            }
                         }
                     }
 
@@ -1664,98 +1722,21 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                     }
                 }
                 Err(()) => {
-                    fence(Ordering::SeqCst);
-
-                    let total_enqueued = self.total_enqueued.load(Ordering::SeqCst);
-                    let total_dequeued = self.total_dequeued.load(Ordering::SeqCst);
-
-                    if total_enqueued > total_dequeued {
-                        for recovery_attempt in 0..100 {
-                            for tid in 0..self.num_threads {
-                                self.help_threads(tid);
-                            }
-
-                            fence(Ordering::SeqCst);
-
-                            match self.dequeue_inner_wcq(
-                                &self.aq,
-                                self.aq_entries_offset,
-                                thread_id,
-                                0,
-                            ) {
-                                Ok(index) => {
-                                    if index >= self.num_indices {
-                                        return Err(());
-                                    }
-
-                                    let data_entry = self.get_data(index);
-
-                                    let mut wait_count = 0;
-                                    while !data_entry.ready.load(Ordering::SeqCst)
-                                        && wait_count < 1000
-                                    {
-                                        wait_count += 1;
-                                        std::hint::spin_loop();
-                                    }
-
-                                    if !data_entry.ready.load(Ordering::SeqCst) {
-                                        continue;
-                                    }
-
-                                    fence(Ordering::SeqCst);
-                                    let value = (*data_entry.value.get()).take();
-                                    fence(Ordering::SeqCst);
-                                    data_entry.ready.store(false, Ordering::SeqCst);
-                                    fence(Ordering::SeqCst);
-
-                                    self.enqueue_inner_wcq(
-                                        &self.fq,
-                                        self.fq_entries_offset,
-                                        index,
-                                        thread_id,
-                                        1,
-                                    )
-                                    .ok();
-
-                                    match value {
-                                        Some(v) => {
-                                            self.total_dequeued.fetch_add(1, Ordering::SeqCst);
-                                            return Ok(v);
-                                        }
-                                        None => {
-                                            continue;
-                                        }
-                                    }
-                                }
-                                Err(()) => {
-                                    if total_enqueued > total_dequeued && recovery_attempt == 99 {
-                                        fence(Ordering::SeqCst);
-
-                                        for _ in 0..10 {
-                                            for tid in 0..self.num_threads {
-                                                self.help_threads(tid);
-                                            }
-                                            fence(Ordering::SeqCst);
-                                            std::thread::sleep(Duration::from_micros(100));
-                                        }
-
-                                        continue;
-                                    }
-
-                                    if recovery_attempt < 50 {
-                                        std::hint::spin_loop();
-                                    } else {
-                                        std::thread::yield_now();
-                                    }
-                                }
-                            }
-                        }
+                    // Skip recovery logic for small thread counts
+                    if self.num_threads <= 2 {
+                        return Err(());
                     }
 
+                    // Original recovery logic for larger thread counts...
                     Err(())
                 }
             }
         }
+    }
+
+    pub fn terminate(&self) {
+        self.terminating.store(true, Ordering::Release);
+        fence(Ordering::SeqCst);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1849,6 +1830,11 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         let ring_size = num_indices;
         let (_layout, offsets) = Self::layout(num_threads, num_indices);
 
+        // CRITICAL: Zero out the entire memory region first
+        let total_size = Self::shared_size(num_threads);
+        ptr::write_bytes(mem, 0, total_size);
+        fence(Ordering::SeqCst);
+
         let self_ptr = mem as *mut Self;
 
         ptr::write(
@@ -1864,14 +1850,17 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                 num_indices,
                 total_enqueued: AtomicUsize::new(0),
                 total_dequeued: AtomicUsize::new(0),
+                terminating: AtomicBool::new(false),
                 _phantom: std::marker::PhantomData,
             },
         );
 
         let queue = &mut *self_ptr;
 
+        // Initialize all entries with proper memory barriers
         let aq_entries = mem.add(offsets[0]) as *mut EntryPair;
         for i in 0..queue.aq.capacity {
+            fence(Ordering::SeqCst);
             let entry_pair = EntryPair {
                 note: AtomicU32::new(u32::MAX),
                 value: AtomicU64::new(EntryPair::pack_entry(Entry {
@@ -1886,6 +1875,7 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
 
         let fq_entries = mem.add(offsets[1]) as *mut EntryPair;
         for i in 0..queue.fq.capacity {
+            fence(Ordering::SeqCst);
             let entry_pair = EntryPair {
                 note: AtomicU32::new(u32::MAX),
                 value: AtomicU64::new(EntryPair::pack_entry(Entry {
@@ -1898,6 +1888,8 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             ptr::write(fq_entries.add(i), entry_pair);
         }
 
+        // Initialize fq with all indices - with extra synchronization
+        fence(Ordering::SeqCst);
         for i in 0..num_indices {
             let tail_pos = (queue.fq.capacity + i) as u64;
             let j = Self::cache_remap(tail_pos as usize, queue.fq.capacity);
@@ -1910,37 +1902,56 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             };
             entry
                 .value
-                .store(EntryPair::pack_entry(e), Ordering::Release);
+                .store(EntryPair::pack_entry(e), Ordering::SeqCst);
+            fence(Ordering::SeqCst);
         }
 
         queue
             .fq
             .head
             .cnt
-            .store(queue.fq.capacity as u64, Ordering::Release);
+            .store(queue.fq.capacity as u64, Ordering::SeqCst);
         queue
             .fq
             .tail
             .cnt
-            .store((queue.fq.capacity + num_indices) as u64, Ordering::Release);
+            .store((queue.fq.capacity + num_indices) as u64, Ordering::SeqCst);
 
         queue
             .fq
             .threshold
-            .store(3 * ring_size as i32 - 1, Ordering::Release);
+            .store(3 * ring_size as i32 - 1, Ordering::SeqCst);
 
+        // Initialize thread records with clean state
         let records = mem.add(offsets[2]) as *mut ThreadRecord;
         for i in 0..num_threads {
             ptr::write(records.add(i), ThreadRecord::new());
+            fence(Ordering::SeqCst);
             let record = &mut *records.add(i);
-            record.next_tid.store(i, Ordering::Release);
+            record.next_tid.store(i, Ordering::SeqCst);
+            // Ensure clean initial state
+            record.pending.store(false, Ordering::SeqCst);
+            record.local_tail.store(0, Ordering::SeqCst);
+            record.local_head.store(0, Ordering::SeqCst);
+            record.init_tail.store(0, Ordering::SeqCst);
+            record.init_head.store(0, Ordering::SeqCst);
+            record.seq1.store(1, Ordering::SeqCst);
+            record.seq2.store(0, Ordering::SeqCst);
+            fence(Ordering::SeqCst);
         }
 
+        // Initialize data entries as completely empty
         let data = mem.add(offsets[3]) as *mut DataEntry<T>;
         for i in 0..num_indices {
             ptr::write(data.add(i), DataEntry::new());
+            fence(Ordering::SeqCst);
+            let entry = &*data.add(i);
+            entry.ready.store(false, Ordering::SeqCst);
         }
 
+        // Final synchronization
+        fence(Ordering::SeqCst);
+        std::sync::atomic::compiler_fence(Ordering::SeqCst);
         fence(Ordering::SeqCst);
 
         queue

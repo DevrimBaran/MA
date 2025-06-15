@@ -597,3 +597,382 @@ mod wcq_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod wcq_stress_tests {
+    use queues::mpmc::WCQueue;
+    use queues::MpmcQueue;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn test_slow_path_synchronization() {
+        // Test specifically targets slow path synchronization
+        const THREADS: usize = 4;
+        const ITEMS_PER_THREAD: usize = 25;
+
+        unsafe {
+            let mem = map_shared(WCQueue::<usize>::shared_size(THREADS));
+            let queue = Arc::new(WCQueue::init_in_shared(mem, THREADS));
+            let barrier = Arc::new(Barrier::new(THREADS));
+
+            let mut handles = vec![];
+
+            for tid in 0..THREADS {
+                let queue_clone = queue.clone();
+                let barrier_clone = barrier.clone();
+
+                let handle = thread::spawn(move || {
+                    // Synchronize all threads to increase contention
+                    barrier_clone.wait();
+
+                    // Everyone tries to enqueue at once
+                    for i in 0..ITEMS_PER_THREAD {
+                        let value = tid * 1000 + i;
+                        let mut attempts = 0;
+                        while queue_clone.push(value, tid).is_err() {
+                            attempts += 1;
+                            if attempts > 1_000_000 {
+                                panic!("Thread {} failed to enqueue item {}", tid, i);
+                            }
+                            thread::yield_now();
+                        }
+                    }
+                });
+                handles.push(handle);
+            }
+
+            // Wait for all enqueuers
+            for handle in handles {
+                handle.join().unwrap();
+            }
+
+            // Now dequeue everything with a single thread
+            let mut dequeued = Vec::new();
+            let mut empty_count = 0;
+
+            while dequeued.len() < THREADS * ITEMS_PER_THREAD {
+                match queue.pop(0) {
+                    Ok(val) => {
+                        dequeued.push(val);
+                        empty_count = 0;
+                    }
+                    Err(_) => {
+                        empty_count += 1;
+                        if empty_count > 1_000_000 {
+                            break;
+                        }
+                        thread::yield_now();
+                    }
+                }
+            }
+
+            assert_eq!(
+                dequeued.len(),
+                THREADS * ITEMS_PER_THREAD,
+                "Lost {} items in slow path test",
+                THREADS * ITEMS_PER_THREAD - dequeued.len()
+            );
+
+            unmap_shared(mem, WCQueue::<usize>::shared_size(THREADS));
+        }
+    }
+
+    #[test]
+    fn test_helping_mechanism() {
+        // Test the helping mechanism specifically
+        const THREADS: usize = 8;
+
+        unsafe {
+            let mem = map_shared(WCQueue::<usize>::shared_size(THREADS));
+            let queue = Arc::new(WCQueue::init_in_shared(mem, THREADS));
+            let stuck_flag = Arc::new(AtomicBool::new(false));
+            let helped_count = Arc::new(AtomicUsize::new(0));
+
+            // Thread 0 will get "stuck" after enqueueing one item
+            let queue_clone = queue.clone();
+            let stuck_flag_clone = stuck_flag.clone();
+            let helped_count_clone = helped_count.clone();
+
+            let stuck_thread = thread::spawn(move || {
+                // Enqueue one item successfully
+                queue_clone.push(999, 0).unwrap();
+
+                // Signal that we're "stuck"
+                stuck_flag_clone.store(true, Ordering::Release);
+
+                // Wait to be helped
+                let start = Instant::now();
+                while helped_count_clone.load(Ordering::Acquire) < 3 {
+                    if start.elapsed() > Duration::from_secs(5) {
+                        panic!("Helping mechanism failed - timeout");
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            });
+
+            // Other threads should help
+            let mut helpers = vec![];
+            for tid in 1..4 {
+                let queue_clone = queue.clone();
+                let stuck_flag_clone = stuck_flag.clone();
+                let helped_count_clone = helped_count.clone();
+
+                let helper = thread::spawn(move || {
+                    // Wait for thread 0 to get stuck
+                    while !stuck_flag_clone.load(Ordering::Acquire) {
+                        thread::yield_now();
+                    }
+
+                    // Try operations which should trigger helping
+                    for i in 0..10 {
+                        queue_clone.push(tid * 100 + i, tid).unwrap();
+                        queue_clone.pop(tid).ok();
+                    }
+
+                    helped_count_clone.fetch_add(1, Ordering::Release);
+                });
+                helpers.push(helper);
+            }
+
+            stuck_thread.join().unwrap();
+            for helper in helpers {
+                helper.join().unwrap();
+            }
+
+            unmap_shared(mem, WCQueue::<usize>::shared_size(THREADS));
+        }
+    }
+
+    #[test]
+    fn test_threshold_edge_case() {
+        // Test behavior around threshold boundaries
+        const THREADS: usize = 2;
+
+        unsafe {
+            let mem = map_shared(WCQueue::<usize>::shared_size(THREADS));
+            let queue = Arc::new(WCQueue::init_in_shared(mem, THREADS));
+
+            // Fill queue to near capacity
+            let mut count = 0;
+            while count < 65000 {
+                // Close to capacity
+                if queue.push(count, 0).is_err() {
+                    break;
+                }
+                count += 1;
+            }
+
+            println!("Filled queue with {} items", count);
+
+            // Now stress test near boundary
+            let queue_prod = queue.clone();
+            let queue_cons = queue.clone();
+
+            let producer = thread::spawn(move || {
+                for i in 0..1000 {
+                    while queue_prod.push(count + i, 0).is_err() {
+                        thread::yield_now();
+                    }
+                }
+            });
+
+            let consumer = thread::spawn(move || {
+                let mut dequeued = 0;
+                let mut last_val = None;
+
+                while dequeued < 1000 {
+                    match queue_cons.pop(1) {
+                        Ok(val) => {
+                            if let Some(last) = last_val {
+                                if val <= last && val < count {
+                                    panic!("Out of order: {} after {}", val, last);
+                                }
+                            }
+                            last_val = Some(val);
+                            dequeued += 1;
+                        }
+                        Err(_) => thread::yield_now(),
+                    }
+                }
+
+                dequeued
+            });
+
+            producer.join().unwrap();
+            let dequeued = consumer.join().unwrap();
+
+            assert_eq!(dequeued, 1000, "Lost items near capacity boundary");
+
+            unmap_shared(mem, WCQueue::<usize>::shared_size(THREADS));
+        }
+    }
+
+    #[test]
+    fn test_rapid_thread_switching() {
+        // Test rapid context switching between threads
+        const THREADS: usize = 8;
+        const ITERATIONS: usize = 100;
+
+        unsafe {
+            let mem = map_shared(WCQueue::<usize>::shared_size(THREADS));
+            let queue = Arc::new(WCQueue::init_in_shared(mem, THREADS));
+            let barrier = Arc::new(Barrier::new(THREADS));
+
+            let mut handles = vec![];
+            let total_items = Arc::new(AtomicUsize::new(0));
+
+            for tid in 0..THREADS {
+                let queue_clone = queue.clone();
+                let barrier_clone = barrier.clone();
+                let total_items_clone = total_items.clone();
+
+                let handle = thread::spawn(move || {
+                    barrier_clone.wait();
+
+                    for i in 0..ITERATIONS {
+                        // Rapid enqueue/dequeue to stress synchronization
+                        let value = tid * 10000 + i;
+
+                        // Enqueue
+                        let mut attempts = 0;
+                        while queue_clone.push(value, tid).is_err() {
+                            attempts += 1;
+                            if attempts > 100_000 {
+                                panic!("Failed to enqueue in rapid switching test");
+                            }
+                            thread::yield_now();
+                        }
+
+                        total_items_clone.fetch_add(1, Ordering::Release);
+
+                        // Immediately try to dequeue (might get someone else's item)
+                        if queue_clone.pop(tid).is_ok() {
+                            total_items_clone.fetch_sub(1, Ordering::Release);
+                        }
+
+                        // Force context switch
+                        thread::yield_now();
+                    }
+                });
+                handles.push(handle);
+            }
+
+            for handle in handles {
+                handle.join().unwrap();
+            }
+
+            // Drain remaining items
+            let remaining = total_items.load(Ordering::Acquire);
+            let mut drained = 0;
+            let mut attempts = 0;
+
+            while drained < remaining && attempts < 1_000_000 {
+                if queue.pop(0).is_ok() {
+                    drained += 1;
+                }
+                attempts += 1;
+            }
+
+            assert_eq!(
+                drained,
+                remaining,
+                "Failed to drain {} remaining items",
+                remaining - drained
+            );
+
+            unmap_shared(mem, WCQueue::<usize>::shared_size(THREADS));
+        }
+    }
+
+    #[test]
+    fn test_memory_consistency() {
+        // Test memory consistency across threads
+        const PATTERN: usize = 0xDEADBEEF;
+
+        unsafe {
+            let mem = map_shared(WCQueue::<usize>::shared_size(2));
+            let queue = Arc::new(WCQueue::init_in_shared(mem, 2));
+
+            // Producer writes specific pattern
+            let queue_prod = queue.clone();
+            let producer = thread::spawn(move || {
+                for i in 0..100 {
+                    let value = PATTERN ^ i; // XOR with index
+                    while queue_prod.push(value, 0).is_err() {
+                        thread::yield_now();
+                    }
+                }
+            });
+
+            // Consumer verifies pattern
+            let queue_cons = queue.clone();
+            let consumer = thread::spawn(move || {
+                let mut received = Vec::new();
+                let mut empty_count = 0;
+
+                while received.len() < 100 {
+                    match queue_cons.pop(1) {
+                        Ok(val) => {
+                            received.push(val);
+                            empty_count = 0;
+                        }
+                        Err(_) => {
+                            empty_count += 1;
+                            if empty_count > 1_000_000 {
+                                break;
+                            }
+                            thread::yield_now();
+                        }
+                    }
+                }
+
+                // Verify pattern
+                for (i, &val) in received.iter().enumerate() {
+                    let expected = PATTERN ^ i;
+                    if val != expected {
+                        panic!(
+                            "Memory corruption detected: expected {:x}, got {:x} at index {}",
+                            expected, val, i
+                        );
+                    }
+                }
+
+                received.len()
+            });
+
+            producer.join().unwrap();
+            let received_count = consumer.join().unwrap();
+
+            assert_eq!(received_count, 100, "Lost {} items", 100 - received_count);
+
+            unmap_shared(mem, WCQueue::<usize>::shared_size(2));
+        }
+    }
+
+    // Helper functions
+    unsafe fn map_shared(bytes: usize) -> *mut u8 {
+        use std::ptr;
+        let ptr = libc::mmap(
+            ptr::null_mut(),
+            bytes,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if ptr == libc::MAP_FAILED {
+            panic!("mmap failed: {}", std::io::Error::last_os_error());
+        }
+        ptr.cast()
+    }
+
+    unsafe fn unmap_shared(ptr: *mut u8, len: usize) {
+        if libc::munmap(ptr.cast(), len) == -1 {
+            panic!("munmap failed: {}", std::io::Error::last_os_error());
+        }
+    }
+}

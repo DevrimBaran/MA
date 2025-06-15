@@ -1474,7 +1474,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             match self.dequeue_inner_wcq(&self.fq, self.fq_entries_offset, thread_id, 1) {
                 Ok(index) => {
                     if index >= self.num_indices {
-                        eprintln!("ERROR: Invalid index {} from fq", index);
                         return Err(());
                     }
 
@@ -1551,154 +1550,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         }
     }
 
-    pub fn debug_dequeue(&self, thread_id: usize) -> Result<T, ()> {
-        eprintln!("[Thread {}] DEBUG: Starting dequeue", thread_id);
-
-        unsafe {
-            fence(Ordering::SeqCst);
-            self.help_threads(thread_id);
-            fence(Ordering::SeqCst);
-
-            match self.dequeue_inner_wcq(&self.aq, self.aq_entries_offset, thread_id, 0) {
-                Ok(index) => {
-                    eprintln!("[Thread {}] DEBUG: Got index {} from aq", thread_id, index);
-
-                    if index >= self.num_indices {
-                        eprintln!(
-                            "[Thread {}] ERROR: Invalid index {} dequeued",
-                            thread_id, index
-                        );
-                        return Err(());
-                    }
-
-                    let data_entry = self.get_data(index);
-
-                    let mut spin_count = 0;
-                    while !data_entry.ready.load(Ordering::SeqCst) {
-                        spin_count += 1;
-                        if spin_count > 1000 && spin_count % 100000 == 0 {
-                            eprintln!(
-                                "[Thread {}] DEBUG: Still waiting for ready at index {}, spins={}",
-                                thread_id, index, spin_count
-                            );
-                        }
-                        if spin_count > 10_000_000 {
-                            eprintln!(
-                                "[Thread {}] ERROR: Timeout waiting for ready at index {}",
-                                thread_id, index
-                            );
-                            self.debug_state();
-                            return Err(());
-                        }
-                        std::hint::spin_loop();
-                    }
-
-                    fence(Ordering::SeqCst);
-                    std::sync::atomic::compiler_fence(Ordering::SeqCst);
-                    fence(Ordering::SeqCst);
-
-                    let value = (*data_entry.value.get()).take();
-
-                    fence(Ordering::SeqCst);
-                    data_entry.ready.store(false, Ordering::SeqCst);
-                    fence(Ordering::SeqCst);
-
-                    self.enqueue_inner_wcq(&self.fq, self.fq_entries_offset, index, thread_id, 1)
-                        .ok();
-
-                    match value {
-                        Some(v) => {
-                            let total = self.total_dequeued.fetch_add(1, Ordering::SeqCst) + 1;
-                            eprintln!("[Thread {}] DEBUG: Successfully dequeued from index {}, total_dequeued={}", thread_id, index, total);
-                            Ok(v)
-                        }
-                        None => {
-                            eprintln!(
-                                "[Thread {}] ERROR: Value was None at index {}",
-                                thread_id, index
-                            );
-                            Err(())
-                        }
-                    }
-                }
-                Err(()) => {
-                    eprintln!("[Thread {}] DEBUG: Failed to get index from aq", thread_id);
-                    Err(())
-                }
-            }
-        }
-    }
-
-    pub fn debug_enqueue(&self, value: T, thread_id: usize) -> Result<(), ()> {
-        eprintln!("[Thread {}] DEBUG: Starting enqueue", thread_id);
-
-        match unsafe { self.dequeue_inner_wcq(&self.fq, self.fq_entries_offset, thread_id, 1) } {
-            Ok(index) => {
-                eprintln!("[Thread {}] DEBUG: Got free index {}", thread_id, index);
-
-                unsafe {
-                    let data_entry = self.get_data(index);
-
-                    fence(Ordering::SeqCst);
-                    *data_entry.value.get() = Some(value);
-                    std::sync::atomic::compiler_fence(Ordering::SeqCst);
-                    fence(Ordering::SeqCst);
-                    data_entry.ready.store(true, Ordering::SeqCst);
-                    fence(Ordering::SeqCst);
-
-                    eprintln!(
-                        "[Thread {}] DEBUG: Stored value at index {}, ready=true",
-                        thread_id, index
-                    );
-
-                    match self.enqueue_inner_wcq(
-                        &self.aq,
-                        self.aq_entries_offset,
-                        index,
-                        thread_id,
-                        0,
-                    ) {
-                        Ok(()) => {
-                            fence(Ordering::SeqCst);
-                            let total = self.total_enqueued.fetch_add(1, Ordering::SeqCst) + 1;
-                            eprintln!("[Thread {}] DEBUG: Successfully enqueued index {} to aq, total_enqueued={}", thread_id, index, total);
-                            Ok(())
-                        }
-                        Err(()) => {
-                            eprintln!(
-                                "[Thread {}] DEBUG: Failed to enqueue index {} to aq",
-                                thread_id, index
-                            );
-
-                            fence(Ordering::SeqCst);
-                            data_entry.ready.store(false, Ordering::SeqCst);
-                            fence(Ordering::SeqCst);
-                            *data_entry.value.get() = None;
-                            fence(Ordering::SeqCst);
-
-                            self.enqueue_inner_wcq(
-                                &self.fq,
-                                self.fq_entries_offset,
-                                index,
-                                thread_id,
-                                1,
-                            )
-                            .ok();
-                            Err(())
-                        }
-                    }
-                }
-            }
-            Err(()) => {
-                eprintln!(
-                    "[Thread {}] DEBUG: Failed to get free index from fq",
-                    thread_id
-                );
-                Err(())
-            }
-        }
-    }
-
     pub fn dequeue(&self, thread_id: usize) -> Result<T, ()> {
         unsafe {
             fence(Ordering::SeqCst);
@@ -1710,7 +1561,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             match self.dequeue_inner_wcq(&self.aq, self.aq_entries_offset, thread_id, 0) {
                 Ok(index) => {
                     if index >= self.num_indices {
-                        eprintln!("ERROR: Invalid index {} dequeued", index);
                         return Err(());
                     }
 
@@ -1742,15 +1592,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
 
                         if spin_count > 10_000_000 || start_time.elapsed() > Duration::from_secs(30)
                         {
-                            eprintln!(
-                                "ERROR: Data not ready for index {} after {} spins, elapsed: {:?}",
-                                index,
-                                spin_count,
-                                start_time.elapsed()
-                            );
-
-                            self.debug_state();
-
                             for _ in 0..10 {
                                 fence(Ordering::SeqCst);
                                 std::thread::sleep(Duration::from_millis(1));
@@ -1819,10 +1660,7 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                             self.total_dequeued.fetch_add(1, Ordering::SeqCst);
                             Ok(v)
                         }
-                        None => {
-                            eprintln!("ERROR: Data was None for index {}", index);
-                            Err(())
-                        }
+                        None => Err(()),
                     }
                 }
                 Err(()) => {
@@ -1977,118 +1815,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         (fq_head >= fq_tail && fq_threshold < 0) || items_in_use >= self.num_indices
     }
 
-    pub fn drain_all(&self, thread_id: usize) -> Vec<T> {
-        let mut items = Vec::new();
-        let mut consecutive_empty = 0;
-        const MAX_EMPTY_ATTEMPTS: usize = 100_000;
-
-        let initial_enqueued = self.total_enqueued.load(Ordering::SeqCst);
-        let initial_dequeued = self.total_dequeued.load(Ordering::SeqCst);
-        let expected_items = initial_enqueued.saturating_sub(initial_dequeued);
-
-        loop {
-            for _ in 0..self.num_threads {
-                unsafe {
-                    self.help_threads(thread_id);
-                }
-            }
-
-            match self.pop(thread_id) {
-                Ok(item) => {
-                    items.push(item);
-                    consecutive_empty = 0;
-
-                    if items.len() >= expected_items {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    consecutive_empty += 1;
-
-                    if consecutive_empty % 1000 == 0 {
-                        fence(Ordering::SeqCst);
-
-                        for tid in 0..self.num_threads {
-                            unsafe {
-                                self.help_threads(tid);
-                            }
-                        }
-
-                        let current_enqueued = self.total_enqueued.load(Ordering::SeqCst);
-                        let current_dequeued = self.total_dequeued.load(Ordering::SeqCst);
-
-                        if current_dequeued + items.len() >= current_enqueued {
-                            break;
-                        }
-                    }
-
-                    if consecutive_empty > MAX_EMPTY_ATTEMPTS {
-                        break;
-                    }
-
-                    if consecutive_empty < 100 {
-                        std::hint::spin_loop();
-                    } else if consecutive_empty < 1000 {
-                        std::thread::yield_now();
-                    } else if consecutive_empty < 10000 {
-                        std::thread::sleep(Duration::from_micros(1));
-                    } else {
-                        std::thread::sleep(Duration::from_micros(10));
-                    }
-                }
-            }
-        }
-
-        items
-    }
-
-    pub fn drain_remaining(&self, thread_id: usize, max_items: usize) -> Vec<T> {
-        let mut items = Vec::new();
-        let mut empty_rounds = 0;
-
-        while items.len() < max_items && empty_rounds < 10 {
-            fence(Ordering::SeqCst);
-
-            for _ in 0..self.num_threads {
-                unsafe {
-                    self.help_threads(thread_id);
-                }
-            }
-
-            let mut found_item = false;
-            for _ in 0..100 {
-                match self.pop(thread_id) {
-                    Ok(item) => {
-                        items.push(item);
-                        found_item = true;
-                        empty_rounds = 0;
-                        break;
-                    }
-                    Err(_) => {
-                        std::hint::spin_loop();
-                    }
-                }
-            }
-
-            if !found_item {
-                empty_rounds += 1;
-
-                fence(Ordering::SeqCst);
-                std::thread::sleep(Duration::from_micros(100));
-                fence(Ordering::SeqCst);
-
-                let total_enqueued = self.total_enqueued.load(Ordering::SeqCst);
-                let total_dequeued = self.total_dequeued.load(Ordering::SeqCst);
-
-                if total_enqueued == total_dequeued + items.len() {
-                    break;
-                }
-            }
-        }
-
-        items
-    }
-
     fn layout(num_threads: usize, num_indices: usize) -> (Layout, [usize; 4]) {
         let ring_size = num_indices.next_power_of_two();
         let capacity = ring_size * 2;
@@ -2218,27 +1944,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         fence(Ordering::SeqCst);
 
         queue
-    }
-
-    pub fn debug_state(&self) {
-        println!("=== Queue State ===");
-        println!(
-            "AQ Head: {}, Tail: {}, Threshold: {}",
-            self.aq.head.cnt.load(Ordering::Acquire),
-            self.aq.tail.cnt.load(Ordering::Acquire),
-            self.aq.threshold.load(Ordering::Acquire)
-        );
-        println!(
-            "FQ Head: {}, Tail: {}, Threshold: {}",
-            self.fq.head.cnt.load(Ordering::Acquire),
-            self.fq.tail.cnt.load(Ordering::Acquire),
-            self.fq.threshold.load(Ordering::Acquire)
-        );
-        println!(
-            "Total enqueued: {}, dequeued: {}",
-            self.total_enqueued.load(Ordering::Acquire),
-            self.total_dequeued.load(Ordering::Acquire)
-        );
     }
 }
 

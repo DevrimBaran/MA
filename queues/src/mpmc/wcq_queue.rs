@@ -251,13 +251,7 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         let packed = entry.value.load(Ordering::Acquire);
         let e = EntryPair::unpack_entry(packed);
 
-        // Debug for first few operations
-        if tail < 5 && entries_offset == self.aq_entries_offset {
-            eprintln!("AQ enq: tail={}, j={}, cycle={}, expected_cycle={}, index={}, attempting to store index={}", 
-                tail, j, e.cycle, Self::cycle(tail, wq.ring_size), e.index, index);
-        }
-
-        if e.cycle <= Self::cycle(tail, wq.ring_size)
+        if e.cycle < Self::cycle(tail, wq.ring_size)
             && (e.is_safe || wq.head.cnt.load(Ordering::Acquire) <= tail)
             && (e.index == IDX_EMPTY || e.index == IDX_BOTTOM)
         {
@@ -271,22 +265,15 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             entry
                 .value
                 .store(EntryPair::pack_entry(new_entry), Ordering::Release);
+            fence(Ordering::SeqCst); // Ensure visibility
 
             if wq.threshold.load(Ordering::Acquire) != (3 * wq.ring_size as i32 - 1) {
                 wq.threshold
-                    .store(3 * wq.ring_size as i32 - 1, Ordering::Release);
-            }
-
-            if tail < 5 && entries_offset == self.aq_entries_offset {
-                eprintln!("AQ enq: SUCCESS storing index {} at position {}", index, j);
+                    .store(3 * wq.ring_size as i32 - 1, Ordering::SeqCst);
             }
 
             Ok(())
         } else {
-            if tail < 5 && entries_offset == self.aq_entries_offset {
-                eprintln!("AQ enq: FAILED - cycle check: {} <= {}, is_safe: {}, index check: {} == {} or {}", 
-                    e.cycle, Self::cycle(tail, wq.ring_size), e.is_safe, e.index, IDX_EMPTY, IDX_BOTTOM);
-            }
             Err(tail)
         }
     }
@@ -303,18 +290,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         let entry = self.get_entry_mut(wq, entries_offset, j);
         let packed = entry.value.load(Ordering::Acquire);
         let e = EntryPair::unpack_entry(packed);
-
-        // Debug for first few operations
-        if head < 5 && entries_offset == self.fq_entries_offset {
-            eprintln!(
-                "FQ deq: head={}, j={}, cycle={}, expected_cycle={}, index={}",
-                head,
-                j,
-                e.cycle,
-                Self::cycle(head, wq.ring_size),
-                e.index
-            );
-        }
 
         if e.cycle == Self::cycle(head, wq.ring_size) {
             self.consume_inner(wq, entries_offset, head, j, &e);
@@ -357,9 +332,12 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             return Ok(());
         }
 
-        // Only check/decrement threshold for aq
+        // For aq, only decrement threshold if we're really sure it's empty
         if entries_offset == self.aq_entries_offset {
-            if wq.threshold.fetch_sub(1, Ordering::AcqRel) <= 0 {
+            // Double-check that queue is really empty before decrementing threshold
+            fence(Ordering::SeqCst);
+            let tail_check = wq.tail.cnt.load(Ordering::SeqCst);
+            if tail_check <= head + 1 && wq.threshold.fetch_sub(1, Ordering::AcqRel) <= 0 {
                 *index_out = usize::MAX; // Empty
                 return Ok(());
             }
@@ -387,6 +365,9 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         entry
             .value
             .store(EntryPair::pack_entry(e_mut), Ordering::Release);
+
+        // Strong fence to ensure visibility
+        fence(Ordering::SeqCst);
     }
 
     unsafe fn finalize_request_inner(&self, h: u64) {
@@ -838,6 +819,12 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
     ) -> Result<(), ()> {
         self.help_threads(thread_id);
 
+        // Update threshold when enqueueing to aq
+        if queue_id == 0 && wq.threshold.load(Ordering::Acquire) < 0 {
+            wq.threshold
+                .store(3 * wq.ring_size as i32 - 1, Ordering::SeqCst);
+        }
+
         // Fast path
         let mut count = MAX_PATIENCE;
         while count > 0 {
@@ -945,19 +932,13 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             match self.dequeue_inner_wcq(&self.fq, self.fq_entries_offset, thread_id, 1) {
                 Ok(index) => {
                     if index >= self.num_indices {
-                        eprintln!("WCQ: Got invalid index {} from fq", index);
                         return Err(());
                     }
 
-                    // Debug
-                    if index < 5 {
-                        eprintln!("WCQ enqueue: got index {} from fq", index);
-                    }
-
-                    // Store value
+                    // Store value with strong ordering
                     let data_cell = self.get_data(index);
                     *data_cell.get() = Some(value);
-                    fence(Ordering::Release);
+                    fence(Ordering::SeqCst);
 
                     // Enqueue index to aq
                     match self.enqueue_inner_wcq(
@@ -968,18 +949,13 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                         0,
                     ) {
                         Ok(()) => {
-                            if index < 5 {
-                                eprintln!(
-                                    "WCQ enqueue: successfully enqueued index {} to aq",
-                                    index
-                                );
-                            }
+                            fence(Ordering::SeqCst);
                             Ok(())
                         }
                         Err(()) => {
-                            eprintln!("WCQ enqueue: failed to enqueue index {} to aq", index);
                             // Return index to fq on failure
                             *data_cell.get() = None;
+                            fence(Ordering::SeqCst);
                             self.enqueue_inner_wcq(
                                 &self.fq,
                                 self.fq_entries_offset,
@@ -992,10 +968,7 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                         }
                     }
                 }
-                Err(()) => {
-                    eprintln!("WCQ: Failed to get index from fq");
-                    Err(())
-                }
+                Err(()) => Err(()),
             }
         }
     }
@@ -1005,14 +978,12 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             // Dequeue index from aq
             match self.dequeue_inner_wcq(&self.aq, self.aq_entries_offset, thread_id, 0) {
                 Ok(index) => {
-                    if index < 5 {
-                        eprintln!("WCQ dequeue: got index {} from aq", index);
-                    }
+                    fence(Ordering::SeqCst);
 
-                    // Get value
+                    // Get value with strong ordering
                     let data_cell = self.get_data(index);
                     let value = (*data_cell.get()).take();
-                    fence(Ordering::Acquire);
+                    fence(Ordering::SeqCst);
 
                     // Return index to fq
                     self.enqueue_inner_wcq(&self.fq, self.fq_entries_offset, index, thread_id, 1)
@@ -1020,18 +991,75 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
 
                     value.ok_or(())
                 }
-                Err(()) => {
-                    eprintln!("WCQ dequeue: failed to get index from aq");
-                    Err(())
-                }
+                Err(()) => Err(()),
             }
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        // Check if aq has any items (threshold < 0 means empty)
-        let aq_head = self.aq.head.cnt.load(Ordering::Acquire);
-        let aq_tail = self.aq.tail.cnt.load(Ordering::Acquire);
+        // First, help any pending operations
+        for tid in 0..self.num_threads {
+            unsafe {
+                self.help_threads(tid);
+            }
+        }
+
+        // Multiple checks with strong synchronization
+        for round in 0..5 {
+            fence(Ordering::SeqCst);
+
+            // Check if aq has any items
+            let aq_head = self.aq.head.cnt.load(Ordering::SeqCst);
+            let aq_tail = self.aq.tail.cnt.load(Ordering::SeqCst);
+
+            if aq_head < aq_tail {
+                return false;
+            }
+
+            // Check for pending operations
+            let mut found_pending = false;
+            for i in 0..self.num_threads {
+                let record = unsafe { self.get_record(i) };
+                if record.pending.load(Ordering::SeqCst) {
+                    let is_enq = record.enqueue.load(Ordering::SeqCst);
+                    let queue_id = record.queue_id.load(Ordering::SeqCst);
+
+                    // If there's a pending enqueue to aq (queue_id == 0)
+                    if is_enq && queue_id == 0 {
+                        found_pending = true;
+                        // Help this operation
+                        unsafe {
+                            self.help_enqueue(record);
+                        }
+                    }
+                }
+            }
+
+            if found_pending {
+                // We found and helped pending operations, check again
+                continue;
+            }
+
+            // If we've done multiple rounds without finding pending ops, do final check
+            if round >= 2 {
+                fence(Ordering::SeqCst);
+                let final_head = self.aq.head.cnt.load(Ordering::SeqCst);
+                let final_tail = self.aq.tail.cnt.load(Ordering::SeqCst);
+
+                if final_head >= final_tail {
+                    // Really empty
+                    return true;
+                }
+            }
+
+            // Small delay to let any in-flight operations complete
+            std::thread::yield_now();
+        }
+
+        // Final check after helping and waiting
+        fence(Ordering::SeqCst);
+        let aq_head = self.aq.head.cnt.load(Ordering::SeqCst);
+        let aq_tail = self.aq.tail.cnt.load(Ordering::SeqCst);
         aq_head >= aq_tail
     }
 
@@ -1104,7 +1132,7 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         }
 
         // Debug IDX values
-        eprintln!("IDX_EMPTY = {}, IDX_BOTTOM = {}", IDX_EMPTY, IDX_BOTTOM);
+        // eprintln!("IDX_EMPTY = {}, IDX_BOTTOM = {}", IDX_EMPTY, IDX_BOTTOM);
 
         // Initialize aq queue as empty
         queue.aq.threshold.store(-1, Ordering::Release);
@@ -1147,11 +1175,6 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             entry
                 .value
                 .store(EntryPair::pack_entry(e), Ordering::Release);
-
-            // Debug first few entries
-            if i < 5 {
-                eprintln!("FQ init: i={}, j={}, cycle={}", i, j, e.cycle);
-            }
         }
 
         // Set threshold after populating

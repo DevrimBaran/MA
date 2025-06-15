@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod wcq_tests {
+    use queues::mpmc::wcq_queue::EntryPair;
     use queues::mpmc::WCQueue;
     use queues::MpmcQueue;
     use std::collections::HashSet;
@@ -19,8 +20,9 @@ mod wcq_tests {
 
             let producer = thread::spawn(move || {
                 for i in 0..ITEMS {
+                    eprintln!("\n=== PRODUCER: Enqueueing item {} ===", i);
                     let mut retry = 0;
-                    while queue.push(i, 0).is_err() {
+                    while queue.debug_enqueue(i, 0).is_err() {
                         retry += 1;
                         if retry > 1000 {
                             panic!("Producer stuck at item {}", i);
@@ -33,7 +35,8 @@ mod wcq_tests {
                         thread::sleep(Duration::from_micros(10));
                     }
                 }
-                println!("Producer finished");
+                eprintln!("\n=== PRODUCER FINISHED ===");
+                queue.debug_state();
             });
 
             let consumer = thread::spawn(move || {
@@ -42,13 +45,14 @@ mod wcq_tests {
                 let mut last_received = 0;
 
                 while received.len() < ITEMS {
-                    match queue_clone.pop(1) {
+                    match queue_clone.debug_dequeue(1) {
                         Ok(val) => {
+                            eprintln!("\n=== CONSUMER: Dequeued item {} ===", val);
                             received.push(val);
                             last_received = val;
                             empty_count = 0;
 
-                            if received.len() % 100 == 0 {
+                            if received.len() % 50 == 0 {
                                 println!("Received {} items, last: {}", received.len(), val);
                             }
                         }
@@ -56,14 +60,42 @@ mod wcq_tests {
                             empty_count += 1;
 
                             if empty_count % 100_000 == 0 {
-                                println!(
-                                    "Consumer waiting... received so far: {}, last: {}",
+                                eprintln!(
+                                    "\n=== CONSUMER WAITING: received so far: {}, last: {} ===",
                                     received.len(),
                                     last_received
                                 );
 
                                 // Debug queue state when stuck
                                 queue_clone.debug_state();
+
+                                // Also check the exact position we think the item should be
+                                if received.len() == 99 {
+                                    eprintln!("\n=== LOOKING FOR MISSING ITEM 99 ===");
+                                    // The consumer likely tried to dequeue at some head position
+                                    // Let's check a range of positions
+                                    let aq_head = queue_clone.aq.head.cnt.load(Ordering::SeqCst);
+                                    let aq_tail = queue_clone.aq.tail.cnt.load(Ordering::SeqCst);
+                                    eprintln!("AQ head: {}, tail: {}", aq_head, aq_tail);
+
+                                    // Check recent positions
+                                    for offset in 0..10 {
+                                        let pos = aq_head.saturating_sub(offset);
+                                        let j = WCQueue::<usize>::cache_remap(
+                                            pos as usize,
+                                            queue_clone.aq.capacity,
+                                        );
+                                        let entry = queue_clone.get_entry(
+                                            &queue_clone.aq,
+                                            queue_clone.aq_entries_offset,
+                                            j,
+                                        );
+                                        let packed = entry.value.load(Ordering::SeqCst);
+                                        let e = EntryPair::unpack_entry(packed);
+                                        eprintln!("Position {} (j={}): cycle={}, index={}, enq={}, safe={}", 
+                                            pos, j, e.cycle, e.index, e.enq, e.is_safe);
+                                    }
+                                }
                             }
 
                             if empty_count > 10_000_000 {

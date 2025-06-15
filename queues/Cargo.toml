@@ -20,6 +20,7 @@ loom = "0.7"
 bench = ["criterion"]
 debug_logging = []
 miri = []
+test = []
 
 [[bench]]
 name = "spsc_bench"

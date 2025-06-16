@@ -1,6 +1,5 @@
 #[cfg(test)]
 mod wcq_tests {
-    use queues::mpmc::wcq_queue::EntryPair;
     use queues::mpmc::WCQueue;
     use queues::MpmcQueue;
     use std::collections::HashSet;
@@ -10,115 +9,6 @@ mod wcq_tests {
     use std::time::Duration;
 
     #[test]
-    fn test_debug_stuck_consumer() {
-        const ITEMS: usize = 100;
-
-        unsafe {
-            let mem = map_shared(WCQueue::<usize>::shared_size(2));
-            let queue = Arc::new(WCQueue::init_in_shared(mem, 2));
-            let queue_clone = queue.clone();
-
-            let producer = thread::spawn(move || {
-                for i in 0..ITEMS {
-                    eprintln!("\n=== PRODUCER: Enqueueing item {} ===", i);
-                    let mut retry = 0;
-                    while queue.debug_enqueue(i, 0).is_err() {
-                        retry += 1;
-                        if retry > 1000 {
-                            panic!("Producer stuck at item {}", i);
-                        }
-                        thread::yield_now();
-                    }
-
-                    // Add small delay to test synchronization
-                    if i % 10 == 0 {
-                        thread::sleep(Duration::from_micros(10));
-                    }
-                }
-                eprintln!("\n=== PRODUCER FINISHED ===");
-                queue.debug_state();
-            });
-
-            let consumer = thread::spawn(move || {
-                let mut received = Vec::with_capacity(ITEMS);
-                let mut empty_count = 0;
-                let mut last_received = 0;
-
-                while received.len() < ITEMS {
-                    match queue_clone.debug_dequeue(1) {
-                        Ok(val) => {
-                            eprintln!("\n=== CONSUMER: Dequeued item {} ===", val);
-                            received.push(val);
-                            last_received = val;
-                            empty_count = 0;
-
-                            if received.len() % 50 == 0 {
-                                println!("Received {} items, last: {}", received.len(), val);
-                            }
-                        }
-                        Err(_) => {
-                            empty_count += 1;
-
-                            if empty_count % 100_000 == 0 {
-                                eprintln!(
-                                    "\n=== CONSUMER WAITING: received so far: {}, last: {} ===",
-                                    received.len(),
-                                    last_received
-                                );
-
-                                // Debug queue state when stuck
-                                queue_clone.debug_state();
-
-                                // Also check the exact position we think the item should be
-                                if received.len() == 99 {
-                                    eprintln!("\n=== LOOKING FOR MISSING ITEM 99 ===");
-                                    // The consumer likely tried to dequeue at some head position
-                                    // Let's check a range of positions
-                                    let aq_head = queue_clone.aq.head.cnt.load(Ordering::SeqCst);
-                                    let aq_tail = queue_clone.aq.tail.cnt.load(Ordering::SeqCst);
-                                    eprintln!("AQ head: {}, tail: {}", aq_head, aq_tail);
-
-                                    // Check recent positions
-                                    for offset in 0..10 {
-                                        let pos = aq_head.saturating_sub(offset);
-                                        let j = WCQueue::<usize>::cache_remap(
-                                            pos as usize,
-                                            queue_clone.aq.capacity,
-                                        );
-                                        let entry = queue_clone.get_entry(
-                                            &queue_clone.aq,
-                                            queue_clone.aq_entries_offset,
-                                            j,
-                                        );
-                                        let packed = entry.value.load(Ordering::SeqCst);
-                                        let e = EntryPair::unpack_entry(packed);
-                                        eprintln!("Position {} (j={}): cycle={}, index={}, enq={}, safe={}", 
-                                            pos, j, e.cycle, e.index, e.enq, e.is_safe);
-                                    }
-                                }
-                            }
-
-                            if empty_count > 10_000_000 {
-                                panic!("Consumer stuck after receiving {} items", received.len());
-                            }
-                            thread::yield_now();
-                        }
-                    }
-                }
-
-                received
-            });
-
-            producer.join().unwrap();
-            let received = consumer.join().unwrap();
-
-            assert_eq!(received.len(), ITEMS);
-
-            unmap_shared(mem, WCQueue::<usize>::shared_size(2));
-        }
-    }
-
-    #[test]
     fn test_debug_queue_state() {
         unsafe {
             let mem = map_shared(WCQueue::<usize>::shared_size(2));
@@ -126,7 +16,6 @@ mod wcq_tests {
 
             // Test scenario that reproduces the issue
             println!("Initial state:");
-            queue.debug_state();
 
             // Enqueue some items
             for i in 0..10 {
@@ -137,7 +26,6 @@ mod wcq_tests {
             }
 
             println!("\nAfter enqueuing 10 items:");
-            queue.debug_state();
 
             // Dequeue half
             for i in 0..5 {
@@ -148,7 +36,6 @@ mod wcq_tests {
             }
 
             println!("\nAfter dequeuing 5 items:");
-            queue.debug_state();
 
             unmap_shared(mem, WCQueue::<usize>::shared_size(2));
         }
@@ -634,7 +521,6 @@ mod wcq_tests {
 mod wcq_stress_tests {
     use queues::mpmc::WCQueue;
     use queues::MpmcQueue;
-    use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;

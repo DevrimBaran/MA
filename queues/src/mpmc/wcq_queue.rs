@@ -333,6 +333,9 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         let mut packed;
         let mut e;
 
+        // For 1P1C, try harder to find the entry
+        let max_retries = if self.num_threads <= 2 { 100 } else { 20 };
+
         loop {
             packed = entry.value.load(Ordering::SeqCst);
             e = EntryPair::unpack_entry(packed);
@@ -344,12 +347,19 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             }
 
             retry_count += 1;
-            if retry_count > 20 {
+            if retry_count > max_retries {
                 break;
             }
 
-            for _ in 0..10 {
-                std::hint::spin_loop();
+            // More aggressive synchronization for 1P1C
+            if self.num_threads <= 2 && retry_count % 10 == 0 {
+                fence(Ordering::SeqCst);
+                std::thread::yield_now();
+                fence(Ordering::SeqCst);
+            } else {
+                for _ in 0..10 {
+                    std::hint::spin_loop();
+                }
             }
             fence(Ordering::SeqCst);
         }
@@ -357,11 +367,54 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         fence(Ordering::SeqCst);
         let tail = wq.tail.cnt.load(Ordering::SeqCst);
 
+        // CRITICAL FIX: Check if queue is truly empty
+        // The issue is that tail <= head + 1 might be true due to wraparound
+        // but there could still be an item at position head
         if tail <= head + 1 {
             fence(Ordering::SeqCst);
             std::thread::yield_now();
             fence(Ordering::SeqCst);
 
+            // For 1P1C, be EXTRA careful about empty detection
+            if entries_offset == self.aq_entries_offset && self.num_threads <= 2 {
+                // Check multiple times with increasing delays
+                for check in 0..10 {
+                    // Increased from 5
+                    fence(Ordering::SeqCst);
+
+                    // Re-read the entry
+                    packed = entry.value.load(Ordering::SeqCst);
+                    e = EntryPair::unpack_entry(packed);
+
+                    // Check if the entry's cycle matches what we expect
+                    if e.cycle == Self::cycle(head, wq.ring_size) {
+                        // The entry IS there! It just wasn't visible before
+                        if e.index != IDX_EMPTY && e.index != IDX_BOTTOM {
+                            self.consume_inner(wq, entries_offset, head, j, &e);
+                            *index_out = e.index;
+                            return Ok(());
+                        }
+                    }
+
+                    // Also check the current tail again
+                    let current_tail = wq.tail.cnt.load(Ordering::SeqCst);
+                    let current_head = wq.head.cnt.load(Ordering::SeqCst);
+
+                    // If tail has advanced, the queue isn't empty
+                    if current_tail > head + 1 {
+                        return Err(head);
+                    }
+
+                    // For high cycle counts (wraparound cases), wait longer
+                    if Self::cycle(head, wq.ring_size) > 1 {
+                        std::thread::sleep(Duration::from_micros(100));
+                    } else if check < 9 {
+                        std::thread::sleep(Duration::from_micros(10));
+                    }
+                }
+            }
+
+            // Final check for any missed entries
             for final_check in 0..5 {
                 fence(Ordering::SeqCst);
                 packed = entry.value.load(Ordering::SeqCst);

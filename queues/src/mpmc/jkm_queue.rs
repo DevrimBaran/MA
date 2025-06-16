@@ -105,6 +105,14 @@ pub struct JKMQueue<T: Send + Clone + 'static> {
     num_dequeuers: usize,
     items_per_process: usize,
     tree_size: usize,
+
+    // Debug counters
+    debug_items_written: AtomicUsize,
+    debug_items_taken: AtomicUsize,
+    debug_deq_ops_completed: AtomicUsize,
+    debug_deq_ops_empty: AtomicUsize,
+    debug_enq_completed: AtomicUsize,
+
     _phantom: std::marker::PhantomData<T>,
 }
 unsafe impl<T: Send + Clone + 'static> Send for JKMQueue<T> {}
@@ -171,6 +179,7 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
         let self_ptr = mem as *mut Self;
         ptr::write(
             self_ptr,
+            // In init_in_shared, update the Self initialization:
             Self {
                 enq_counter: MaxRegister::new(0),
                 deq_counter: FetchAndInc::new(1),
@@ -184,6 +193,11 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
                 num_dequeuers: n_deq,
                 items_per_process: ipp,
                 tree_size: tree_sz,
+                debug_items_written: AtomicUsize::new(0),
+                debug_items_taken: AtomicUsize::new(0),
+                debug_deq_ops_completed: AtomicUsize::new(0),
+                debug_deq_ops_empty: AtomicUsize::new(0),
+                debug_enq_completed: AtomicUsize::new(0),
                 _phantom: std::marker::PhantomData,
             },
         );
@@ -385,6 +399,7 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
 
             // Write value and timestamp with strong barriers
             *item.val.get() = Some(x);
+            self.debug_items_written.fetch_add(1, Ordering::SeqCst);
             atomic::fence(Ordering::SeqCst);
             atomic::fence(Ordering::SeqCst);
             item.timestamp.store(timestamp);
@@ -407,6 +422,7 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
                 atomic::fence(Ordering::SeqCst);
             }
 
+            self.debug_enq_completed.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -416,6 +432,13 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
             atomic::fence(Ordering::SeqCst);
 
             let num = self.deq_counter.fetch_inc();
+
+            // Check if we've exceeded the deq_ops array size
+            if num >= 100_000 {
+                // Reset the counter or handle wraparound
+                eprintln!("Warning: dequeue counter {} exceeds array size", num);
+                return Err(());
+            }
 
             // Help operations in the range [max(1, num - k + 1), num]
             let help_start = if num > self.num_dequeuers {
@@ -427,10 +450,7 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
             // Execute helping in order with multiple passes
             for pass in 0..2 {
                 for i in help_start..=num {
-                    if i >= 100_000 {
-                        break;
-                    }
-
+                    // No need to check for 100_000 here since we already checked above
                     atomic::fence(Ordering::SeqCst);
                     let op_val = (*self.deq_ops).get_unchecked(i).load();
                     if op_val == DEQ_OPS_INIT {
@@ -454,14 +474,16 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
             // Get our result with very long waiting
             let mut op = (*self.deq_ops).get_unchecked(num).load();
             let mut wait_cycles = 0;
-            const MAX_WAIT: usize = 100000; // Much longer wait
+            const MAX_WAIT: usize = 100000;
 
             while op == DEQ_OPS_INIT && wait_cycles < MAX_WAIT {
-                // Help ALL operations multiple times
+                // Help ALL operations multiple times - but limit the range
                 for _ in 0..3 {
                     atomic::fence(Ordering::SeqCst);
 
-                    for i in 1..=num.min(99999) {
+                    // Only help operations within valid range
+                    let max_help = num.min(99999);
+                    for i in help_start..=max_help {
                         let op_val = (*self.deq_ops).get_unchecked(i).load();
                         if op_val == DEQ_OPS_INIT {
                             if i > 1 {
@@ -496,6 +518,7 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
             let (j, id) = unpack_u128(op);
 
             if id == DEQ_ID_EMPTY {
+                self.debug_deq_ops_empty.fetch_add(1, Ordering::SeqCst);
                 return Err(());
             }
 
@@ -508,6 +531,9 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
             atomic::fence(Ordering::SeqCst);
             let item = (*self.items).get_unchecked(id * self.items_per_process + j);
             let result = (*item.val.get()).take();
+            if result.is_some() {
+                self.debug_items_taken.fetch_add(1, Ordering::SeqCst);
+            }
             atomic::fence(Ordering::SeqCst);
             atomic::fence(Ordering::SeqCst);
 
@@ -517,6 +543,7 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
                 atomic::fence(Ordering::SeqCst);
             }
 
+            self.debug_deq_ops_completed.fetch_add(1, Ordering::SeqCst);
             result.ok_or(())
         }
     }
@@ -633,6 +660,74 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
+        }
+    }
+
+    pub fn print_debug_stats(&self) {
+        println!("JKMQueue Debug Stats:");
+        println!(
+            "  Items written: {}",
+            self.debug_items_written.load(Ordering::Acquire)
+        );
+        println!(
+            "  Items taken: {}",
+            self.debug_items_taken.load(Ordering::Acquire)
+        );
+        println!(
+            "  Enqueues completed: {}",
+            self.debug_enq_completed.load(Ordering::Acquire)
+        );
+        println!(
+            "  Dequeue ops completed: {}",
+            self.debug_deq_ops_completed.load(Ordering::Acquire)
+        );
+        println!(
+            "  Dequeue ops empty: {}",
+            self.debug_deq_ops_empty.load(Ordering::Acquire)
+        );
+
+        let deq_counter = self.deq_counter.v.load(Ordering::Acquire);
+        println!("  Dequeue counter: {}", deq_counter);
+
+        // Check per-process queues
+        unsafe {
+            let mut total_queued = 0;
+            for p in 0..self.num_processes {
+                let h = (*self.head).get_unchecked(p).max_read();
+                let t = (*self.tail).get_unchecked(p).load(Ordering::SeqCst);
+                if t > h {
+                    println!(
+                        "  Process {} queue: head={}, tail={}, items={}",
+                        p,
+                        h,
+                        t,
+                        t - h
+                    );
+                    total_queued += t - h;
+                }
+            }
+            println!("  Total items still in queues: {}", total_queued);
+
+            // Check deq_ops status
+            let mut pending_deq_ops = 0;
+            let mut completed_deq_ops = 0;
+            let mut empty_deq_ops = 0;
+
+            for i in 1..deq_counter.min(100000) {
+                let op = (*self.deq_ops).get_unchecked(i).load();
+                if op == DEQ_OPS_INIT {
+                    pending_deq_ops += 1;
+                } else if op == DEQ_OPS_EMPTY {
+                    empty_deq_ops += 1;
+                } else {
+                    completed_deq_ops += 1;
+                }
+            }
+
+            println!(
+                "  Deq ops - pending: {}, completed: {}, empty: {}",
+                pending_deq_ops, completed_deq_ops, empty_deq_ops
+            );
         }
     }
 }

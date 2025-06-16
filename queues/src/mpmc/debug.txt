@@ -1,0 +1,69 @@
+    pub fn print_debug_stats(&self) {
+        if self.num_threads <= 2 {
+            println!("WCQ Debug Stats:");
+            println!(
+                "  Data written: {}",
+                self.debug_data_written.load(Ordering::Acquire)
+            );
+            println!(
+                "  Data read: {}",
+                self.debug_data_read.load(Ordering::Acquire)
+            );
+            println!(
+                "  Indices enqueued: {}",
+                self.debug_enqueued_indices.load(Ordering::Acquire)
+            );
+            println!(
+                "  Indices dequeued: {}",
+                self.debug_dequeued_indices.load(Ordering::Acquire)
+            );
+            println!(
+                "  Total enqueued: {}",
+                self.total_enqueued.load(Ordering::Acquire)
+            );
+            println!(
+                "  Total dequeued: {}",
+                self.total_dequeued.load(Ordering::Acquire)
+            );
+
+            let aq_head = self.aq.head.cnt.load(Ordering::Acquire);
+            let aq_tail = self.aq.tail.cnt.load(Ordering::Acquire);
+            let aq_threshold = self.aq.threshold.load(Ordering::Acquire);
+
+            println!(
+                "  AQ head: {}, tail: {}, threshold: {}",
+                aq_head, aq_tail, aq_threshold
+            );
+        }
+    }
+
+
+
+    Benchmarking NaderibeniRuppertMPMC/1P_1C: Warming up for 5.0000 sWarning (MPMC): Total consumed 4999/5000 items. Q: queues::mpmc::polylog_queue::NRQueue<usize>, Prods: 1, Cons: 1
+NaderibeniRuppertMPMC/1P_1C
+                        time:   [673.53 ps 805.15 ps 1.1217 ns]
+                        change: [+72.758% +284.17% +768.16%] (p = 0.01 < 0.05)
+                        Performance has regressed.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+NaderibeniRuppertMPMC/2P_2C
+                        time:   [4.6901 ms 5.5793 ms 7.6833 ms]
+                        change: [−57.254% −2.1408% +111.73%] (p = 0.96 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+NaderibeniRuppertMPMC/4P_4C
+                        time:   [643.16 ms 658.44 ms 678.83 ms]
+                        change: [+1.7812% +4.4337% +7.5000%] (p = 0.01 < 0.05)
+                        Performance has regressed.
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) high mild
+  1 (10.00%) high severe
+Benchmarking NaderibeniRuppertMPMC/6P_6C: Warming up for 5.0000 s
+Warning: Unable to complete 10 samples in 10.0s. You may wish to increase target time to 54.7s.
+NaderibeniRuppertMPMC/6P_6C
+                        time:   [3.7560 s 3.7859 s 3.8099 s]
+                        change: [+3.2868% +4.6857% +5.9143%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low mild

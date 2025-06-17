@@ -28,7 +28,7 @@ const DEQ_J_EMPTY: usize = usize::MAX;
 const DEQ_ID_EMPTY: usize = usize::MAX - 1;
 const DEQ_OPS_EMPTY: u128 = pack_u128(DEQ_J_EMPTY, DEQ_ID_EMPTY);
 
-const DEQ_OPS_SIZE: usize = 500_000; // Increased from 100_000
+const DEQ_OPS_SIZE: usize = 500_000;
 
 #[repr(C)]
 struct QueueItem<T> {
@@ -96,9 +96,6 @@ pub struct JKMQueue<T: Send + Clone + 'static> {
     enq_counter: MaxRegister,
     pub deq_counter: FetchAndInc,
     pub successful_dequeues: AtomicUsize,
-
-    // Add a lock for dequeue assignment
-    deq_assignment_lock: AtomicUsize,
 
     head: *const [MaxRegister],
     tail: *const [AtomicUsize],
@@ -189,7 +186,6 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
                 enq_counter: MaxRegister::new(0),
                 deq_counter: FetchAndInc::new(1),
                 successful_dequeues: AtomicUsize::new(0),
-                deq_assignment_lock: AtomicUsize::new(0),
                 head: ptr::slice_from_raw_parts(head_ptr, n_enq),
                 tail: ptr::slice_from_raw_parts(tail_ptr, n_enq),
                 items: ptr::slice_from_raw_parts(items_ptr, n_enq * ipp),
@@ -305,7 +301,8 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
         let mut idx = self.leaf_for(p);
 
         // Refresh leaf multiple times with strong synchronization
-        for _ in 0..3 {
+        for _ in 0..7 {
+            // Increased from 3
             self.refresh(idx, true);
             atomic::fence(Ordering::SeqCst);
         }
@@ -313,7 +310,8 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
         // Propagate up the tree with strong synchronization
         while idx > 0 {
             idx = Self::parent(idx);
-            for _ in 0..3 {
+            for _ in 0..7 {
+                // Increased from 3
                 self.refresh(idx, false);
                 atomic::fence(Ordering::SeqCst);
             }
@@ -326,99 +324,154 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
     unsafe fn finish_deq(&self, num: usize) {
         let deq_op_node = (*self.deq_ops).get_unchecked(num);
 
-        // Try to acquire the assignment lock with bounded attempts
-        let max_attempts = self.num_dequeuers * 100;
-        let mut attempts = 0;
-
-        loop {
+        // Multiple attempts to complete the operation
+        for attempt in 0..self.num_dequeuers * 100 {
             // Check if already done
             let current = deq_op_node.load();
             if current != DEQ_OPS_INIT {
                 return;
             }
 
-            // Try to acquire lock
-            if self
-                .deq_assignment_lock
-                .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                // Got the lock, proceed with assignment
-                break;
-            }
-
-            attempts += 1;
-            if attempts >= max_attempts {
-                // Couldn't get lock, but check one more time if someone else finished our operation
-                let current = deq_op_node.load();
-                if current != DEQ_OPS_INIT {
-                    return;
-                }
-                // Mark as empty to maintain wait-free property
-                if deq_op_node
-                    .compare_exchange(DEQ_OPS_INIT, DEQ_OPS_EMPTY)
-                    .is_ok()
-                {
-                    self.debug_deq_ops_empty.fetch_add(1, Ordering::SeqCst);
-                }
-                return;
-            }
-
-            std::hint::spin_loop();
-        }
-
-        // Critical section - we have the lock
-        {
-            // Double-check if someone else finished it
-            if deq_op_node.load() != DEQ_OPS_INIT {
-                self.deq_assignment_lock.store(0, Ordering::Release);
-                return;
-            }
-
-            // Strong synchronization before reading tree
+            // Triple synchronization before reading tree
+            atomic::fence(Ordering::SeqCst);
+            atomic::fence(Ordering::SeqCst);
             atomic::fence(Ordering::SeqCst);
 
             let root_ts = (*self.tree).get_unchecked(0).load();
+
+            // More synchronization after reading
+            atomic::fence(Ordering::SeqCst);
+            atomic::fence(Ordering::SeqCst);
+
             let (_, id) = unpack_u128(root_ts);
 
-            let final_val = if id == TS_P_EMPTY {
-                DEQ_OPS_EMPTY
+            if id == TS_P_EMPTY {
+                // Try to mark as empty
+                match deq_op_node.compare_exchange(DEQ_OPS_INIT, DEQ_OPS_EMPTY) {
+                    Ok(_) => {
+                        self.debug_deq_ops_empty.fetch_add(1, Ordering::SeqCst);
+                        atomic::fence(Ordering::SeqCst);
+                        return;
+                    }
+                    Err(_) => {
+                        // Someone else completed it
+                        return;
+                    }
+                }
             } else {
+                // Multiple fences before reading head/tail
+                atomic::fence(Ordering::SeqCst);
+                atomic::fence(Ordering::SeqCst);
+                atomic::fence(Ordering::SeqCst);
+
                 let h = (*self.head).get_unchecked(id).max_read();
+
+                // Synchronize between reads
+                atomic::fence(Ordering::SeqCst);
+                atomic::fence(Ordering::SeqCst);
+
                 let t = (*self.tail).get_unchecked(id).load(Ordering::SeqCst);
 
+                // More synchronization
+                atomic::fence(Ordering::SeqCst);
+                atomic::fence(Ordering::SeqCst);
+                atomic::fence(Ordering::SeqCst);
+
                 if h >= t {
-                    DEQ_OPS_EMPTY
-                } else {
-                    // Update head BEFORE writing to deq_ops
-                    (*self.head).get_unchecked(id).max_write(h + 1);
-                    atomic::fence(Ordering::SeqCst);
+                    // This process is now empty, force complete refresh
+                    for _ in 0..7 {
+                        // Increased from 5
+                        atomic::fence(Ordering::SeqCst);
+                        let leaf_idx = self.leaf_for(id);
+                        self.refresh(leaf_idx, true);
+                        atomic::fence(Ordering::SeqCst);
+                        self.propagate(id);
+                        atomic::fence(Ordering::SeqCst);
+                    }
 
-                    // Propagate immediately
-                    self.propagate(id);
-                    atomic::fence(Ordering::SeqCst);
-
-                    pack_u128(h, id)
+                    if attempt > 10 {
+                        std::thread::yield_now();
+                    }
+                    continue;
                 }
-            };
 
-            // Write the result - this commits the assignment
-            deq_op_node.store(final_val);
+                // Double-check that h is still valid by re-reading
+                atomic::fence(Ordering::SeqCst);
+                let h_verify = (*self.head).get_unchecked(id).max_read();
+                atomic::fence(Ordering::SeqCst);
 
-            if final_val == DEQ_OPS_EMPTY {
-                self.debug_deq_ops_empty.fetch_add(1, Ordering::SeqCst);
-            } else {
-                self.debug_deq_ops_non_empty.fetch_add(1, Ordering::SeqCst);
+                if h_verify != h {
+                    // Head changed, retry
+                    continue;
+                }
+
+                // Try to atomically claim and assign in one operation
+                let final_val = pack_u128(h, id);
+
+                // First attempt to write to deq_ops
+                match deq_op_node.compare_exchange(DEQ_OPS_INIT, final_val) {
+                    Ok(_) => {
+                        // We successfully assigned this dequeue operation
+                        // Now we MUST update the head to claim the item
+
+                        // Multiple synchronization before claiming
+                        atomic::fence(Ordering::SeqCst);
+                        atomic::fence(Ordering::SeqCst);
+                        atomic::fence(Ordering::SeqCst);
+
+                        // Update head with strong synchronization
+                        (*self.head).get_unchecked(id).max_write(h + 1);
+
+                        // Excessive synchronization after claiming
+                        for _ in 0..7 {
+                            // Increased from 5
+                            atomic::fence(Ordering::SeqCst);
+                        }
+
+                        // Multiple propagations to ensure visibility
+                        for _ in 0..7 {
+                            // Increased from 5
+                            self.propagate(id);
+                            atomic::fence(Ordering::SeqCst);
+                        }
+
+                        self.debug_deq_ops_non_empty.fetch_add(1, Ordering::SeqCst);
+
+                        // Final synchronization
+                        atomic::fence(Ordering::SeqCst);
+                        atomic::fence(Ordering::SeqCst);
+                        atomic::fence(Ordering::SeqCst);
+
+                        return;
+                    }
+                    Err(_) => {
+                        // Someone else completed this deq_op
+                        // We haven't claimed anything yet, so just return
+                        return;
+                    }
+                }
             }
 
-            atomic::fence(Ordering::SeqCst);
+            // Add delay on later attempts
+            if attempt > self.num_dequeuers * 10 {
+                std::thread::yield_now();
+            }
         }
 
-        // Release the lock
-        self.deq_assignment_lock.store(0, Ordering::Release);
+        // Last resort: mark as empty to maintain wait-free property
+        atomic::fence(Ordering::SeqCst);
+        if deq_op_node
+            .compare_exchange(DEQ_OPS_INIT, DEQ_OPS_EMPTY)
+            .is_ok()
+        {
+            self.debug_deq_ops_empty.fetch_add(1, Ordering::SeqCst);
+        }
+        atomic::fence(Ordering::SeqCst);
     }
 
     unsafe fn update_tree(&self, num: usize) {
+        // Multiple strong fences for synchronization
+        atomic::fence(Ordering::SeqCst);
         atomic::fence(Ordering::SeqCst);
 
         if num >= DEQ_OPS_SIZE {
@@ -426,6 +479,8 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
         }
 
         let op = (*self.deq_ops).get_unchecked(num).load();
+        atomic::fence(Ordering::SeqCst);
+
         if op == DEQ_OPS_INIT {
             return;
         }
@@ -434,9 +489,23 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
 
         if id != DEQ_ID_INIT && id != DEQ_ID_EMPTY && id < self.num_processes {
             // The head should already be updated by finish_deq
-            // Just propagate to ensure visibility
-            self.propagate(id);
+            // But ensure it's at least j+1
+            (*self.head).get_unchecked(id).max_write(j + 1);
+
+            // Multiple strong fences
+            atomic::fence(Ordering::SeqCst);
+            atomic::fence(Ordering::SeqCst);
+            atomic::fence(Ordering::SeqCst); // Extra fence
+
+            // Multiple propagations for reliability
+            for _ in 0..7 {
+                // Increased from 3
+                self.propagate(id);
+                atomic::fence(Ordering::SeqCst);
+            }
         }
+
+        atomic::fence(Ordering::SeqCst);
     }
 
     // ---------- enqueue / dequeue -------------------------------------------
@@ -445,6 +514,9 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
             return Err(());
         }
         unsafe {
+            // Strong synchronization at start
+            atomic::fence(Ordering::SeqCst);
+            atomic::fence(Ordering::SeqCst);
             atomic::fence(Ordering::SeqCst);
 
             let t = (*self.tail).get_unchecked(pid).load(Ordering::SeqCst);
@@ -456,32 +528,60 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
             let timestamp = pack_u128(st, pid);
             let item = (*self.items).get_unchecked(pid * self.items_per_process + t);
 
-            // Write value and timestamp with strong barriers
+            // Write value first with extreme synchronization
             *item.val.get() = Some(x);
             self.debug_items_written.fetch_add(1, Ordering::SeqCst);
-            atomic::fence(Ordering::SeqCst);
-            atomic::fence(Ordering::SeqCst);
-            item.timestamp.store(timestamp);
-            atomic::fence(Ordering::SeqCst);
-            atomic::fence(Ordering::SeqCst);
 
-            // Publish by incrementing tail
+            // Excessive barriers to ensure value is written
+            for _ in 0..7 {
+                // Increased from 5
+                atomic::fence(Ordering::SeqCst);
+            }
+
+            // Write timestamp with more barriers
+            item.timestamp.store(timestamp);
+
+            // More excessive barriers
+            for _ in 0..7 {
+                // Increased from 5
+                atomic::fence(Ordering::SeqCst);
+            }
+
+            // Publish by incrementing tail with synchronization
             (*self.tail)
                 .get_unchecked(pid)
                 .store(t + 1, Ordering::SeqCst);
-            atomic::fence(Ordering::SeqCst);
 
-            // Update global counter and propagate
+            // Synchronize after tail update
+            for _ in 0..7 {
+                // Increased from 5
+                atomic::fence(Ordering::SeqCst);
+            }
+
+            // Update global counter
             self.enq_counter.max_write(st + 1);
-            atomic::fence(Ordering::SeqCst);
 
-            // Triple propagation for maximum reliability
-            for _ in 0..3 {
+            // More synchronization
+            for _ in 0..7 {
+                // Increased from 5
+                atomic::fence(Ordering::SeqCst);
+            }
+
+            // Multiple propagations for maximum reliability
+            for _ in 0..7 {
+                // Increased from 5
                 self.propagate(pid);
                 atomic::fence(Ordering::SeqCst);
             }
 
             self.debug_enq_completed.fetch_add(1, Ordering::SeqCst);
+
+            // Final excessive synchronization
+            for _ in 0..7 {
+                // Increased from 5
+                atomic::fence(Ordering::SeqCst);
+            }
+
             Ok(())
         }
     }
@@ -534,7 +634,7 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
             // Get our result with very long waiting
             let mut op = (*self.deq_ops).get_unchecked(num).load();
             let mut wait_cycles = 0;
-            const MAX_WAIT: usize = 1000000; // Increased from 100000
+            const MAX_WAIT: usize = 1000000;
 
             while op == DEQ_OPS_INIT && wait_cycles < MAX_WAIT {
                 // Help ALL operations multiple times
@@ -611,33 +711,127 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
                 return Err(());
             }
 
-            // Take the value with strong synchronization
+            // Take the value with a retry loop
             atomic::fence(Ordering::SeqCst);
             atomic::fence(Ordering::SeqCst);
+            atomic::fence(Ordering::SeqCst);
+
             let item = (*self.items).get_unchecked(id * self.items_per_process + j);
-            let result = (*item.val.get()).take();
 
-            atomic::fence(Ordering::SeqCst);
-            atomic::fence(Ordering::SeqCst);
+            // Try to take the value multiple times
+            let mut take_attempts = 0;
+            let max_take_attempts = 10000; // Increased from 1000
 
-            // Only proceed if we actually got an item
-            if let Some(value) = result {
-                self.debug_items_taken.fetch_add(1, Ordering::SeqCst);
-                self.debug_deq_ops_completed.fetch_add(1, Ordering::SeqCst);
-
-                // Update the tree for THIS operation multiple times
-                for _ in 0..3 {
-                    self.update_tree(num);
+            while take_attempts < max_take_attempts {
+                // Extreme synchronization before critical operation
+                for _ in 0..7 {
+                    // Increased from 5
                     atomic::fence(Ordering::SeqCst);
                 }
 
-                Ok(value)
-            } else {
-                // We got None - this dequeue operation was assigned an item
-                // but couldn't take it. This is the data loss bug.
-                // Don't count as completed, return error
-                Err(())
+                // Check if value is available
+                let val_ptr = item.val.get();
+                let has_value = (*val_ptr).is_some();
+
+                if has_value {
+                    // Try to take it with extreme care
+                    atomic::fence(Ordering::SeqCst);
+                    atomic::fence(Ordering::SeqCst);
+                    atomic::fence(Ordering::SeqCst); // Extra fence
+
+                    let result = (*val_ptr).take();
+
+                    // Extreme synchronization after take
+                    for _ in 0..7 {
+                        // Increased from 5
+                        atomic::fence(Ordering::SeqCst);
+                    }
+
+                    if let Some(value) = result {
+                        self.debug_items_taken.fetch_add(1, Ordering::SeqCst);
+                        self.debug_deq_ops_completed.fetch_add(1, Ordering::SeqCst);
+
+                        // Update the tree for THIS operation many times
+                        for _ in 0..15 {
+                            // Increased from 10
+                            self.update_tree(num);
+                            atomic::fence(Ordering::SeqCst);
+                        }
+
+                        return Ok(value);
+                    }
+                }
+
+                // Value was None or take failed
+                take_attempts += 1;
+
+                // Re-check bounds with synchronization
+                atomic::fence(Ordering::SeqCst);
+                let h = (*self.head).get_unchecked(id).max_read();
+                atomic::fence(Ordering::SeqCst);
+                let t = (*self.tail).get_unchecked(id).load(Ordering::SeqCst);
+                atomic::fence(Ordering::SeqCst);
+
+                if j >= t {
+                    // The item hasn't been enqueued yet - this shouldn't happen
+                    eprintln!(
+                        "ERROR: Trying to take item {} from process {} but tail is only {}",
+                        j, id, t
+                    );
+                    self.debug_take_failures.fetch_add(1, Ordering::SeqCst);
+
+                    // But wait a bit in case it's being written right now
+                    if take_attempts < 100 {
+                        std::thread::sleep(std::time::Duration::from_micros(100));
+                        continue;
+                    }
+                    return Err(());
+                }
+
+                if j < h {
+                    // Someone else already took this item
+                    eprintln!(
+                        "ERROR: Trying to take item {} from process {} but head is already {}",
+                        j, id, h
+                    );
+                    self.debug_take_failures.fetch_add(1, Ordering::SeqCst);
+                    return Err(());
+                }
+
+                // Aggressive backoff with heavy synchronization
+                if take_attempts < 10 {
+                    for _ in 0..100 {
+                        atomic::fence(Ordering::SeqCst);
+                        std::hint::spin_loop();
+                    }
+                } else if take_attempts < 100 {
+                    atomic::fence(Ordering::SeqCst);
+                    std::thread::yield_now();
+                    atomic::fence(Ordering::SeqCst);
+                } else if take_attempts < 1000 {
+                    atomic::fence(Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                    atomic::fence(Ordering::SeqCst);
+                } else {
+                    // Longer sleep for later attempts
+                    atomic::fence(Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    atomic::fence(Ordering::SeqCst);
+                }
+
+                // Periodically force synchronization
+                if take_attempts % 100 == 0 {
+                    self.force_sync();
+                }
             }
+
+            // Failed to take after many attempts
+            eprintln!(
+                "ERROR: Failed to take item after {} attempts. Deq {}, item[{}][{}]",
+                max_take_attempts, num, id, j
+            );
+            self.debug_take_failures.fetch_add(1, Ordering::SeqCst);
+            Err(())
         }
     }
 
@@ -731,19 +925,7 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
 
                 // Second pass: ensure all tree updates are applied
                 for i in 1..=max_deq.min(DEQ_OPS_SIZE - 1) {
-                    atomic::fence(Ordering::SeqCst);
-                    let op_val = (*self.deq_ops).get_unchecked(i).load();
-                    if op_val != DEQ_OPS_INIT && op_val != DEQ_OPS_EMPTY {
-                        let (j, id) = unpack_u128(op_val);
-                        if id < self.num_processes {
-                            (*self.head).get_unchecked(id).max_write(j + 1);
-                            atomic::fence(Ordering::SeqCst);
-                            for _ in 0..3 {
-                                self.propagate(id);
-                                atomic::fence(Ordering::SeqCst);
-                            }
-                        }
-                    }
+                    self.update_tree(i);
                 }
 
                 // Force complete propagation

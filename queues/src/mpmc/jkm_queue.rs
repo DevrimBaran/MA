@@ -326,27 +326,50 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
     unsafe fn finish_deq(&self, num: usize) {
         let deq_op_node = (*self.deq_ops).get_unchecked(num);
 
-        // Use CAS to ensure only one thread finishes this operation
-        let current = deq_op_node.load();
-        if current != DEQ_OPS_INIT {
-            return;
-        }
+        // Try to acquire the assignment lock with bounded attempts
+        let max_attempts = self.num_dequeuers * 100;
+        let mut attempts = 0;
 
-        // Acquire the assignment lock using a simple spinlock
         loop {
+            // Check if already done
+            let current = deq_op_node.load();
+            if current != DEQ_OPS_INIT {
+                return;
+            }
+
+            // Try to acquire lock
             if self
                 .deq_assignment_lock
                 .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
+                // Got the lock, proceed with assignment
                 break;
             }
+
+            attempts += 1;
+            if attempts >= max_attempts {
+                // Couldn't get lock, but check one more time if someone else finished our operation
+                let current = deq_op_node.load();
+                if current != DEQ_OPS_INIT {
+                    return;
+                }
+                // Mark as empty to maintain wait-free property
+                if deq_op_node
+                    .compare_exchange(DEQ_OPS_INIT, DEQ_OPS_EMPTY)
+                    .is_ok()
+                {
+                    self.debug_deq_ops_empty.fetch_add(1, Ordering::SeqCst);
+                }
+                return;
+            }
+
             std::hint::spin_loop();
         }
 
-        // Critical section - only one thread can assign dequeues at a time
+        // Critical section - we have the lock
         {
-            // Check again if someone else finished it while we waited
+            // Double-check if someone else finished it
             if deq_op_node.load() != DEQ_OPS_INIT {
                 self.deq_assignment_lock.store(0, Ordering::Release);
                 return;
@@ -364,23 +387,22 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
                 let h = (*self.head).get_unchecked(id).max_read();
                 let t = (*self.tail).get_unchecked(id).load(Ordering::SeqCst);
 
-                // Double-check that there's actually an item available
                 if h >= t {
-                    // No items in this queue, mark as empty
                     DEQ_OPS_EMPTY
                 } else {
-                    // We're going to assign this item, immediately update head
+                    // Update head BEFORE writing to deq_ops
                     (*self.head).get_unchecked(id).max_write(h + 1);
                     atomic::fence(Ordering::SeqCst);
 
-                    // Propagate the change before releasing lock
+                    // Propagate immediately
                     self.propagate(id);
+                    atomic::fence(Ordering::SeqCst);
 
                     pack_u128(h, id)
                 }
             };
 
-            // Write the result
+            // Write the result - this commits the assignment
             deq_op_node.store(final_val);
 
             if final_val == DEQ_OPS_EMPTY {
@@ -388,11 +410,12 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
             } else {
                 self.debug_deq_ops_non_empty.fetch_add(1, Ordering::SeqCst);
             }
+
+            atomic::fence(Ordering::SeqCst);
         }
 
         // Release the lock
         self.deq_assignment_lock.store(0, Ordering::Release);
-        atomic::fence(Ordering::SeqCst);
     }
 
     unsafe fn update_tree(&self, num: usize) {
@@ -511,7 +534,7 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
             // Get our result with very long waiting
             let mut op = (*self.deq_ops).get_unchecked(num).load();
             let mut wait_cycles = 0;
-            const MAX_WAIT: usize = 100000;
+            const MAX_WAIT: usize = 1000000; // Increased from 100000
 
             while op == DEQ_OPS_INIT && wait_cycles < MAX_WAIT {
                 // Help ALL operations multiple times
@@ -558,7 +581,24 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
                     "ERROR: Dequeue {} timed out waiting for result after {} cycles",
                     num, wait_cycles
                 );
-                return Err(());
+                // Try one more aggressive helping round
+                for i in 1..=num {
+                    if i >= DEQ_OPS_SIZE {
+                        break;
+                    }
+                    let op_val = (*self.deq_ops).get_unchecked(i).load();
+                    if op_val == DEQ_OPS_INIT {
+                        if i > 1 {
+                            self.update_tree(i - 1);
+                        }
+                        self.finish_deq(i);
+                    }
+                }
+                // Final check
+                op = (*self.deq_ops).get_unchecked(num).load();
+                if op == DEQ_OPS_INIT {
+                    return Err(());
+                }
             }
 
             let (j, id) = unpack_u128(op);

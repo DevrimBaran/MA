@@ -1,4 +1,5 @@
 pub mod burden_queue;
+pub mod feldman_dechev_queue;
 pub mod jkm_queue;
 pub mod kw_queue;
 pub mod polylog_queue;
@@ -8,6 +9,7 @@ pub mod wcq_queue;
 pub mod ymc_queue;
 
 pub use burden_queue::BurdenWFQueue;
+pub use feldman_dechev_queue::FeldmanDechevWFQueue;
 pub use jkm_queue::JKMQueue;
 pub use kw_queue::KWQueue;
 pub use polylog_queue::NRQueue;

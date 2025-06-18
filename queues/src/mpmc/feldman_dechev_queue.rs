@@ -3,7 +3,7 @@
 use std::cell::UnsafeCell;
 use std::mem;
 use std::ptr;
-use std::sync::atomic::{fence, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use crate::MpmcQueue;
 
@@ -11,6 +11,7 @@ const CACHE_LINE_SIZE: usize = 64;
 const MAX_FAILS: usize = 1000;
 const EMPTY_TYPE_MASK: u64 = 1; // LSB = 1 for EmptyType
 const DELAY_MARK_MASK: u64 = 2; // Second LSB = 1 for delay marked
+const CHECK_DELAY: usize = 8; // Check for announcements every 8 operations
 
 // Node types stored in the ring buffer
 #[derive(Clone, Copy)]
@@ -79,17 +80,74 @@ struct ValueType<T> {
     value: UnsafeCell<Option<T>>,
 }
 
-// Operation records for progress assurance
-#[repr(C)]
-struct EnqueueOp<T> {
-    value: T,
-    helper: AtomicPtr<Node>,
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum OpType {
+    Enqueue,
+    Dequeue,
 }
 
+// Operation record for enqueue
 #[repr(C)]
-struct DequeueOp<T> {
-    result: AtomicPtr<ValueType<T>>,
-    helper: AtomicPtr<Node>,
+struct EnqueueOp {
+    op_type: OpType,
+    value: AtomicUsize, // Store as atomic instead of UnsafeCell
+    seqid: AtomicU64,
+    complete: AtomicBool,
+}
+
+impl EnqueueOp {
+    fn new(value: usize) -> Self {
+        Self {
+            op_type: OpType::Enqueue,
+            value: AtomicUsize::new(value),
+            seqid: AtomicU64::new(0),
+            complete: AtomicBool::new(false),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.complete.load(Ordering::Acquire)
+    }
+
+    fn complete(&self) {
+        self.complete.store(true, Ordering::Release);
+    }
+}
+
+// Operation record for dequeue
+#[repr(C)]
+struct DequeueOp {
+    op_type: OpType,
+    result: AtomicUsize, // Store as atomic instead of UnsafeCell
+    seqid: AtomicU64,
+    complete: AtomicBool,
+}
+
+impl DequeueOp {
+    fn new() -> Self {
+        Self {
+            op_type: OpType::Dequeue,
+            result: AtomicUsize::new(0),
+            seqid: AtomicU64::new(0),
+            complete: AtomicBool::new(false),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.complete.load(Ordering::Acquire)
+    }
+
+    fn complete(&self) {
+        self.complete.store(true, Ordering::Release);
+    }
+
+    fn set_result(&self, value: usize) {
+        self.result.store(value, Ordering::Release);
+    }
+
+    fn get_result(&self) -> usize {
+        self.result.load(Ordering::Acquire)
+    }
 }
 
 // Main queue structure
@@ -104,14 +162,16 @@ pub struct FeldmanDechevWFQueue<T: Send + Clone + 'static> {
     // Progress assurance
     announcement_table: *mut AtomicPtr<()>, // Generic op pointers
     num_threads: usize,
+    operation_counter: *mut AtomicUsize, // Per-thread operation counters
+    help_index: *mut AtomicUsize,        // Per-thread help indices
 
     // Memory pools
     value_pool: *mut ValueType<usize>,
     value_pool_size: usize,
     next_value: AtomicUsize,
 
-    enq_op_pool: *mut EnqueueOp<usize>,
-    deq_op_pool: *mut DequeueOp<usize>,
+    enq_op_pool: *mut EnqueueOp,
+    deq_op_pool: *mut DequeueOp,
     next_enq_op: AtomicUsize,
     next_deq_op: AtomicUsize,
 
@@ -149,8 +209,148 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         false
     }
 
+    // Check for announcements and help other threads
+    unsafe fn check_for_announcement(&self, thread_id: usize) {
+        let op_count = (*self.operation_counter.add(thread_id)).fetch_add(1, Ordering::AcqRel);
+
+        if op_count % CHECK_DELAY == 0 {
+            let help_idx =
+                (*self.help_index.add(thread_id)).fetch_add(1, Ordering::AcqRel) % self.num_threads;
+            let announced_op = (*self.announcement_table.add(help_idx)).load(Ordering::Acquire);
+
+            if !announced_op.is_null() {
+                self.help_operation(announced_op, help_idx);
+            }
+        }
+    }
+
+    // Help another thread's operation
+    unsafe fn help_operation(&self, op_ptr: *mut (), helper_thread_id: usize) {
+        // First, determine what type of operation this is
+        let op_type_ptr = op_ptr as *const OpType;
+        let op_type = *op_type_ptr;
+
+        match op_type {
+            OpType::Enqueue => {
+                let enq_op = op_ptr as *mut EnqueueOp;
+                self.help_enqueue(enq_op, helper_thread_id);
+            }
+            OpType::Dequeue => {
+                let deq_op = op_ptr as *mut DequeueOp;
+                self.help_dequeue(deq_op, helper_thread_id);
+            }
+        }
+    }
+
+    // Help complete an enqueue operation
+    unsafe fn help_enqueue(&self, op: *mut EnqueueOp, helper_thread_id: usize) {
+        if (*op).is_complete() {
+            return;
+        }
+
+        let value = (*op).value.load(Ordering::Acquire);
+
+        // Try to complete the enqueue
+        let mut seqid = (*op).seqid.load(Ordering::Acquire);
+        if seqid == 0 {
+            seqid = self.tail.fetch_add(1, Ordering::AcqRel);
+            (*op).seqid.store(seqid, Ordering::Release);
+        }
+
+        let pos = (seqid % self.capacity as u64) as usize;
+        let node_val = self.get_node(pos).load(Ordering::Acquire);
+        let node = Node { value: node_val };
+
+        if node.is_empty() && node.get_seqid() <= seqid {
+            // Try to complete the enqueue
+            let value_idx = self.next_value.fetch_add(1, Ordering::AcqRel);
+            if value_idx < self.value_pool_size {
+                let value_ptr = self.value_pool.add(value_idx);
+                ptr::write(
+                    value_ptr,
+                    ValueType {
+                        seqid,
+                        value: UnsafeCell::new(Some(value)),
+                    },
+                );
+
+                let new_node = Node::new_value(value_ptr, seqid);
+
+                if self
+                    .get_node(pos)
+                    .compare_exchange(
+                        node_val,
+                        new_node.value,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    (*op).complete();
+                }
+            }
+        }
+    }
+
+    // Help complete a dequeue operation
+    unsafe fn help_dequeue(&self, op: *mut DequeueOp, helper_thread_id: usize) {
+        if (*op).is_complete() {
+            return;
+        }
+
+        // Try to complete the dequeue
+        let mut seqid = (*op).seqid.load(Ordering::Acquire);
+        if seqid == 0 {
+            seqid = self.head.fetch_add(1, Ordering::AcqRel);
+            (*op).seqid.store(seqid, Ordering::Release);
+        }
+
+        let pos = (seqid % self.capacity as u64) as usize;
+        let node_val = self.get_node(pos).load(Ordering::Acquire);
+        let node = Node { value: node_val };
+
+        if node.is_value() && node.get_seqid() == seqid {
+            let empty_node = Node::new_empty(seqid + self.capacity as u64);
+
+            if self
+                .get_node(pos)
+                .compare_exchange(
+                    node_val,
+                    empty_node.value,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                let value_ptr = node.get_value_ptr();
+                let value = (*(*value_ptr).value.get()).take().unwrap_or(0);
+                (*op).set_result(value);
+                (*op).complete();
+            }
+        }
+    }
+
+    // Make announcement for help
+    unsafe fn make_announcement(&self, thread_id: usize, op_ptr: *mut ()) {
+        (*self.announcement_table.add(thread_id)).store(op_ptr, Ordering::Release);
+
+        // Wait for help - up to num_threads^2 operations
+        let wait_threshold = self.num_threads * self.num_threads * CHECK_DELAY;
+        for _ in 0..wait_threshold {
+            std::hint::spin_loop();
+        }
+    }
+
+    // Clear announcement
+    unsafe fn clear_announcement(&self, thread_id: usize) {
+        (*self.announcement_table.add(thread_id)).store(ptr::null_mut(), Ordering::Release);
+    }
+
     pub fn enqueue(&self, thread_id: usize, item: T) -> Result<(), ()> {
         unsafe {
+            // Check for announcements periodically
+            self.check_for_announcement(thread_id);
+
             let mut fails = 0;
 
             // Convert item to usize once, outside the loop
@@ -160,9 +360,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
             loop {
                 if fails >= MAX_FAILS {
                     // Switch to wait-free slow path
-                    // Need to convert back for slow path
-                    let item_copy = std::mem::transmute_copy::<usize, T>(&value_as_usize);
-                    return self.enqueue_slow_path(thread_id, item_copy);
+                    return self.enqueue_slow_path(thread_id, value_as_usize);
                 }
 
                 let seqid = self.tail.fetch_add(1, Ordering::AcqRel);
@@ -241,6 +439,9 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
 
     pub fn dequeue(&self, thread_id: usize) -> Result<T, ()> {
         unsafe {
+            // Check for announcements periodically
+            self.check_for_announcement(thread_id);
+
             let mut fails = 0;
 
             loop {
@@ -386,17 +587,81 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         }
     }
 
-    // Placeholder for wait-free slow paths - would need full implementation
-    unsafe fn enqueue_slow_path(&self, _thread_id: usize, _item: T) -> Result<(), ()> {
-        // In a full implementation, this would use the announcement table
-        // and helper threads as described in the paper
-        Err(())
+    // Wait-free slow path for enqueue
+    unsafe fn enqueue_slow_path(&self, thread_id: usize, value: usize) -> Result<(), ()> {
+        // Allocate operation record
+        let op_idx = self.next_enq_op.fetch_add(1, Ordering::AcqRel);
+        if op_idx >= self.num_threads * 100 {
+            return Err(()); // Op pool exhausted
+        }
+
+        let op_ptr = self.enq_op_pool.add(op_idx);
+        ptr::write(op_ptr, EnqueueOp::new(value));
+
+        // Make announcement
+        self.make_announcement(thread_id, op_ptr as *mut ());
+
+        // Try to complete operation ourselves while waiting for help
+        let mut attempts = 0;
+        while !(*op_ptr).is_complete() && attempts < self.num_threads * self.num_threads {
+            self.help_enqueue(op_ptr, thread_id);
+            attempts += 1;
+
+            // Also help others
+            if attempts % CHECK_DELAY == 0 {
+                self.check_for_announcement(thread_id);
+            }
+        }
+
+        // Clear announcement
+        self.clear_announcement(thread_id);
+
+        if (*op_ptr).is_complete() {
+            Ok(())
+        } else {
+            Err(())
+        }
     }
 
-    unsafe fn dequeue_slow_path(&self, _thread_id: usize) -> Result<T, ()> {
-        // In a full implementation, this would use the announcement table
-        // and helper threads as described in the paper
-        Err(())
+    // Wait-free slow path for dequeue
+    unsafe fn dequeue_slow_path(&self, thread_id: usize) -> Result<T, ()> {
+        // Allocate operation record
+        let op_idx = self.next_deq_op.fetch_add(1, Ordering::AcqRel);
+        if op_idx >= self.num_threads * 100 {
+            return Err(()); // Op pool exhausted
+        }
+
+        let op_ptr = self.deq_op_pool.add(op_idx);
+        ptr::write(op_ptr, DequeueOp::new());
+
+        // Make announcement
+        self.make_announcement(thread_id, op_ptr as *mut ());
+
+        // Try to complete operation ourselves while waiting for help
+        let mut attempts = 0;
+        while !(*op_ptr).is_complete() && attempts < self.num_threads * self.num_threads {
+            self.help_dequeue(op_ptr, thread_id);
+            attempts += 1;
+
+            // Also help others
+            if attempts % CHECK_DELAY == 0 {
+                self.check_for_announcement(thread_id);
+            }
+        }
+
+        // Clear announcement
+        self.clear_announcement(thread_id);
+
+        if (*op_ptr).is_complete() {
+            let result = (*op_ptr).get_result();
+            if result != 0 {
+                Ok(std::mem::transmute_copy::<usize, T>(&result))
+            } else {
+                Err(())
+            }
+        } else {
+            Err(())
+        }
     }
 
     pub unsafe fn init_in_shared(mem: *mut u8, num_threads: usize) -> &'static mut Self {
@@ -418,24 +683,32 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         let announcement_aligned =
             (announcement_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
+        // Operation counters
+        let op_counter_offset = announcement_offset + announcement_aligned;
+        let op_counter_size = num_threads * mem::size_of::<AtomicUsize>();
+        let op_counter_aligned = (op_counter_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
+
+        // Help indices
+        let help_index_offset = op_counter_offset + op_counter_aligned;
+        let help_index_size = num_threads * mem::size_of::<AtomicUsize>();
+        let help_index_aligned = (help_index_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
+
         // Value pool
         let items_per_thread = 250_000;
         let value_pool_size = num_threads * items_per_thread;
-        let value_pool_offset = announcement_offset + announcement_aligned;
+        let value_pool_offset = help_index_offset + help_index_aligned;
         let value_pool_bytes = value_pool_size * mem::size_of::<ValueType<usize>>();
         let value_pool_aligned = (value_pool_bytes + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
         // Op pools
         let op_pool_size = num_threads * 100;
         let enq_op_pool_offset = value_pool_offset + value_pool_aligned;
-        let enq_op_pool_bytes = op_pool_size * mem::size_of::<EnqueueOp<usize>>();
+        let enq_op_pool_bytes = op_pool_size * mem::size_of::<EnqueueOp>();
         let enq_op_pool_aligned =
             (enq_op_pool_bytes + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
         let deq_op_pool_offset = enq_op_pool_offset + enq_op_pool_aligned;
-        let deq_op_pool_bytes = op_pool_size * mem::size_of::<DequeueOp<usize>>();
-
-        let total_size = deq_op_pool_offset + deq_op_pool_bytes;
+        let _deq_op_pool_bytes = op_pool_size * mem::size_of::<DequeueOp>();
 
         // Initialize buffer
         let buffer_ptr = mem.add(buffer_offset) as *mut AtomicU64;
@@ -450,6 +723,18 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
             ptr::write(announcement_ptr.add(i), AtomicPtr::new(ptr::null_mut()));
         }
 
+        // Initialize operation counters
+        let op_counter_ptr = mem.add(op_counter_offset) as *mut AtomicUsize;
+        for i in 0..num_threads {
+            ptr::write(op_counter_ptr.add(i), AtomicUsize::new(0));
+        }
+
+        // Initialize help indices
+        let help_index_ptr = mem.add(help_index_offset) as *mut AtomicUsize;
+        for i in 0..num_threads {
+            ptr::write(help_index_ptr.add(i), AtomicUsize::new(i)); // Start at different positions
+        }
+
         // Initialize queue
         ptr::write(
             queue_ptr,
@@ -460,15 +745,17 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
                 tail: AtomicU64::new(0),
                 announcement_table: announcement_ptr,
                 num_threads,
+                operation_counter: op_counter_ptr,
+                help_index: help_index_ptr,
                 value_pool: mem.add(value_pool_offset) as *mut ValueType<usize>,
                 value_pool_size,
                 next_value: AtomicUsize::new(0),
-                enq_op_pool: mem.add(enq_op_pool_offset) as *mut EnqueueOp<usize>,
-                deq_op_pool: mem.add(deq_op_pool_offset) as *mut DequeueOp<usize>,
+                enq_op_pool: mem.add(enq_op_pool_offset) as *mut EnqueueOp,
+                deq_op_pool: mem.add(deq_op_pool_offset) as *mut DequeueOp,
                 next_enq_op: AtomicUsize::new(0),
                 next_deq_op: AtomicUsize::new(0),
                 base_ptr: mem,
-                total_size,
+                total_size: 0, // Will be set below
                 _phantom: std::marker::PhantomData,
             },
         );
@@ -489,21 +776,29 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         let announcement_aligned =
             (announcement_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
+        let op_counter_size = num_threads * mem::size_of::<AtomicUsize>();
+        let op_counter_aligned = (op_counter_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
+
+        let help_index_size = num_threads * mem::size_of::<AtomicUsize>();
+        let help_index_aligned = (help_index_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
+
         let items_per_thread = 250_000;
         let value_pool_size = num_threads * items_per_thread;
         let value_pool_bytes = value_pool_size * mem::size_of::<ValueType<usize>>();
         let value_pool_aligned = (value_pool_bytes + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
         let op_pool_size = num_threads * 100;
-        let enq_op_pool_bytes = op_pool_size * mem::size_of::<EnqueueOp<usize>>();
+        let enq_op_pool_bytes = op_pool_size * mem::size_of::<EnqueueOp>();
         let enq_op_pool_aligned =
             (enq_op_pool_bytes + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
-        let deq_op_pool_bytes = op_pool_size * mem::size_of::<DequeueOp<usize>>();
+        let deq_op_pool_bytes = op_pool_size * mem::size_of::<DequeueOp>();
 
         let total = queue_aligned
             + buffer_aligned
             + announcement_aligned
+            + op_counter_aligned
+            + help_index_aligned
             + value_pool_aligned
             + enq_op_pool_aligned
             + deq_op_pool_bytes;

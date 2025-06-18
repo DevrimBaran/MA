@@ -26,6 +26,7 @@ pub use mpmc::FeldmanDechevWFQueue;
 pub use mpmc::JKMQueue;
 pub use mpmc::KWQueue;
 pub use mpmc::NRQueue;
+pub use mpmc::SDPWFQueue;
 pub use mpmc::TurnQueue;
 pub use mpmc::WCQueue;
 pub use mpmc::WFQueue;

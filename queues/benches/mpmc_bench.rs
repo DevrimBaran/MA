@@ -6,8 +6,8 @@ use nix::{
 };
 use queues::mpmc::{self, polylog_queue, ymc_queue};
 use queues::mpmc::{
-    BurdenWFQueue, FeldmanDechevWFQueue, JKMQueue, KWQueue, NRQueue, SDPWFQueue, TurnQueue,
-    WCQueue, WFQueue, YangCrummeyQueue,
+    BurdenWFQueue, FeldmanDechevWFQueue, JKMQueue, KPQueue, KWQueue, NRQueue, SDPWFQueue,
+    TurnQueue, WCQueue, WFQueue, YangCrummeyQueue,
 };
 use queues::MpmcQueue;
 use std::ptr;
@@ -210,6 +210,24 @@ impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for FeldmanDechevWFQueue<T> {
 }
 
 impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for SDPWFQueue<T> {
+    fn bench_push(&self, item: T, process_id: usize) -> Result<(), ()> {
+        self.enqueue(process_id, item)
+    }
+
+    fn bench_pop(&self, process_id: usize) -> Result<T, ()> {
+        self.dequeue(process_id)
+    }
+
+    fn bench_is_empty(&self) -> bool {
+        self.is_empty()
+    }
+
+    fn bench_is_full(&self) -> bool {
+        self.is_full()
+    }
+}
+
+impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for KPQueue<T> {
     fn bench_push(&self, item: T, process_id: usize) -> Result<(), ()> {
         self.enqueue(process_id, item)
     }
@@ -1207,6 +1225,37 @@ fn bench_sdp_queue(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_kogan_petrank_queue(c: &mut Criterion) {
+    let mut group = c.benchmark_group("KoganPetrankMPMC");
+
+    for &(num_prods, num_cons) in PROCESS_COUNTS_TO_TEST {
+        let items_per_process = ITEMS_PER_PROCESS_TARGET;
+        let total_processes = num_prods + num_cons;
+
+        group.bench_function(
+            format!("{}P_{}C", num_prods, num_cons),
+            |b: &mut Bencher| {
+                b.iter_custom(|_iters| {
+                    fork_and_run_mpmc_with_helper::<KPQueue<usize>, _>(
+                        || {
+                            let bytes = KPQueue::<usize>::shared_size(total_processes);
+                            let shm_ptr = unsafe { map_shared(bytes) };
+                            let q = unsafe { KPQueue::init_in_shared(shm_ptr, total_processes) };
+                            (q, shm_ptr, bytes)
+                        },
+                        num_prods,
+                        num_cons,
+                        items_per_process,
+                        false, // needs_helper = false (internal helping mechanism)
+                    )
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(5))
@@ -1218,6 +1267,7 @@ criterion_group! {
     name = benches;
     config = custom_criterion();
     targets =
+        bench_kogan_petrank_queue,
         bench_sdp_queue,
         bench_feldman_dechev_wf_queue,
         bench_turn_queue,

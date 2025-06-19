@@ -37,6 +37,11 @@ name = "mpmc_bench"
 harness = false
 required-features = ["bench"]
 
+[[bench]]
+name = "spmc_bench"
+harness = false
+required-features = ["bench"]
+
 [profile.release]
 debug = 2
 split-debuginfo = "off"

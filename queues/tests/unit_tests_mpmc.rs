@@ -28,7 +28,7 @@ unsafe fn deallocate_shared_memory(ptr: *mut u8, size: usize) {
 }
 
 // Macro to generate tests for each queue type
-macro_rules! test_queue {
+macro_rules! mpmc_test_queue {
     ($module_name:ident, $queue_type:ty, $init_fn:expr, $size_fn:expr, $needs_helper:expr) => {
         mod $module_name {
             use super::*;
@@ -343,7 +343,7 @@ unsafe fn init_wf_queue(mem: *mut u8, num_threads: usize) -> &'static mut WFQueu
 }
 
 // Generate tests for each queue type (except NRQueue which has special handling)
-test_queue!(
+mpmc_test_queue!(
     test_yang_crummey,
     YangCrummeyQueue<usize>,
     YangCrummeyQueue::<usize>::init_in_shared,
@@ -351,7 +351,7 @@ test_queue!(
     false
 );
 
-test_queue!(
+mpmc_test_queue!(
     test_kw_queue,
     KWQueue<usize>,
     KWQueue::<usize>::init_in_shared,
@@ -359,7 +359,7 @@ test_queue!(
     false
 );
 
-test_queue!(
+mpmc_test_queue!(
     test_burden_wf,
     BurdenWFQueue<usize>,
     BurdenWFQueue::<usize>::init_in_shared,
@@ -367,7 +367,7 @@ test_queue!(
     false
 );
 
-test_queue!(
+mpmc_test_queue!(
     test_wcq_queue,
     WCQueue<usize>,
     WCQueue::<usize>::init_in_shared,
@@ -375,7 +375,7 @@ test_queue!(
     false
 );
 
-test_queue!(
+mpmc_test_queue!(
     test_turn_queue,
     TurnQueue<usize>,
     TurnQueue::<usize>::init_in_shared,
@@ -383,7 +383,7 @@ test_queue!(
     false
 );
 
-test_queue!(
+mpmc_test_queue!(
     test_feldman_dechev,
     FeldmanDechevWFQueue<usize>,
     FeldmanDechevWFQueue::<usize>::init_in_shared,
@@ -391,7 +391,7 @@ test_queue!(
     false
 );
 
-test_queue!(
+mpmc_test_queue!(
     test_kogan_petrank,
     KPQueue<usize>,
     KPQueue::<usize>::init_in_shared,
@@ -399,7 +399,7 @@ test_queue!(
     false
 );
 
-test_queue!(
+mpmc_test_queue!(
     test_feldman_dechev_standard,
     FeldmanDechevWFQueue<usize>,
     FeldmanDechevWFQueue::<usize>::init_in_shared,

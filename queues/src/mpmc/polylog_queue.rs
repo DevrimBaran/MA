@@ -345,13 +345,19 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
     }
 
     pub fn simple_dequeue(&self, thread_id: usize) -> Result<T, ()> {
-        const MAX_RETRIES: usize = 10;
-        const SYNC_ROUNDS: usize = 5;
+        const MAX_RETRIES: usize = 50; // Significantly increased
+        const INITIAL_SYNC_ROUNDS: usize = 10; // More aggressive initial sync
 
         unsafe {
+            // First, ensure strong synchronization before we check availability
+            for _ in 0..INITIAL_SYNC_ROUNDS {
+                self.sync();
+            }
+
             let root = &*self.root;
             let initial_root_head = root.head.load(Ordering::Acquire);
 
+            // Get the current queue state AFTER synchronization
             let (initial_total_enq, initial_total_deq) = if initial_root_head > 0 {
                 if let Some(last_block) = root.get_block(initial_root_head - 1) {
                     (
@@ -365,59 +371,84 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 (0, 0)
             };
 
+            // Check if queue is empty
             if initial_total_enq <= initial_total_deq {
                 return Err(());
             }
 
+            // Now append our dequeue - we know there's at least one item
             self.append(thread_id, None);
 
+            // Our dequeue will be the (initial_total_deq + 1)th dequeue
             let my_deq_rank = initial_total_deq + 1;
 
-            for _ in 0..SYNC_ROUNDS {
+            // Aggressive synchronization to ensure our dequeue propagates
+            for _ in 0..INITIAL_SYNC_ROUNDS {
                 self.force_complete_sync();
             }
 
+            // Now find which enqueue we should return
             for retry in 0..MAX_RETRIES {
                 let current_root_head = root.head.load(Ordering::Acquire);
 
-                for block_idx in initial_root_head.saturating_sub(1)..current_root_head {
+                // Search through blocks to verify our dequeue is registered
+                for block_idx in 1..current_root_head {
                     if let Some(block) = root.get_block(block_idx) {
                         let block_total_deq = block.sumdeq.load(Ordering::Acquire);
 
+                        // Check if this block contains our dequeue
                         if block_total_deq >= my_deq_rank {
                             let block_total_enq = block.sumenq.load(Ordering::Acquire);
 
+                            // Ensure there are enough enqueues for our dequeue
                             if my_deq_rank <= block_total_enq {
-                                match self.get_enqueue_by_rank(my_deq_rank) {
-                                    Ok(val) => return Ok(val),
-                                    Err(_) => {
-                                        if retry < MAX_RETRIES - 1 {
+                                // Try to get the enqueue multiple times with sync
+                                for attempt in 0..5 {
+                                    match self.get_enqueue_by_rank(my_deq_rank) {
+                                        Ok(val) => return Ok(val),
+                                        Err(_) => {
+                                            // Synchronize and retry
                                             self.force_complete_sync();
-                                            break;
+                                            std::thread::yield_now();
                                         }
                                     }
                                 }
                             } else {
+                                // This dequeue found the queue empty
                                 return Err(());
                             }
                         }
                     }
                 }
 
+                // Our dequeue hasn't appeared in root yet, synchronize more
                 if retry < MAX_RETRIES - 1 {
-                    self.force_complete_sync();
-                    std::thread::yield_now();
+                    for _ in 0..5 {
+                        self.force_complete_sync();
+                    }
+                    // Exponential backoff
+                    std::thread::sleep(std::time::Duration::from_micros((retry + 1) as u64));
                 }
             }
 
+            // Final attempt - check the very latest state
+            self.force_complete_sync();
             let final_root_head = root.head.load(Ordering::Acquire);
+
             if let Some(last_block) = root.get_block(final_root_head - 1) {
                 let final_total_enq = last_block.sumenq.load(Ordering::Acquire);
                 let final_total_deq = last_block.sumdeq.load(Ordering::Acquire);
 
-                if final_total_deq >= my_deq_rank {
-                    if my_deq_rank > final_total_enq {
-                        return Err(());
+                // Our dequeue should definitely be counted by now
+                if final_total_deq >= my_deq_rank && my_deq_rank <= final_total_enq {
+                    // One last attempt to get the value
+                    match self.get_enqueue_by_rank(my_deq_rank) {
+                        Ok(val) => return Ok(val),
+                        Err(_) => {
+                            // This is the data loss case - we know the item exists but can't find it
+                            eprintln!("ERROR: NRQueue data loss - dequeue {} should get enqueue {} but failed",
+                                     my_deq_rank, my_deq_rank);
+                        }
                     }
                 }
             }
@@ -430,12 +461,17 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
     fn get_enqueue_by_rank(&self, rank: usize) -> Result<T, ()> {
         unsafe {
             let root = &*self.root;
+
+            // Synchronize before searching
+            self.sync();
+
             let root_head = root.head.load(Ordering::Acquire);
 
             if root_head <= 1 || rank == 0 {
                 return Err(());
             }
 
+            // Binary search for the block containing our rank
             let mut left = 1;
             let mut right = root_head - 1;
             let mut target_block = 0;
@@ -459,6 +495,16 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 return Err(());
             }
 
+            // Verify the block still contains our rank after potential racing updates
+            if let Some(block) = root.get_block(target_block) {
+                let block_sum_enq = block.sumenq.load(Ordering::Acquire);
+                if block_sum_enq < rank {
+                    // Race condition - retry with synchronization
+                    self.sync();
+                    return self.get_enqueue_by_rank(rank);
+                }
+            }
+
             let prev_sum_enq = if target_block > 1 {
                 root.get_block(target_block - 1)
                     .map(|b| b.sumenq.load(Ordering::Acquire))
@@ -468,7 +514,20 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
             };
 
             let rank_in_block = rank - prev_sum_enq;
-            self.get_enqueue(root, target_block, rank_in_block)
+
+            // Add retry logic for get_enqueue as well
+            for attempt in 0..3 {
+                match self.get_enqueue(root, target_block, rank_in_block) {
+                    Ok(val) => return Ok(val),
+                    Err(_) if attempt < 2 => {
+                        self.sync();
+                        continue;
+                    }
+                    Err(_) => return Err(()),
+                }
+            }
+
+            Err(())
         }
     }
 

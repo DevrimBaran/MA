@@ -52,6 +52,12 @@ struct Node<T> {
     is_root: bool,
     process_id: usize,
 
+    // FIX: Store the blocks pointer directly
+    blocks_ptr: *mut Block<T>,
+
+    // FIX: Store node's index for navigation
+    node_index: usize,
+
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -68,15 +74,15 @@ impl<T> Node<T> {
             is_leaf: false,
             is_root: false,
             process_id: usize::MAX,
+            blocks_ptr: ptr::null_mut(),
+            node_index: 0,
             _phantom: std::marker::PhantomData,
         }
     }
 
+    // FIX: Simply return the stored pointer
     unsafe fn get_blocks_ptr(&self) -> *mut Block<T> {
-        let node_ptr = self as *const Self as *mut u8;
-        let blocks_offset = mem::size_of::<Self>();
-        let aligned_offset = (blocks_offset + 63) & !63;
-        node_ptr.add(aligned_offset) as *mut Block<T>
+        self.blocks_ptr
     }
 
     unsafe fn get_block(&self, index: usize) -> Option<&Block<T>> {
@@ -120,6 +126,22 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
 
     unsafe fn get_node(&self, index: usize) -> &Node<T> {
         &*self.get_node_ptr(index)
+    }
+
+    // FIX: Calculate blocks pointer from base_ptr during initialization
+    unsafe fn calculate_blocks_ptr(
+        base_ptr: *mut u8,
+        nodes_offset: usize,
+        node_index: usize,
+        node_size: usize,
+    ) -> *mut Block<T> {
+        let node_offset = nodes_offset + (node_index * node_size);
+        let node_base = base_ptr.add(node_offset);
+
+        let node_struct_size = mem::size_of::<Node<T>>();
+        let blocks_offset = (node_struct_size + 63) & !63;
+
+        node_base.add(blocks_offset) as *mut Block<T>
     }
 
     fn append(&self, process_id: usize, element: Option<T>) {
@@ -327,11 +349,9 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
         const SYNC_ROUNDS: usize = 5;
 
         unsafe {
-            // Take a snapshot of the queue state BEFORE appending
             let root = &*self.root;
             let initial_root_head = root.head.load(Ordering::Acquire);
 
-            // Get the total number of operations before our dequeue
             let (initial_total_enq, initial_total_deq) = if initial_root_head > 0 {
                 if let Some(last_block) = root.get_block(initial_root_head - 1) {
                     (
@@ -345,42 +365,32 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 (0, 0)
             };
 
-            // Check if queue is empty before we even try
             if initial_total_enq <= initial_total_deq {
                 return Err(());
             }
 
-            // Now append our dequeue
             self.append(thread_id, None);
 
-            // Our dequeue will be the (initial_total_deq + 1)th dequeue
             let my_deq_rank = initial_total_deq + 1;
 
-            // Multiple sync rounds to ensure propagation
             for _ in 0..SYNC_ROUNDS {
                 self.force_complete_sync();
             }
 
-            // Now search for our dequeue with retries
             for retry in 0..MAX_RETRIES {
                 let current_root_head = root.head.load(Ordering::Acquire);
 
-                // Search through all blocks from initial position to current
                 for block_idx in initial_root_head.saturating_sub(1)..current_root_head {
                     if let Some(block) = root.get_block(block_idx) {
                         let block_total_deq = block.sumdeq.load(Ordering::Acquire);
 
-                        // Our dequeue is in this block if block_total_deq >= my_deq_rank
                         if block_total_deq >= my_deq_rank {
-                            // Check if it's a successful dequeue
                             let block_total_enq = block.sumenq.load(Ordering::Acquire);
 
                             if my_deq_rank <= block_total_enq {
-                                // Find the enqueue corresponding to our dequeue
                                 match self.get_enqueue_by_rank(my_deq_rank) {
                                     Ok(val) => return Ok(val),
                                     Err(_) => {
-                                        // Sync more and retry
                                         if retry < MAX_RETRIES - 1 {
                                             self.force_complete_sync();
                                             break;
@@ -388,30 +398,25 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                                     }
                                 }
                             } else {
-                                // Our dequeue is null - queue was empty
                                 return Err(());
                             }
                         }
                     }
                 }
 
-                // If we haven't found it yet, sync more
                 if retry < MAX_RETRIES - 1 {
                     self.force_complete_sync();
                     std::thread::yield_now();
                 }
             }
 
-            // Final attempt: check if we became null due to insufficient enqueues
             let final_root_head = root.head.load(Ordering::Acquire);
             if let Some(last_block) = root.get_block(final_root_head - 1) {
                 let final_total_enq = last_block.sumenq.load(Ordering::Acquire);
                 let final_total_deq = last_block.sumdeq.load(Ordering::Acquire);
 
-                // Verify our dequeue is accounted for
                 if final_total_deq >= my_deq_rank {
                     if my_deq_rank > final_total_enq {
-                        // Confirmed null dequeue
                         return Err(());
                     }
                 }
@@ -431,7 +436,6 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 return Err(());
             }
 
-            // Binary search for the block containing the rank-th enqueue
             let mut left = 1;
             let mut right = root_head - 1;
             let mut target_block = 0;
@@ -455,7 +459,6 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 return Err(());
             }
 
-            // Get the exact position within the block
             let prev_sum_enq = if target_block > 1 {
                 root.get_block(target_block - 1)
                     .map(|b| b.sumenq.load(Ordering::Acquire))
@@ -471,7 +474,6 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
 
     pub fn sync(&self) {
         unsafe {
-            // First: propagate all leaf operations
             for i in 0..self.num_processes {
                 let leaf = self.get_leaf(i);
                 let head = leaf.head.load(Ordering::Acquire);
@@ -485,9 +487,7 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 }
             }
 
-            // Multiple complete tree traversals
             for _ in 0..3 {
-                // Bottom-up to ensure children propagate before parents
                 for level in (0..=self.tree_height).rev() {
                     let start_idx = (1 << level) - 1;
                     let end_idx = (1 << (level + 1)) - 1;
@@ -495,7 +495,6 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                     for idx in start_idx..end_idx.min(start_idx + (1 << level)) {
                         let node = self.get_node(idx);
 
-                        // Multiple refresh attempts
                         for _ in 0..3 {
                             self.refresh(node);
                         }
@@ -508,7 +507,6 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 }
             }
 
-            // Final root refresh
             let root = &*self.root;
             for _ in 0..3 {
                 self.refresh(root);
@@ -666,12 +664,10 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
 
     pub fn force_complete_sync(&self) {
         unsafe {
-            // More aggressive sync
             for _ in 0..3 {
                 self.sync();
             }
 
-            // Force refresh from leaves to root
             for level in (0..=self.tree_height).rev() {
                 let start_idx = (1 << level) - 1;
                 let end_idx = (1 << (level + 1)) - 1;
@@ -723,11 +719,19 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
 
         let queue = &mut *queue_ptr;
 
+        // FIX: Initialize nodes with proper blocks pointers
         for i in 0..tree_size {
             let node_ptr = queue.get_node_ptr(i);
             ptr::write(node_ptr, Node::new());
 
-            let blocks_ptr = (*node_ptr).get_blocks_ptr();
+            let node = &mut *node_ptr;
+            node.node_index = i;
+
+            // Calculate and store blocks pointer
+            node.blocks_ptr = Self::calculate_blocks_ptr(mem, nodes_offset, i, node_size_aligned);
+
+            // Initialize blocks
+            let blocks_ptr = node.blocks_ptr;
             for j in 0..BLOCKS_PER_NODE {
                 ptr::write(blocks_ptr.add(j), Block::new());
             }
@@ -735,6 +739,7 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
 
         queue.root = queue.get_node_ptr(0);
 
+        // Set up tree structure
         for i in 0..tree_size {
             let node = &mut *queue.get_node_ptr(i);
 
@@ -762,6 +767,7 @@ impl<T: Send + Clone + 'static> NRQueue<T> {
                 node.is_root = true;
             }
 
+            // Initialize sentinel block
             let blocks = node.get_blocks_ptr();
             let sentinel = &*blocks.add(0);
             sentinel.sumenq.store(0, Ordering::Release);

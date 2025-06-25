@@ -1267,14 +1267,6 @@ criterion_group! {
     name = benches;
     config = custom_criterion();
     targets =
-        bench_kogan_petrank_queue,
-        bench_sdp_queue,
-        bench_feldman_dechev_wf_queue,
-        bench_turn_queue,
-        bench_wf_queue,
-        bench_yang_crummey,
-        bench_kw_queue,
-        bench_burden_wf_queue,
         bench_nr_queue,
         bench_jkm_queue,
         bench_wcq_queue

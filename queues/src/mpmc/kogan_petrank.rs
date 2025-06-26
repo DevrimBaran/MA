@@ -93,7 +93,7 @@ impl<T> AtomicOpDesc<T> {
         }
     }
 
-    unsafe fn store(&self, desc: OpDesc<T>, desc_pool: &mut DescPool<T>) -> *mut OpDesc<T> {
+    unsafe fn store(&self, desc: OpDesc<T>, desc_pool: &DescPool<T>) -> *mut OpDesc<T> {
         let desc_ptr = desc_pool.allocate(desc);
         self.version.fetch_add(1, Ordering::AcqRel);
         self.data.store(desc_ptr as usize, Ordering::Release);
@@ -104,7 +104,7 @@ impl<T> AtomicOpDesc<T> {
         &self,
         expected: &OpDesc<T>,
         new_desc: OpDesc<T>,
-        desc_pool: &mut DescPool<T>,
+        desc_pool: &DescPool<T>,
     ) -> Result<(), OpDesc<T>> {
         let current_ptr = self.data.load(Ordering::Acquire) as *mut OpDesc<T>;
 
@@ -167,7 +167,7 @@ impl<T> DescPool<T> {
         }
     }
 
-    unsafe fn allocate(&mut self, desc: OpDesc<T>) -> *mut OpDesc<T> {
+    unsafe fn allocate(&self, desc: OpDesc<T>) -> *mut OpDesc<T> {
         let idx = self.next_desc.fetch_add(1, Ordering::AcqRel) % self.pool_size;
         let ptr = self.pool.add(idx);
         ptr::write(ptr, desc);
@@ -206,8 +206,8 @@ impl<T: Send + Clone + 'static> KPQueue<T> {
     }
 
     // Get descriptor pool for thread
-    unsafe fn get_desc_pool(&self, tid: usize) -> &mut DescPool<T> {
-        &mut *self.desc_pools.add(tid)
+    unsafe fn get_desc_pool(&self, tid: usize) -> &DescPool<T> {
+        &*self.desc_pools.add(tid)
     }
 
     // Allocate a node from the pool

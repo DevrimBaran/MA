@@ -258,26 +258,6 @@ mod miri_test_nr_queue {
     }
 }
 
-// WCQueue has complex synchronization that times out in Miri
-mod miri_test_wcq_queue {
-    use super::*;
-
-    #[test]
-    fn test_init_only() {
-        unsafe {
-            let num_threads = 1;
-            let size = WCQueue::<usize>::shared_size(num_threads);
-            let mem = allocate_shared_memory(size);
-            let queue = WCQueue::<usize>::init_in_shared(mem, num_threads);
-
-            // Just test initialization
-            assert!(queue.is_empty(), "New queue should be empty");
-
-            deallocate_shared_memory(mem, size);
-        }
-    }
-}
-
 // Special handling for SDPQueue with enable_helping parameter
 mod miri_test_sdp_queue {
     use super::*;

@@ -73,17 +73,17 @@ unsafe impl<T: Send + Clone> Send for SDPWFQueue<T> {}
 unsafe impl<T: Send + Clone> Sync for SDPWFQueue<T> {}
 
 impl<T: Send + Clone + 'static> SDPWFQueue<T> {
-    // Get element by index
-    unsafe fn get_element(&self, index: usize) -> &QueueElement<T> {
-        let elements_ptr = self.base_ptr.add(self.elements_offset) as *const QueueElement<T>;
-        &*elements_ptr.add(index)
+    // Get element by index - return raw pointer to avoid aliasing issues
+    unsafe fn get_element(&self, index: usize) -> *mut QueueElement<T> {
+        let elements_ptr = self.base_ptr.add(self.elements_offset) as *mut QueueElement<T>;
+        elements_ptr.add(index)
     }
 
-    // Get helping queue element by thread id
-    unsafe fn get_helping_element(&self, thread_id: usize) -> &HelpingQueueElement {
+    // Get helping queue element by thread id - also use raw pointer
+    unsafe fn get_helping_element(&self, thread_id: usize) -> *const HelpingQueueElement {
         let helping_ptr =
             self.base_ptr.add(self.helping_queue_offset) as *const HelpingQueueElement;
-        &*helping_ptr.add(thread_id)
+        helping_ptr.add(thread_id)
     }
 
     // Algorithm from Figure 3: Enqueue operation
@@ -94,11 +94,11 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
 
         unsafe {
             let helping_elem = self.get_helping_element(thread_id);
-            let start_idx = helping_elem.local_queue;
+            let start_idx = (*helping_elem).local_queue;
             let end_idx = if thread_id == self.num_threads - 1 {
                 self.total_elements
             } else {
-                self.get_helping_element(thread_id + 1).local_queue
+                (*self.get_helping_element(thread_id + 1)).local_queue
             };
 
             // First try local elements with improved traversal
@@ -152,13 +152,13 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
 
         // First, try TAR(del) - test and reset del bit
         loop {
-            let old_status = elem.status.load(Ordering::Acquire);
+            let old_status = (*elem).status.load(Ordering::Acquire);
 
             // Check if del bit is set
             if old_status & DEL_BIT != 0 {
                 // Try to reset del bit
                 let new_status = old_status & !DEL_BIT;
-                match elem.status.compare_exchange_weak(
+                match (*elem).status.compare_exchange_weak(
                     old_status,
                     new_status,
                     Ordering::AcqRel,
@@ -167,18 +167,18 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
                     Ok(_) => {
                         // Successfully reset del bit
                         // Check if readers are still attached
-                        if elem.read_counter.load(Ordering::Acquire) > 0 {
+                        if (*elem).read_counter.load(Ordering::Acquire) > 0 {
                             // Readers still active, restore del bit
-                            elem.status.fetch_or(DEL_BIT, Ordering::AcqRel);
+                            (*elem).status.fetch_or(DEL_BIT, Ordering::AcqRel);
                             return Ok(false);
                         }
 
                         // No readers, write data
-                        ptr::write(elem.data.as_ptr() as *mut T, item.clone());
+                        ptr::write((*elem).data.as_mut_ptr(), item.clone());
                         fence(Ordering::Release);
 
                         // LP1: Atomically set use=1, del=0, init=0
-                        elem.status.store(USE_BIT, Ordering::Release);
+                        (*elem).status.store(USE_BIT, Ordering::Release);
                         return Ok(true);
                     }
                     Err(_) => continue, // Retry
@@ -189,13 +189,13 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
         }
 
         // Try TAS(init) - test and set init bit
-        let old_status = elem.status.load(Ordering::Acquire);
+        let old_status = (*elem).status.load(Ordering::Acquire);
         if old_status & INIT_BIT != 0 {
             return Ok(false); // Already being processed
         }
 
         let new_status = old_status | INIT_BIT;
-        match elem.status.compare_exchange(
+        match (*elem).status.compare_exchange(
             old_status,
             new_status,
             Ordering::AcqRel,
@@ -204,18 +204,18 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
             Ok(_) => {
                 // Successfully set init bit
                 // Check if element is in use
-                let current_status = elem.status.load(Ordering::Acquire);
+                let current_status = (*elem).status.load(Ordering::Acquire);
                 if current_status & USE_BIT == 0 {
                     // Element is free, write data
-                    ptr::write(elem.data.as_ptr() as *mut T, item.clone());
+                    ptr::write((*elem).data.as_mut_ptr(), item.clone());
                     fence(Ordering::Release);
 
                     // Release: set use=1, init=0, del=0
-                    elem.status.store(USE_BIT, Ordering::Release);
+                    (*elem).status.store(USE_BIT, Ordering::Release);
                     return Ok(true);
                 } else {
                     // Element is in use, reset init bit
-                    elem.status.fetch_and(!INIT_BIT, Ordering::AcqRel);
+                    (*elem).status.fetch_and(!INIT_BIT, Ordering::AcqRel);
                     return Ok(false);
                 }
             }
@@ -232,7 +232,7 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
         end_idx: usize,
     ) -> Result<(), ()> {
         let helping_elem = self.get_helping_element(thread_id);
-        let middle = helping_elem.local_middle;
+        let middle = (*helping_elem).local_middle;
 
         // Get current traversal direction
         let directions = self.traversal_directions.load(Ordering::Acquire);
@@ -286,10 +286,10 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
                 let helper = self.get_helping_element(current_helper);
 
                 // Check free_at_top counter
-                let top_count = helper.free_at_top.load(Ordering::Acquire);
+                let top_count = (*helper).free_at_top.load(Ordering::Acquire);
                 if top_count > 0 {
                     // Try to reserve a slot
-                    match helper.free_at_top.compare_exchange(
+                    match (*helper).free_at_top.compare_exchange(
                         top_count,
                         top_count - 1,
                         Ordering::AcqRel,
@@ -297,8 +297,8 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
                     ) {
                         Ok(_) => {
                             // Successfully reserved, find the free element in first half
-                            let start = helper.local_queue;
-                            let middle = helper.local_middle;
+                            let start = (*helper).local_queue;
+                            let middle = (*helper).local_middle;
 
                             for idx in start..middle {
                                 if self.try_enqueue_at(idx, item)? {
@@ -307,17 +307,17 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
                             }
 
                             // Couldn't find it, restore counter
-                            helper.free_at_top.fetch_add(1, Ordering::AcqRel);
+                            (*helper).free_at_top.fetch_add(1, Ordering::AcqRel);
                         }
                         Err(_) => {} // Try again later
                     }
                 }
 
                 // Check free_at_bottom counter
-                let bottom_count = helper.free_at_bottom.load(Ordering::Acquire);
+                let bottom_count = (*helper).free_at_bottom.load(Ordering::Acquire);
                 if bottom_count > 0 {
                     // Try to reserve a slot
-                    match helper.free_at_bottom.compare_exchange(
+                    match (*helper).free_at_bottom.compare_exchange(
                         bottom_count,
                         bottom_count - 1,
                         Ordering::AcqRel,
@@ -325,11 +325,11 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
                     ) {
                         Ok(_) => {
                             // Successfully reserved, find the free element in second half
-                            let middle = helper.local_middle;
+                            let middle = (*helper).local_middle;
                             let end = if current_helper == self.num_threads - 1 {
                                 self.total_elements
                             } else {
-                                self.get_helping_element(current_helper + 1).local_queue
+                                (*self.get_helping_element(current_helper + 1)).local_queue
                             };
 
                             for idx in middle..end {
@@ -339,14 +339,14 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
                             }
 
                             // Couldn't find it, restore counter
-                            helper.free_at_bottom.fetch_add(1, Ordering::AcqRel);
+                            (*helper).free_at_bottom.fetch_add(1, Ordering::AcqRel);
                         }
                         Err(_) => {} // Try again later
                     }
                 }
 
                 // Move to next helper element
-                current_helper = helper.next;
+                current_helper = (*helper).next;
                 if current_helper == start_helper {
                     break; // Completed one round
                 }
@@ -368,7 +368,7 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
         unsafe {
             // Multiple attempts to handle concurrent modifications
             for attempt in 0..3 {
-                let start_idx = self.get_helping_element(thread_id).local_queue;
+                let start_idx = (*self.get_helping_element(thread_id)).local_queue;
                 let mut current = start_idx;
 
                 // Full queue traversal
@@ -399,20 +399,20 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
         let elem = self.get_element(idx);
 
         // BT(use) - Check if element is in use
-        let status = elem.status.load(Ordering::Acquire);
+        let status = (*elem).status.load(Ordering::Acquire);
         if status & USE_BIT == 0 {
             return Ok(None);
         }
 
         // TAS(init) - Try to set init bit
         loop {
-            let old_status = elem.status.load(Ordering::Acquire);
+            let old_status = (*elem).status.load(Ordering::Acquire);
             if old_status & INIT_BIT != 0 {
                 return Ok(None); // Already being processed
             }
 
             let new_status = old_status | INIT_BIT;
-            match elem.status.compare_exchange_weak(
+            match (*elem).status.compare_exchange_weak(
                 old_status,
                 new_status,
                 Ordering::AcqRel,
@@ -421,7 +421,7 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
                 Ok(_) => break, // Successfully set init bit
                 Err(_) => {
                     // Check if status changed significantly
-                    let current = elem.status.load(Ordering::Acquire);
+                    let current = (*elem).status.load(Ordering::Acquire);
                     if current & USE_BIT == 0 {
                         return Ok(None); // Element no longer in use
                     }
@@ -431,30 +431,30 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
         }
 
         // Double-check element is still in use after getting init
-        let current_status = elem.status.load(Ordering::Acquire);
+        let current_status = (*elem).status.load(Ordering::Acquire);
         if current_status & USE_BIT == 0 {
             // Element was freed, reset init bit
-            elem.status.fetch_and(!INIT_BIT, Ordering::AcqRel);
+            (*elem).status.fetch_and(!INIT_BIT, Ordering::AcqRel);
             return Ok(None);
         }
 
         // Wait for any active readers to finish
         let mut wait_cycles = 0;
-        while elem.read_counter.load(Ordering::Acquire) > 0 {
+        while (*elem).read_counter.load(Ordering::Acquire) > 0 {
             wait_cycles += 1;
             if wait_cycles > 1000 {
                 // Timeout - reset init and return
-                elem.status.fetch_and(!INIT_BIT, Ordering::AcqRel);
+                (*elem).status.fetch_and(!INIT_BIT, Ordering::AcqRel);
                 return Ok(None);
             }
             std::hint::spin_loop();
         }
 
         // Read the data before marking as removed
-        let item = ptr::read(elem.data.as_ptr() as *const T);
+        let item = ptr::read((*elem).data.as_ptr());
 
         // LP2: Atomically mark as removed - set del=1, use=0, init=0
-        elem.status.store(DEL_BIT, Ordering::Release);
+        (*elem).status.store(DEL_BIT, Ordering::Release);
 
         Ok(Some(item))
     }
@@ -467,15 +467,15 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
             let end_idx = if thread_id == self.num_threads - 1 {
                 self.total_elements
             } else {
-                self.get_helping_element(thread_id + 1).local_queue
+                (*self.get_helping_element(thread_id + 1)).local_queue
             };
 
-            if elem_idx >= helper.local_queue && elem_idx < end_idx {
+            if elem_idx >= (*helper).local_queue && elem_idx < end_idx {
                 // Found the owner, update appropriate counter
-                if elem_idx < helper.local_middle {
-                    helper.free_at_top.fetch_add(1, Ordering::AcqRel);
+                if elem_idx < (*helper).local_middle {
+                    (*helper).free_at_top.fetch_add(1, Ordering::AcqRel);
                 } else {
-                    helper.free_at_bottom.fetch_add(1, Ordering::AcqRel);
+                    (*helper).free_at_bottom.fetch_add(1, Ordering::AcqRel);
                 }
                 break;
             }
@@ -491,21 +491,21 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
                 let elem = self.get_element(idx);
 
                 // Check if element is in use and not deleted
-                let status = elem.status.load(Ordering::Acquire);
+                let status = (*elem).status.load(Ordering::Acquire);
                 if (status & USE_BIT) != 0 && (status & DEL_BIT) == 0 {
                     // Increment read counter
-                    elem.read_counter.fetch_add(1, Ordering::AcqRel);
+                    (*elem).read_counter.fetch_add(1, Ordering::AcqRel);
 
                     // Re-check status after incrementing counter
-                    let new_status = elem.status.load(Ordering::Acquire);
+                    let new_status = (*elem).status.load(Ordering::Acquire);
                     if (new_status & USE_BIT) != 0 && (new_status & DEL_BIT) == 0 {
                         // Read the data
-                        let item = ptr::read(elem.data.as_ptr() as *const T);
+                        let item = ptr::read((*elem).data.as_ptr());
                         items.push(item);
                     }
 
                     // Decrement read counter
-                    elem.read_counter.fetch_sub(1, Ordering::AcqRel);
+                    (*elem).read_counter.fetch_sub(1, Ordering::AcqRel);
                 }
             }
         }
@@ -518,12 +518,12 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
         true
     }
 
-    // Initialize queue in shared memory
+    // Initialize queue in shared memory - return raw pointer to avoid aliasing issues
     pub unsafe fn init_in_shared(
         mem: *mut u8,
         num_threads: usize,
         enable_helping_queue: bool,
-    ) -> &'static mut Self {
+    ) -> &'static Self {
         let queue_ptr = mem as *mut Self;
         let elements_per_thread = 10_000; // Increased for better performance
         let total_elements = num_threads * elements_per_thread;
@@ -570,8 +570,6 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
             },
         );
 
-        let queue = &mut *queue_ptr;
-
         // Initialize elements
         let elements_ptr = mem.add(elements_offset) as *mut QueueElement<T>;
         for i in 0..total_elements {
@@ -580,8 +578,10 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
 
         // Create circular linked list
         for i in 0..total_elements {
-            let elem = &*elements_ptr.add(i);
-            elem.next.store((i + 1) % total_elements, Ordering::Release);
+            let elem = elements_ptr.add(i);
+            (*elem)
+                .next
+                .store((i + 1) % total_elements, Ordering::Release);
         }
 
         // Initialize helping queue if enabled
@@ -609,7 +609,7 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
         }
 
         fence(Ordering::SeqCst);
-        queue
+        &*queue_ptr
     }
 
     // Calculate required shared memory size
@@ -637,7 +637,7 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
         unsafe {
             for i in 0..self.total_elements {
                 let elem = self.get_element(i);
-                let status = elem.status.load(Ordering::Acquire);
+                let status = (*elem).status.load(Ordering::Acquire);
                 if (status & USE_BIT) != 0 && (status & DEL_BIT) == 0 {
                     return false;
                 }
@@ -650,7 +650,7 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
         unsafe {
             for i in 0..self.total_elements {
                 let elem = self.get_element(i);
-                let status = elem.status.load(Ordering::Acquire);
+                let status = (*elem).status.load(Ordering::Acquire);
                 // Element is free if no bits are set or only del bit is set
                 if status == 0 || status == DEL_BIT {
                     return false;

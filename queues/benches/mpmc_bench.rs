@@ -1267,6 +1267,7 @@ criterion_group! {
     name = benches;
     config = custom_criterion();
     targets =
+        bench_sdp_queue,
         bench_kogan_petrank_queue
 }
 

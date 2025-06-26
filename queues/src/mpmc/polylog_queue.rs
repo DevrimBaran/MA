@@ -100,7 +100,7 @@ pub struct NRQueue<T: Send + Clone + 'static> {
     tree_height: usize,
     num_processes: usize,
 
-    base_ptr: *mut u8,
+    pub base_ptr: *mut u8,
     total_size: usize,
     nodes_offset: usize,
     node_size: usize,

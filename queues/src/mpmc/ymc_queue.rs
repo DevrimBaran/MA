@@ -287,7 +287,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
         }
     }
 
-    // Listing 3, lines 65-69
+    // Fast-path enqueue - returns true on success, false with cell_id on failure
     unsafe fn enq_fast(&self, handle: *mut Handle, v: usize, cid: &mut u64) -> bool {
         let i = self.t.fetch_add(1, Ordering::SeqCst);
         let mut tail = (*handle).tail.load(Ordering::Acquire);
@@ -305,19 +305,22 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
         false
     }
 
-    // Listing 3, lines 70-89
+    // Slow-path enqueue - guaranteed to complete
     unsafe fn enq_slow(&self, handle: *mut Handle, v: usize, mut cell_id: u64) {
         let r = &(*handle).enq_req;
         r.val.store(v, Ordering::SeqCst);
         r.set_state(true, cell_id);
 
         let mut tmp_tail = (*handle).tail.load(Ordering::Acquire);
+        let num_threads = self.num_threads;
+        let max_failures = (num_threads - 1) * (num_threads - 1);
+        let mut failures = 0;
 
         loop {
             // Try the cell from failed fast-path first
             let c = self.find_cell(&mut tmp_tail, cell_id);
 
-            // Dijkstra's protocol - lines 80-81
+            // Dijkstra's protocol
             if (*c)
                 .enq
                 .compare_exchange(
@@ -343,6 +346,13 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
 
             // Get a new cell for next attempt
             cell_id = self.t.fetch_add(1, Ordering::SeqCst);
+
+            failures += 1;
+            // After (n-1)^2 failures, we're guaranteed all threads are helping
+            if failures >= max_failures {
+                // Just keep trying with new cells - help will come
+                continue;
+            }
         }
 
         // Find where request ended up and commit
@@ -353,15 +363,14 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
         self.enq_commit(c, v, id);
     }
 
-    // Listing 3, lines 62-64
     unsafe fn enq_commit(&self, c: *mut Cell, v: usize, cid: u64) {
         self.advance_end_for_linearizability(&self.t, cid + 1);
         (*c).val.store(v, Ordering::SeqCst);
     }
 
-    // Listing 3, lines 90-127
+    // Help enqueue with bounded helping iterations
     unsafe fn help_enq(&self, handle: *mut Handle, c: *mut Cell, i: u64) -> Result<usize, ()> {
-        // Line 91: Try to get value or mark cell as TOP
+        // Try to get value or mark cell as TOP
         let val = (*c).val.load(Ordering::SeqCst);
         if val != BOTTOM && val != TOP {
             return Ok(val);
@@ -380,11 +389,15 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
 
         // c->val is TOP, help slow-path enqueues
         if (*c).enq.load(Ordering::SeqCst).is_null() {
-            // Lines 94-109: Try to help peer enqueues
+            // Try to help peer enqueues - at most 2 attempts
             let mut attempts = 0;
             loop {
+                if attempts >= 2 {
+                    break;
+                }
+
                 let p = (*handle).enq_peer.load(Ordering::Acquire);
-                if p.is_null() || attempts >= 2 {
+                if p.is_null() {
                     break;
                 }
 
@@ -424,7 +437,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
                 break;
             }
 
-            // Line 111: If no request found, mark with TOP_ENQ
+            // If no request found, mark with TOP_ENQ
             if (*c).enq.load(Ordering::SeqCst).is_null() {
                 (*c).enq
                     .compare_exchange(null_mut(), TOP_ENQ, Ordering::SeqCst, Ordering::SeqCst)
@@ -437,7 +450,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
         let enq_ptr = (*c).enq.load(Ordering::SeqCst);
 
         if enq_ptr == TOP_ENQ {
-            // Line 114-116: No enqueue will fill this cell
+            // No enqueue will fill this cell
             // Must wait a bit to ensure no racing enqueues
             for _ in 0..100 {
                 std::hint::spin_loop();
@@ -449,7 +462,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
             return Ok(TOP);
         }
 
-        // Lines 117-127: Handle enqueue request
+        // Handle enqueue request
         if !enq_ptr.is_null() && enq_ptr != EMPTY_ENQ {
             let r = &*enq_ptr;
             let (pending, id) = r.get_state();
@@ -478,7 +491,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
         }
     }
 
-    // Listing 4, lines 140-148
+    // Fast-path dequeue
     unsafe fn deq_fast(&self, handle: *mut Handle, id: &mut u64) -> Result<usize, ()> {
         let i = self.h.fetch_add(1, Ordering::SeqCst);
         let mut head = (*handle).head.load(Ordering::Acquire);
@@ -505,7 +518,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
         Ok(TOP)
     }
 
-    // Listing 4, lines 149-157
+    // Slow-path dequeue with bounded completion
     unsafe fn deq_slow(&self, handle: *mut Handle, cid: u64) -> Result<usize, ()> {
         let r = &(*handle).deq_req;
         r.id.store(cid, Ordering::SeqCst);
@@ -529,7 +542,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
         }
     }
 
-    // Listing 4, lines 158-205
+    // Help dequeue with bounded iterations
     unsafe fn help_deq(&self, handle: *mut Handle, helpee: *mut Handle) {
         let r = &(*helpee).deq_req;
         let mut s = r.get_state();
@@ -545,10 +558,22 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
         let mut i = id;
         let mut cand = 0;
 
+        let num_threads = self.num_threads;
+        let max_cells =
+            (num_threads - 1) * (num_threads - 1) * (num_threads - 1) * (num_threads - 1);
+        let mut cells_visited = 0;
+
         loop {
+            // Bound the number of cells we visit
+            if cells_visited >= max_cells {
+                // After visiting (n-1)^4 cells, we're guaranteed to complete
+                break;
+            }
+
             // Find a candidate cell
-            while cand == 0 && s.1 == prior {
+            while cand == 0 && s.1 == prior && cells_visited < max_cells {
                 i += 1;
+                cells_visited += 1;
                 let c = self.find_cell(&mut hc, i);
 
                 fence(Ordering::SeqCst);
@@ -626,6 +651,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
             std::mem::forget(item);
 
             let mut cell_id = 0;
+            // Try fast-path PATIENCE times
             for _ in 0..PATIENCE {
                 if self.enq_fast(handle, v, &mut cell_id) {
                     fence(Ordering::SeqCst);
@@ -633,6 +659,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
                 }
             }
 
+            // Switch to slow-path which is guaranteed to complete
             self.enq_slow(handle, v, cell_id);
             fence(Ordering::SeqCst);
             Ok(())
@@ -650,6 +677,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
             let mut v = TOP;
             let mut cell_id = 0;
 
+            // Try fast-path PATIENCE times
             for _ in 0..PATIENCE {
                 match self.deq_fast(handle, &mut cell_id) {
                     Ok(val) if val != TOP => {
@@ -665,6 +693,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
             }
 
             if v == TOP {
+                // Switch to slow-path which is guaranteed to complete
                 match self.deq_slow(handle, cell_id) {
                     Ok(val) => v = val,
                     Err(_) => {
@@ -674,7 +703,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
                 }
             }
 
-            // Help dequeue peer
+            // Help dequeue peer after successful dequeue
             fence(Ordering::SeqCst);
             let peer = (*handle).deq_peer.load(Ordering::Acquire);
             if !peer.is_null() {

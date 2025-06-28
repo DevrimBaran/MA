@@ -2,8 +2,8 @@
 // Miri-compatible tests for MPMC queues
 
 use queues::{
-    BurdenWFQueue, FeldmanDechevWFQueue, JKMQueue, KPQueue, KWQueue, MpmcQueue, NRQueue, TurnQueue,
-    WCQueue, WFQueue, YangCrummeyQueue,
+    BurdenWFQueue, FeldmanDechevWFQueue, JKMQueue, KPQueue, KWQueue, MpmcQueue, NRQueue,
+    SDPWFQueue, TurnQueue, WCQueue, WFQueue, YangCrummeyQueue,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -258,6 +258,36 @@ mod miri_test_nr_queue {
     }
 }
 
+// Special handling for SDPQueue with enable_helping parameter
+mod miri_test_sdp_queue {
+    use super::*;
+
+    #[test]
+    fn test_basic_operations() {
+        unsafe {
+            let num_threads = 1;
+            let enable_helping = false; // Simpler without helping for Miri
+            let size = SDPWFQueue::<usize>::shared_size(num_threads, enable_helping);
+            let mem = allocate_shared_memory(size);
+            let queue = SDPWFQueue::<usize>::init_in_shared(mem, num_threads, enable_helping);
+
+            assert!(queue.is_empty(), "New queue should be empty");
+
+            assert!(queue.push(42, 0).is_ok(), "Push should succeed");
+            assert!(!queue.is_empty(), "Queue should not be empty after push");
+
+            match queue.pop(0) {
+                Ok(val) => assert_eq!(val, 42, "Dequeued value should be 42"),
+                Err(_) => panic!("Pop should succeed"),
+            }
+
+            assert!(queue.is_empty(), "Queue should be empty after pop");
+
+            deallocate_shared_memory(mem, size);
+        }
+    }
+}
+
 // Special test for WFQueue - skip helper thread tests for Miri
 mod miri_test_wf_queue {
     use super::*;
@@ -313,5 +343,6 @@ fn test_type_names() {
     assert!(!std::any::type_name::<WCQueue<usize>>().is_empty());
     assert!(!std::any::type_name::<TurnQueue<usize>>().is_empty());
     assert!(!std::any::type_name::<FeldmanDechevWFQueue<usize>>().is_empty());
+    assert!(!std::any::type_name::<SDPWFQueue<usize>>().is_empty());
     assert!(!std::any::type_name::<KPQueue<usize>>().is_empty());
 }

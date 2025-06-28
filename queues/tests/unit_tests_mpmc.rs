@@ -1,8 +1,8 @@
 // queues/tests/mpmc_tests.rs
 
 use queues::{
-    BurdenWFQueue, FeldmanDechevWFQueue, JKMQueue, KPQueue, KWQueue, MpmcQueue, NRQueue, TurnQueue,
-    WCQueue, WFQueue, YangCrummeyQueue,
+    BurdenWFQueue, FeldmanDechevWFQueue, JKMQueue, KPQueue, KWQueue, MpmcQueue, NRQueue,
+    SDPWFQueue, TurnQueue, WCQueue, WFQueue, YangCrummeyQueue,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -745,6 +745,58 @@ mod test_nr_queue_special {
     }
 }
 
+// Special handling for SDPQueue which has enable_helping parameter
+mod test_sdp_queue {
+    use super::*;
+
+    #[test]
+    fn test_single_thread_operations() {
+        unsafe {
+            let num_threads = 1;
+            let enable_helping = true;
+            let size = SDPWFQueue::<usize>::shared_size(num_threads, enable_helping);
+            let mem = allocate_shared_memory(size);
+            let queue = SDPWFQueue::<usize>::init_in_shared(mem, num_threads, enable_helping);
+
+            assert!(queue.is_empty(), "New queue should be empty");
+
+            assert!(queue.push(42, 0).is_ok(), "Push should succeed");
+            assert!(!queue.is_empty(), "Queue should not be empty after push");
+
+            match queue.pop(0) {
+                Ok(val) => assert_eq!(val, 42, "Dequeued value should be 42"),
+                Err(_) => panic!("Pop should succeed"),
+            }
+
+            assert!(queue.is_empty(), "Queue should be empty after pop");
+
+            deallocate_shared_memory(mem, size);
+        }
+    }
+
+    #[test]
+    fn test_with_helping_disabled() {
+        unsafe {
+            let num_threads = 2;
+            let enable_helping = false;
+            let size = SDPWFQueue::<usize>::shared_size(num_threads, enable_helping);
+            let mem = allocate_shared_memory(size);
+            let queue = SDPWFQueue::<usize>::init_in_shared(mem, num_threads, enable_helping);
+
+            // Just test basic operations without concurrency
+            assert!(queue.push(1, 0).is_ok(), "Push 1 should succeed");
+            assert!(queue.push(2, 0).is_ok(), "Push 2 should succeed");
+
+            match queue.pop(0) {
+                Ok(val) => assert!(val == 1 || val == 2, "Should pop a valid value"),
+                Err(_) => panic!("Pop should succeed"),
+            }
+
+            deallocate_shared_memory(mem, size);
+        }
+    }
+}
+
 // Special test for WFQueue with helper thread
 mod test_wf_queue {
     use super::*;
@@ -1338,6 +1390,7 @@ fn test_all_queues_exist() {
     let _ = std::any::type_name::<WCQueue<usize>>();
     let _ = std::any::type_name::<TurnQueue<usize>>();
     let _ = std::any::type_name::<FeldmanDechevWFQueue<usize>>();
+    let _ = std::any::type_name::<SDPWFQueue<usize>>();
     let _ = std::any::type_name::<KPQueue<usize>>();
     let _ = std::any::type_name::<JKMQueue<usize>>();
 }

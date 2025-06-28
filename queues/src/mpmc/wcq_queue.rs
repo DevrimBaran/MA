@@ -1,4 +1,4 @@
-// paper om /queues/src/mpmc/wCQ.pdf
+// paper in /queues/src/mpmc/wCQ.pdf
 use std::alloc::Layout;
 use std::cell::UnsafeCell;
 use std::ptr;

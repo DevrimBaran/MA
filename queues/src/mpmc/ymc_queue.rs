@@ -1,3 +1,4 @@
+// paper in /paper/mpmc/ymc.pdf
 use std::mem::{self, MaybeUninit};
 use std::ptr::{self, null_mut};
 use std::sync::atomic::{fence, AtomicPtr, AtomicU64, AtomicUsize, Ordering};

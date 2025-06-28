@@ -1,3 +1,4 @@
+// paper in /paper/mpmc/crturnqueue-2016.pdf
 use crate::MpmcQueue;
 use std::mem;
 use std::ptr;
@@ -285,8 +286,17 @@ impl<T: Send + Clone + 'static> TurnQueue<T> {
                 }
             }
 
-            // Lines 24-31: Return result
+            // Lines 24-31: Return result - FIXED LOGIC
             let my_node = (*self.deqhelp.add(thread_id)).load(Ordering::Acquire);
+
+            // Check if we got a valid node assigned to us
+            if my_node.is_null() || my_node == my_req {
+                // No node was assigned or still pointing to original request
+                self.hazard_pointers.clear(thread_id);
+                return Err(());
+            }
+
+            // Help advance head if needed (lines 25-28 of paper)
             let lhead = self.hazard_pointers.protect_ptr(
                 thread_id,
                 HazardPointers::<T>::HP_HEAD,
@@ -303,11 +313,17 @@ impl<T: Send + Clone + 'static> TurnQueue<T> {
 
             self.hazard_pointers.clear(thread_id);
 
-            // Return the item if we have a valid node
-            if my_node.is_null() || (*my_node).item.is_null() {
+            // Now return the item from the node that was assigned to us
+            if (*my_node).item.is_null() {
+                // This shouldn't happen unless it's the sentinel
                 Err(())
             } else {
+                // Read and return the item
                 let item = ptr::read((*my_node).item);
+
+                // In the paper, this is where hp.retire(prReq) would happen,
+                // but we don't need it in shared memory implementation
+
                 Ok(item)
             }
         }

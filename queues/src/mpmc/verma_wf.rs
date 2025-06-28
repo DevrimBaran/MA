@@ -1,3 +1,4 @@
+// paper in /paper/mpmc/TR-IID-Thesis_Mudit_Verma.pdf
 use std::cell::UnsafeCell;
 use std::mem;
 use std::ptr;

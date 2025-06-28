@@ -1267,7 +1267,6 @@ criterion_group! {
     name = benches;
     config = custom_criterion();
     targets =
-        bench_wcq_queue,
         bench_turn_queue,
         bench_feldman_dechev_wf_queue,
         bench_sdp_queue,

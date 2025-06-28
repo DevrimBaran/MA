@@ -1,3 +1,4 @@
+// Paper in /paper/mpmc/kogan-petrank.pdf
 use std::mem;
 use std::ptr;
 use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicUsize, Ordering};

@@ -1,3 +1,4 @@
+// paper in /paper/mpmc/jkm.pdf
 use std::alloc::Layout;
 use std::cell::UnsafeCell;
 use std::ptr;

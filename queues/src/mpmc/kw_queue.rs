@@ -1,3 +1,4 @@
+// paper in /paper/mpmc/kw.pdf
 use std::cell::UnsafeCell;
 use std::mem;
 use std::ptr;

@@ -1,3 +1,4 @@
+// paper in /paper/mpmc/Wait-free_Algorithms_the_Burden_of_the_Past.pdf
 use std::mem;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};

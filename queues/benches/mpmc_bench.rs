@@ -1273,7 +1273,7 @@ criterion_group! {
     name = benches;
     config = custom_criterion();
     targets =
-        bench_nr_queue,
+        bench_feldman_dechev_wf_queue,
         bench_kogan_petrank_queue
 }
 

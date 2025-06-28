@@ -1,4 +1,4 @@
-// queues/src/mpmc/feldman_dechev_wf.rs
+// paper in /paper/mpmc/feldman_dechev_v1.pdf and feldman_dechev_v2.pdf and feldman_dechev_v3.pdf
 
 use std::cell::UnsafeCell;
 use std::mem;
@@ -243,7 +243,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
     }
 
     // Help complete an enqueue operation
-    unsafe fn help_enqueue(&self, op: *mut EnqueueOp, helper_thread_id: usize) {
+    unsafe fn help_enqueue(&self, op: *mut EnqueueOp, _helper_thread_id: usize) {
         if (*op).is_complete() {
             return;
         }
@@ -293,7 +293,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
     }
 
     // Help complete a dequeue operation
-    unsafe fn help_dequeue(&self, op: *mut DequeueOp, helper_thread_id: usize) {
+    unsafe fn help_dequeue(&self, op: *mut DequeueOp, _helper_thread_id: usize) {
         if (*op).is_complete() {
             return;
         }

@@ -15,9 +15,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 const PERFORMANCE_TEST: bool = false;
-const ITEMS_PER_PROCESS_TARGET: usize = 5_000;
-const PROCESS_COUNTS_TO_TEST: &[(usize, usize)] = &[(1, 1), (2, 2), (4, 4), (6, 6)];
-const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 100_000_000;
+const ITEMS_PER_PROCESS_TARGET: usize = 1_500_000;
+const PROCESS_COUNTS_TO_TEST: &[(usize, usize)] = &[(1, 1)];
+const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 1_000_000_000;
 
 trait BenchMpmcQueue<T: Send + Clone>: Send + Sync + 'static {
     fn bench_push(&self, item: T, process_id: usize) -> Result<(), ()>;
@@ -1265,8 +1265,8 @@ fn bench_kogan_petrank_queue(c: &mut Criterion) {
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(5))
-        .measurement_time(Duration::from_secs(2500))
-        .sample_size(1000)
+        .measurement_time(Duration::from_secs(15))
+        .sample_size(10)
 }
 
 criterion_group! {

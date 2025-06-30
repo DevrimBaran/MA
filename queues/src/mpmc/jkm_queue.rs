@@ -104,8 +104,8 @@ pub struct JKMQueue<T: Send + Clone + 'static> {
     tree: *const [AtomicCell<u128>],
     deq_ops: *const [AtomicCell<u128>],
 
-    num_processes: usize,
-    num_dequeuers: usize,
+    pub num_processes: usize,
+    pub num_dequeuers: usize,
     items_per_process: usize,
     tree_size: usize,
 

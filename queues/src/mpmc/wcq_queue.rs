@@ -187,11 +187,11 @@ pub struct WCQueue<T: Send + Clone + 'static> {
     fq: InnerWCQ,
 
     pub aq_entries_offset: usize,
-    fq_entries_offset: usize,
-    records_offset: usize,
-    data_offset: usize,
+    pub fq_entries_offset: usize,
+    pub records_offset: usize,
+    pub data_offset: usize,
 
-    num_threads: usize,
+    pub num_threads: usize,
     num_indices: usize,
 
     total_enqueued: AtomicUsize,

@@ -98,7 +98,7 @@ impl<T> Node<T> {
 pub struct NRQueue<T: Send + Clone + 'static> {
     root: *const Node<T>,
     tree_height: usize,
-    num_processes: usize,
+    pub num_processes: usize,
 
     pub base_ptr: *mut u8,
     total_size: usize,

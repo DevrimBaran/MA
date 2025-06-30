@@ -60,7 +60,7 @@ pub struct WFQueue<T: Send + Clone + 'static> {
     head: AtomicUsize,
     tail: AtomicUsize,
     size: AtomicUsize,
-    num_threads: usize,
+    pub num_threads: usize,
 
     // Helper control
     helper_should_stop: AtomicBool,
@@ -73,7 +73,7 @@ pub struct WFQueue<T: Send + Clone + 'static> {
     next_free_node: AtomicUsize,
 
     // Shared memory info
-    base_ptr: *mut u8,
+    pub base_ptr: *mut u8,
     total_size: usize,
 
     _phantom: std::marker::PhantomData<T>,

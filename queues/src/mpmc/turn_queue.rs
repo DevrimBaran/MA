@@ -446,7 +446,7 @@ impl<T: Send + Clone + 'static> TurnQueue<T> {
         let hp_aligned = (hp_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
         // Node and item pools
-        let items_per_thread = 250_000;
+        let items_per_thread = 750_000;
         let pool_size = num_threads * items_per_thread * 2;
 
         let node_pool_offset = hp_offset + hp_aligned;
@@ -518,7 +518,7 @@ impl<T: Send + Clone + 'static> TurnQueue<T> {
         let hp_size = num_threads * HazardPointers::<T>::size();
         let hp_aligned = (hp_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
-        let items_per_thread = 250_000;
+        let items_per_thread = 750_000;
         let pool_size = num_threads * items_per_thread * 2;
 
         let node_pool_size = pool_size * mem::size_of::<Node<T>>();

@@ -608,7 +608,7 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
         enable_helping_queue: bool,
     ) -> &'static Self {
         let queue_ptr = mem as *mut Self;
-        let elements_per_thread = 10_000;
+        let elements_per_thread = 750_000;
         let total_elements = num_threads * elements_per_thread;
 
         // Calculate memory layout
@@ -697,7 +697,7 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
 
     // Calculate required shared memory size
     pub fn shared_size(num_threads: usize, enable_helping_queue: bool) -> usize {
-        let elements_per_thread = 10_000;
+        let elements_per_thread = 750_000;
         let total_elements = num_threads * elements_per_thread;
 
         let queue_size = mem::size_of::<Self>();

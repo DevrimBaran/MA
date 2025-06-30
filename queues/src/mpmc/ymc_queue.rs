@@ -172,7 +172,7 @@ unsafe impl<T: Send + Clone> Sync for YangCrummeyQueue<T> {}
 impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
     pub unsafe fn init_in_shared(mem: *mut u8, num_threads: usize) -> &'static mut Self {
         let queue_ptr = mem as *mut Self;
-        let items_per_thread = 250_000;
+        let items_per_thread = 750_000;
         let max_items = items_per_thread * num_threads * 3;
         let num_segments = std::cmp::min((max_items + SEGMENT_SIZE - 1) / SEGMENT_SIZE, 8192);
 
@@ -245,7 +245,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
     }
 
     pub fn shared_size(num_threads: usize) -> usize {
-        let items_per_thread = 250_000;
+        let items_per_thread = 750_000;
         let max_items = items_per_thread * num_threads * 3;
         let num_segments = std::cmp::min((max_items + SEGMENT_SIZE - 1) / SEGMENT_SIZE, 8192);
 

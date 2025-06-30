@@ -120,12 +120,6 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
     // Allocate a new node
     unsafe fn allocate_node(&self, value: Option<T>) -> usize {
         let index = self.next_free_node.fetch_add(1, Ordering::AcqRel);
-        if index >= self.node_pool_size {
-            panic!(
-                "Node pool exhausted: {} >= {} (num_threads: {})",
-                index, self.node_pool_size, self.num_threads
-            );
-        }
         let node = self.get_node(index + 1); // +1 because 0 is null
         node.value = value;
         node.next.store(0, Ordering::Release);
@@ -257,7 +251,7 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
         let state_array_aligned = (state_array_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
         // Node pool
-        let items_per_thread = 250_000;
+        let items_per_thread = 700_000;
         let node_pool_size = num_threads * items_per_thread * 2;
         let nodes_offset = state_array_offset + state_array_aligned;
         let nodes_size = node_pool_size * mem::size_of::<Node<T>>();
@@ -315,7 +309,7 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
             num_threads * FALSE_SHARING_MULTIPLIER * mem::size_of::<Request<T>>();
         let state_array_aligned = (state_array_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
-        let items_per_thread = 250_000;
+        let items_per_thread = 700_000;
         let node_pool_size = num_threads * items_per_thread * 2;
         let nodes_size = node_pool_size * mem::size_of::<Node<T>>();
 

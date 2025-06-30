@@ -1,3 +1,4 @@
+// paper in /paper/mpsc/jiffy_full.pdf and /paper/mpsc/jiffy_short.pdf
 use std::fmt;
 use std::mem::{align_of, size_of, MaybeUninit};
 use std::ptr;
@@ -507,7 +508,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
 
                 let node_ptr = unsafe { tail_bl_ref.curr_buffer.add(internal_idx) };
                 unsafe {
-                    ptr::write(&mut (*node_ptr).data, MaybeUninit::new(data));
+                    ptr::addr_of_mut!((*node_ptr).data).write(MaybeUninit::new(data));
                     (*node_ptr)
                         .is_set
                         .store(NodeState::Set as usize, Ordering::Release);

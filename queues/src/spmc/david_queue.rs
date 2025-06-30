@@ -1,4 +1,4 @@
-// queues/src/spmc/david_queue.rs
+// paper in /paper/spmc/david.pdf
 use std::mem;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -1,3 +1,4 @@
+// paper in /paper/mpmc/dqueue.pdf
 use std::cell::UnsafeCell;
 use std::mem::{self, MaybeUninit};
 use std::ptr;

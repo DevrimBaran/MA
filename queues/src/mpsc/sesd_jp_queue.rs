@@ -1,3 +1,4 @@
+// part of jayanti petrovic
 use crate::SpscQueue;
 use std::cell::UnsafeCell;
 use std::mem::{self, MaybeUninit};

@@ -1,8 +1,7 @@
 // queues/tests/mpmc_tests.rs
 
 use queues::{
-    FeldmanDechevWFQueue, JKMQueue, KPQueue, MpmcQueue, NRQueue, TurnQueue, WCQueue, WFQueue,
-    YangCrummeyQueue,
+    FeldmanDechevWFQueue, KPQueue, MpmcQueue, TurnQueue, WCQueue, WFQueue, YangCrummeyQueue,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;

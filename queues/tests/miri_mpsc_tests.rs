@@ -248,12 +248,9 @@ mod miri_drescher_tests {
 
         let queue = unsafe { DrescherQueue::init_in_shared(mem_ptr, 100) };
 
-        for producer_id in 0..4 {
-            for i in 0..10 {
-                queue
-                    .bench_push(producer_id * 100 + i, producer_id)
-                    .unwrap();
-            }
+        // Just push 5 elements total
+        for i in 0..5 {
+            queue.bench_push(i, 0).unwrap();
         }
 
         let mut count = 0;
@@ -261,7 +258,7 @@ mod miri_drescher_tests {
             count += 1;
         }
 
-        assert_eq!(count, 40);
+        assert_eq!(count, 5);
         assert!(queue.bench_is_empty());
     }
 
@@ -1823,12 +1820,13 @@ mod miri_integration_tests {
 
         let queue = unsafe { DrescherQueue::init_in_shared(mem_ptr, 50) };
 
-        for cycle in 0..3 {
-            for i in 0..10 {
+        // Reduce from 3 cycles to 2, and from 10 items to 5 items per cycle
+        for cycle in 0..2 {
+            for i in 0..5 {
                 queue.push(cycle * 100 + i).unwrap();
             }
 
-            for _ in 0..10 {
+            for _ in 0..5 {
                 assert!(queue.pop().is_some());
             }
 

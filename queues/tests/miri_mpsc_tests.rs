@@ -41,7 +41,6 @@ impl Drop for AlignedMemory {
     }
 }
 
-// Define BenchMpscQueue trait for miri tests
 trait BenchMpscQueue<T: Send>: Send + Sync + 'static {
     fn bench_push(&self, item: T, producer_id: usize) -> Result<(), ()>;
     fn bench_pop(&self) -> Result<T, ()>;
@@ -779,8 +778,7 @@ mod miri_jiffy_tests {
 mod miri_dqueue_tests {
     use super::*;
 
-    // Override the segment capacity for Miri tests
-    const MIRI_SEGMENT_CAPACITY: usize = 64; // Much smaller than default 262144
+    const MIRI_SEGMENT_CAPACITY: usize = 64;
 
     #[test]
     fn test_dqueue_basic_init() {
@@ -810,24 +808,18 @@ mod miri_dqueue_tests {
         let queue: &'static mut DQueue<usize> =
             unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
 
-        // Test enqueue operations
         for i in 0..5 {
             assert!(queue.enqueue(0, i).is_ok());
         }
 
-        // Items are in local buffer, but DQueue::is_empty() checks local buffers too
-        // So it will return false even though items aren't globally visible yet
-        assert!(!queue.is_empty()); // Changed from assert!(queue.is_empty())
+        assert!(!queue.is_empty());
 
-        // Dump buffer to make items globally visible
         unsafe {
             queue.dump_local_buffer(0);
         }
 
-        // Still not empty
         assert!(!queue.is_empty());
 
-        // Dequeue one by one
         for expected in 0..5 {
             match queue.dequeue() {
                 Some(val) => assert_eq!(val, expected),
@@ -850,11 +842,9 @@ mod miri_dqueue_tests {
         let queue: &'static mut DQueue<usize> =
             unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
 
-        // Valid producers are 0 and 1
         assert!(queue.enqueue(0, 10).is_ok());
         assert!(queue.enqueue(1, 20).is_ok());
 
-        // Invalid producers
         assert!(queue.enqueue(2, 30).is_err());
         assert!(queue.enqueue(100, 40).is_err());
     }
@@ -871,21 +861,17 @@ mod miri_dqueue_tests {
         let queue: &'static mut DQueue<usize> =
             unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
 
-        // Producer 0 enqueues
         queue.enqueue(0, 100).unwrap();
         queue.enqueue(0, 101).unwrap();
 
-        // Producer 1 enqueues
         queue.enqueue(1, 200).unwrap();
         queue.enqueue(1, 201).unwrap();
 
-        // Dump both buffers
         unsafe {
             queue.dump_local_buffer(0);
             queue.dump_local_buffer(1);
         }
 
-        // Collect all items
         let mut items = Vec::new();
         for _ in 0..4 {
             if let Some(val) = queue.dequeue() {
@@ -910,19 +896,13 @@ mod miri_dqueue_tests {
         let queue: &'static mut DQueue<usize> =
             unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
 
-        // Enqueue without dumping
         queue.enqueue(0, 1).unwrap();
         queue.enqueue(0, 2).unwrap();
 
-        // DQueue might help enqueue or have different visibility rules
-        // Let's not assume dequeue returns None before dump
-
-        // Instead, let's verify the behavior after dump
         unsafe {
             queue.dump_local_buffer(0);
         }
 
-        // Now items are definitely available
         assert_eq!(queue.dequeue(), Some(1));
         assert_eq!(queue.dequeue(), Some(2));
         assert_eq!(queue.dequeue(), None);
@@ -940,7 +920,6 @@ mod miri_dqueue_tests {
         let queue: &'static mut DQueue<usize> =
             unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
 
-        // Add some items
         for i in 0..10 {
             queue.enqueue(0, i).unwrap();
         }
@@ -949,17 +928,14 @@ mod miri_dqueue_tests {
             queue.dump_local_buffer(0);
         }
 
-        // Dequeue half
         for _ in 0..5 {
             queue.dequeue();
         }
 
-        // Run GC - should complete without hanging
         unsafe {
             queue.run_gc();
         }
 
-        // Remaining items should still be accessible
         for expected in 5..10 {
             assert_eq!(queue.dequeue(), Some(expected));
         }
@@ -973,7 +949,6 @@ mod miri_dqueue_tests {
 
         let queue: &'static mut DQueue<usize> = unsafe { DQueue::init_in_shared(mem_ptr, 1, 2) };
 
-        // Test bench interface
         queue.bench_push(42, 0).unwrap();
         queue.bench_push(43, 0).unwrap();
 
@@ -1012,9 +987,8 @@ mod miri_dqueue_tests {
 
         assert!(queue.is_empty());
 
-        // Items in local buffer ARE visible to is_empty() in DQueue
         queue.enqueue(0, 1).unwrap();
-        assert!(!queue.is_empty()); // Changed - DQueue sees local buffers
+        assert!(!queue.is_empty());
 
         unsafe {
             queue.dump_local_buffer(0);
@@ -1038,7 +1012,6 @@ mod miri_dqueue_tests {
         let queue: &'static mut DQueue<String> =
             unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
 
-        // Each producer adds items with different patterns
         queue.enqueue(0, "A1".to_string()).unwrap();
         queue.enqueue(1, "B1".to_string()).unwrap();
         queue.enqueue(0, "A2".to_string()).unwrap();
@@ -1049,15 +1022,13 @@ mod miri_dqueue_tests {
             queue.dump_local_buffer(1);
         }
 
-        // Items should come out in timestamp order
         let mut items = Vec::new();
         while let Some(item) = queue.dequeue() {
             items.push(item);
         }
 
         assert_eq!(items.len(), 4);
-        // The exact order depends on which producer got which timestamp
-        // but each producer's items should maintain their relative order
+
         let a_indices: Vec<_> = items
             .iter()
             .enumerate()
@@ -1071,14 +1042,13 @@ mod miri_dqueue_tests {
             .map(|(i, _)| i)
             .collect();
 
-        // A1 should come before A2
         assert!(a_indices[0] < a_indices[1]);
-        // B1 should come before B2
+
         assert!(b_indices[0] < b_indices[1]);
     }
     #[test]
     fn test_dqueue_concurrent_producers() {
-        let num_producers = 2; // Reduced from 4 for Miri
+        let num_producers = 2;
         let segment_pool_capacity = 5;
 
         let shared_size = DQueue::<usize>::shared_size(num_producers, segment_pool_capacity);
@@ -1100,12 +1070,10 @@ mod miri_dqueue_tests {
                 barrier_clone.wait();
 
                 for i in 0..25 {
-                    // Reduced from 100 for Miri
                     let value = producer_id * 1000 + i;
                     queue_clone.enqueue(producer_id, value).unwrap();
                 }
 
-                // Dump buffer after enqueuing
                 unsafe {
                     queue_clone.dump_local_buffer(producer_id);
                 }
@@ -1120,12 +1088,10 @@ mod miri_dqueue_tests {
             handle.join().unwrap();
         }
 
-        // Collect all items
         let mut items = Vec::new();
         let expected_total = num_producers * 25;
 
         for _ in 0..expected_total * 2 {
-            // Extra iterations for safety
             match queue.dequeue() {
                 Some(item) => items.push(item),
                 None => {
@@ -1139,7 +1105,6 @@ mod miri_dqueue_tests {
 
         assert_eq!(items.len(), expected_total);
 
-        // Verify all items are present
         items.sort();
         let mut expected = Vec::new();
         for producer_id in 0..num_producers {
@@ -1162,12 +1127,10 @@ mod miri_dqueue_tests {
 
         let queue = unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool) };
 
-        // Producer 0 enqueues but doesn't dump
         for i in 0..10 {
             queue.enqueue(0, i).unwrap();
         }
 
-        // Producer 1 enqueues and dumps
         for i in 0..10 {
             queue.enqueue(1, 100 + i).unwrap();
         }
@@ -1175,25 +1138,20 @@ mod miri_dqueue_tests {
             queue.dump_local_buffer(1);
         }
 
-        // Consumer should trigger helping mechanism for producer 0
         let mut items = Vec::new();
         for _ in 0..30 {
-            // Try to dequeue more than what's visible
             match queue.dequeue() {
                 Some(val) => items.push(val),
                 None => break,
             }
         }
 
-        // Should have gotten some items (at least from producer 1)
         assert!(items.len() >= 10);
 
-        // Now dump producer 0's buffer
         unsafe {
             queue.dump_local_buffer(0);
         }
 
-        // Get remaining items
         while let Some(val) = queue.dequeue() {
             items.push(val);
         }
@@ -1212,7 +1170,6 @@ mod miri_dqueue_tests {
 
         let queue = unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool) };
 
-        // Add enough items to potentially span multiple segments
         for i in 0..50 {
             queue.enqueue(0, format!("item_{}", i)).unwrap();
         }
@@ -1221,17 +1178,14 @@ mod miri_dqueue_tests {
             queue.dump_local_buffer(0);
         }
 
-        // Dequeue half
         for _ in 0..25 {
             assert!(queue.dequeue().is_some());
         }
 
-        // Run GC to reclaim segments
         unsafe {
             queue.run_gc();
         }
 
-        // Add more items
         for i in 50..75 {
             queue.enqueue(0, format!("item_{}", i)).unwrap();
         }
@@ -1240,12 +1194,11 @@ mod miri_dqueue_tests {
             queue.dump_local_buffer(0);
         }
 
-        // Verify we can still dequeue everything
         let mut count = 0;
         while queue.dequeue().is_some() {
             count += 1;
         }
-        assert_eq!(count, 50); // 25 from first batch + 25 from second batch
+        assert_eq!(count, 50);
     }
 
     #[test]
@@ -1259,7 +1212,6 @@ mod miri_dqueue_tests {
 
         let queue = unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool) };
 
-        // Multiple cycles of enqueue/dequeue to test wraparound
         for cycle in 0..3 {
             for producer_id in 0..num_producers {
                 for i in 0..10 {
@@ -1272,12 +1224,10 @@ mod miri_dqueue_tests {
                 }
             }
 
-            // Dequeue all
             for _ in 0..(num_producers * 10) {
                 assert!(queue.dequeue().is_some());
             }
 
-            // Run GC between cycles
             unsafe {
                 queue.run_gc();
             }
@@ -1297,7 +1247,6 @@ mod miri_dqueue_tests {
 
         let queue = unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool) };
 
-        // Interleave enqueues, dumps, and dequeues
         queue.enqueue(0, 1).unwrap();
         queue.enqueue(1, 2).unwrap();
 
@@ -1335,7 +1284,6 @@ mod miri_dqueue_tests {
 
         let queue = unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool) };
 
-        // Each producer adds items with different timestamps
         for round in 0..5 {
             for producer_id in 0..num_producers {
                 queue
@@ -1344,23 +1292,19 @@ mod miri_dqueue_tests {
             }
         }
 
-        // Dump all buffers
         for producer_id in 0..num_producers {
             unsafe {
                 queue.dump_local_buffer(producer_id);
             }
         }
 
-        // Items should come out in timestamp order
         let mut items = Vec::new();
         while let Some(item) = queue.dequeue() {
             items.push(item);
         }
 
-        // Verify fairness - items should be interleaved by timestamp
         assert_eq!(items.len(), num_producers * 5);
 
-        // Check that we got all items from all producers
         for producer_id in 0..num_producers {
             let producer_items: Vec<_> =
                 items.iter().filter(|&&x| x / 1000 == producer_id).collect();
@@ -1379,7 +1323,6 @@ mod miri_dqueue_tests {
 
         let queue = unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool) };
 
-        // Test with None values
         queue.enqueue(0, None).unwrap();
         queue.enqueue(0, Some(42)).unwrap();
         queue.enqueue(0, None).unwrap();
@@ -1479,7 +1422,6 @@ mod miri_drop_tests {
                 queue.enqueue(0, DropCounter { _value: i }).unwrap();
             }
 
-            // Dequeue 5 items
             for _ in 0..5 {
                 drop(queue.dequeue().unwrap());
             }
@@ -1487,7 +1429,6 @@ mod miri_drop_tests {
             assert!(drops >= 5, "Should have at least 5 drops, got {}", drops);
         }
 
-        // After the queue is dropped, all remaining items should be dropped too
         let final_drops = DROP_COUNT.load(Ordering::SeqCst);
         assert!(
             final_drops >= 10,
@@ -1506,7 +1447,6 @@ mod miri_drop_tests {
 
             let queue = unsafe { DQueue::init_in_shared(mem_ptr, 2, 10) };
 
-            // Enqueue items to both producers
             for i in 0..10 {
                 queue.enqueue(0, DropCounter { _value: i }).unwrap();
             }
@@ -1514,13 +1454,11 @@ mod miri_drop_tests {
                 queue.enqueue(1, DropCounter { _value: i }).unwrap();
             }
 
-            // Dump buffers to make items visible
             unsafe {
                 queue.dump_local_buffer(0);
                 queue.dump_local_buffer(1);
             }
 
-            // Dequeue 10 items
             for _ in 0..10 {
                 drop(queue.dequeue().unwrap());
             }
@@ -1528,8 +1466,6 @@ mod miri_drop_tests {
             assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 10);
         }
 
-        // After the queue is dropped, remaining items might not be dropped
-        // due to the nature of DQueue's implementation
         let final_drops = DROP_COUNT.load(Ordering::SeqCst);
         assert!(
             final_drops >= 10,
@@ -1673,10 +1609,8 @@ mod miri_memory_tests {
 
         let queue = unsafe { DrescherQueue::init_in_shared(mem_ptr, 10) };
 
-        // Push until full
         let mut pushed = 0;
         for i in 0..100 {
-            // Try many more than expected capacity
             match queue.push(i) {
                 Ok(_) => pushed += 1,
                 Err(_) => break,
@@ -1686,13 +1620,11 @@ mod miri_memory_tests {
         assert!(pushed > 0, "Should push at least one item");
         let initial_pushed = pushed;
 
-        // Pop half
         let to_pop = pushed / 2;
         for _ in 0..to_pop {
             queue.pop().unwrap();
         }
 
-        // Push again - should be able to push at least as many as we popped
         let mut pushed_again = 0;
         for i in 100..200 {
             match queue.push(i) {
@@ -1708,7 +1640,6 @@ mod miri_memory_tests {
             pushed_again
         );
 
-        // Verify total items in queue
         let mut count = 0;
         while queue.pop().is_some() {
             count += 1;
@@ -1839,7 +1770,6 @@ mod miri_integration_tests {
 
     #[test]
     fn test_producer_consumer_pattern() {
-        // Simplified version of mixed workload
         let shared_size = JiffyQueue::<usize>::shared_size(64, 10);
         let mut memory = AlignedMemory::new(shared_size, 64);
         let mem_ptr = memory.as_mut_ptr();
@@ -1847,7 +1777,6 @@ mod miri_integration_tests {
         let queue = unsafe { JiffyQueue::init_in_shared(mem_ptr, 64, 10) };
         let queue = Arc::new(queue);
 
-        // Producer
         let q1 = queue.clone();
         let producer = thread::spawn(move || {
             for i in 0..20 {
@@ -1855,7 +1784,6 @@ mod miri_integration_tests {
             }
         });
 
-        // Consumer
         let q2 = queue.clone();
         let consumer = thread::spawn(move || {
             let mut items = Vec::new();
@@ -1889,7 +1817,6 @@ mod miri_integration_tests {
 
     #[test]
     fn test_queue_reuse() {
-        // Test that queues can be emptied and reused
         let shared_size = DrescherQueue::<usize>::shared_size(50);
         let mut memory = AlignedMemory::new(shared_size, 64);
         let mem_ptr = memory.as_mut_ptr();
@@ -1897,12 +1824,10 @@ mod miri_integration_tests {
         let queue = unsafe { DrescherQueue::init_in_shared(mem_ptr, 50) };
 
         for cycle in 0..3 {
-            // Fill
             for i in 0..10 {
                 queue.push(cycle * 100 + i).unwrap();
             }
 
-            // Empty
             for _ in 0..10 {
                 assert!(queue.pop().is_some());
             }
@@ -1917,7 +1842,6 @@ mod miri_edge_cases {
 
     #[test]
     fn test_single_item_queues() {
-        // Test with just one item
         let size = JiffyQueue::<usize>::shared_size(1, 1);
         let mut memory = AlignedMemory::new(size, 64);
         let mem_ptr = memory.as_mut_ptr();

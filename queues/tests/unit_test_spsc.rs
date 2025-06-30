@@ -819,7 +819,7 @@ mod unbounded_tests {
     #[test]
     fn test_unbounded_segment_growth() {
         let segment_size = 8192;
-        let num_segments = 16; // Enough segments to test growth
+        let num_segments = 16;
         let shared_size = UnboundedQueue::<usize>::shared_size(segment_size, num_segments);
         const ALIGNMENT: usize = 128;
 
@@ -828,8 +828,6 @@ mod unbounded_tests {
 
         let queue = unsafe { UnboundedQueue::init_in_shared(mem_ptr, segment_size, num_segments) };
 
-        // The paperlike implementation has a known limitation where
-        // it may not handle all items correctly across segment boundaries
         let mut pushed = 0;
         for i in 0..20000 {
             match queue.push(i) {
@@ -841,15 +839,13 @@ mod unbounded_tests {
         println!("Pushed {} items", pushed);
         assert!(pushed >= 8192, "Should push at least one full segment");
 
-        // Pop what we can
         let mut popped = 0;
         while let Ok(val) = queue.pop() {
-            // Don't assert on order due to known limitations
             popped += 1;
         }
 
         println!("Popped {} items (pushed {})", popped, pushed);
-        // Known limitation: may not pop all items
+
         assert!(popped > 0, "Should pop at least some items");
 
         unsafe {
@@ -889,13 +885,11 @@ mod unbounded_tests {
             let queue =
                 unsafe { UnboundedQueue::init_in_shared(mem_ptr, segment_size, num_segments) };
 
-            // Push within one segment to avoid the cross-segment issue
-            let items_to_push = 5000; // Less than 8192
+            let items_to_push = 5000;
             for i in 0..items_to_push {
                 queue.push(DropCounter { _value: i }).unwrap();
             }
 
-            // Pop all items
             let mut popped = 0;
             while let Ok(_) = queue.pop() {
                 popped += 1;
@@ -922,7 +916,6 @@ mod unbounded_tests {
     fn test_unbounded_drop_implementation() {
         const ALIGNMENT: usize = 128;
 
-        // Test with unit type
         {
             let segment_size = 8192;
             let num_segments = 16;
@@ -954,7 +947,6 @@ mod unbounded_tests {
             }
         }
 
-        // Test with Vec
         {
             let segment_size = 8192;
             let num_segments = 8;
@@ -979,7 +971,6 @@ mod unbounded_tests {
             }
         }
 
-        // Test with String
         {
             let segment_size = 8192;
             let num_segments = 8;
@@ -1331,10 +1322,9 @@ mod shared_memory_tests {
 
     #[test]
     fn test_dspsc_shared() {
-        // For testing, allocate enough nodes for our test cases
         let test_items = 20000;
         let cache_size = 8192;
-        let nodes_count = test_items + 1; // +1 for dummy node
+        let nodes_count = test_items + 1;
 
         let shared_size = DynListQueue::<usize>::shared_size(cache_size, nodes_count);
         let memory = create_aligned_memory_box(shared_size, 128);
@@ -1363,9 +1353,8 @@ mod shared_memory_tests {
 
     #[test]
     fn test_unbounded_shared() {
-        // For testing, allocate enough segments
         let segment_size = 8192;
-        let num_segments = 16; // Enough for testing
+        let num_segments = 16;
 
         let shared_size = UnboundedQueue::<usize>::shared_size(segment_size, num_segments);
         let memory = create_aligned_memory_box(shared_size, 128);
@@ -1378,8 +1367,7 @@ mod shared_memory_tests {
         assert_eq!(queue.pop().unwrap(), 123);
         assert!(queue.empty());
 
-        // Test within single segment to avoid cross-segment issues
-        let items = 5000; // Less than 8192
+        let items = 5000;
         for i in 0..items {
             queue.push(i).unwrap();
         }
@@ -1514,8 +1502,8 @@ mod special_feature_tests {
     #[test]
     fn test_dspsc_shared_memory_batched() {
         let cache_size = 8192;
-        let batch_size = 5000; // Less than cache size
-        let nodes_count = cache_size + 100; // Cache size + extra for safety
+        let batch_size = 5000;
+        let nodes_count = cache_size + 100;
 
         let shared_size = DynListQueue::<usize>::shared_size(cache_size, nodes_count);
 
@@ -1537,17 +1525,14 @@ mod special_feature_tests {
         let queue =
             unsafe { DynListQueue::<usize>::init_in_shared(mem_ptr, cache_size, nodes_count) };
 
-        // Test in batches that fit within cache
         for batch in 0..4 {
             let start = batch * batch_size;
             let end = start + batch_size;
 
-            // Push batch
             for i in start..end {
                 queue.push(i).unwrap();
             }
 
-            // Pop batch
             for i in start..end {
                 assert_eq!(queue.pop().unwrap(), i);
             }
@@ -1961,12 +1946,10 @@ mod ipc_tests {
 
         let shm_ptr = unsafe { map_shared(total_size) };
 
-        // CRITICAL: Zero out ALL shared memory before use
         unsafe {
             std::ptr::write_bytes(shm_ptr, 0, total_size);
         }
 
-        // Add memory barrier to ensure zeroing is complete
         std::sync::atomic::fence(Ordering::SeqCst);
 
         let producer_ready = unsafe { &*(shm_ptr as *const AtomicBool) };
@@ -1991,13 +1974,11 @@ mod ipc_tests {
 
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
-                // Producer
                 producer_ready.store(true, Ordering::Release);
                 while !consumer_ready.load(Ordering::Acquire) {
                     std::hint::spin_loop();
                 }
 
-                // Add a small delay to ensure consumer is ready
                 std::thread::sleep(std::time::Duration::from_millis(10));
 
                 for i in 0..NUM_ITEMS {
@@ -2019,7 +2000,6 @@ mod ipc_tests {
                 unsafe { libc::_exit(0) };
             }
             Ok(ForkResult::Parent { child }) => {
-                // Consumer
                 while !producer_ready.load(Ordering::Acquire) {
                     std::hint::spin_loop();
                 }
@@ -2032,7 +2012,6 @@ mod ipc_tests {
                 while received.len() < NUM_ITEMS {
                     match queue.pop() {
                         Ok(item) => {
-                            // Check immediately if we got the right value
                             if item != received.len() {
                                 eprintln!(
                                     "ERROR: Expected {}, got {} at position {}",
@@ -2066,7 +2045,6 @@ mod ipc_tests {
 
                 items_consumed.store(received.len(), Ordering::SeqCst);
 
-                // Wait for child with timeout
                 use nix::sys::wait::WaitStatus;
                 match waitpid(child, None) {
                     Ok(WaitStatus::Exited(_, 0)) => {}
@@ -2079,7 +2057,6 @@ mod ipc_tests {
                     "Not all items were consumed in IPC test"
                 );
 
-                // Now check order
                 for (i, &item) in received.iter().enumerate() {
                     if item != i {
                         panic!(
@@ -2255,7 +2232,7 @@ mod ipc_tests {
     #[test]
     fn test_unbounded_ipc() {
         let segment_size = 16384;
-        let num_segments = 16; // Enough for 100k items
+        let num_segments = 16;
         let shared_size = UnboundedQueue::<usize>::shared_size(segment_size, num_segments);
         let sync_size = std::mem::size_of::<AtomicBool>() * 2;
         let sync_size = (sync_size + 63) & !63;

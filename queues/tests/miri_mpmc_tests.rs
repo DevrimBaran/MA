@@ -46,16 +46,6 @@ macro_rules! mpmc_miri_test_queue {
                     // Test enqueue
                     assert!(queue.push(1, 0).is_ok(), "Push should succeed");
 
-                    // Special handling for NRQueue
-                    #[allow(unused_unsafe)]
-                    unsafe {
-                        use std::any::TypeId;
-                        if TypeId::of::<$queue_type>() == TypeId::of::<NRQueue<usize>>() {
-                            let nr_queue = &*(queue as *const _ as *const NRQueue<usize>);
-                            nr_queue.force_complete_sync();
-                        }
-                    }
-
                     // Test dequeue
                     match queue.pop(0) {
                         Ok(val) => assert_eq!(val, 1, "Dequeued value should be 1"),
@@ -80,16 +70,6 @@ macro_rules! mpmc_miri_test_queue {
                     // Enqueue a few items
                     for i in 0..5 {
                         assert!(queue.push(i, 0).is_ok(), "Push {} should succeed", i);
-                    }
-
-                    // Special sync for NRQueue
-                    #[allow(unused_unsafe)]
-                    unsafe {
-                        use std::any::TypeId;
-                        if TypeId::of::<$queue_type>() == TypeId::of::<NRQueue<usize>>() {
-                            let nr_queue = &*(queue as *const _ as *const NRQueue<usize>);
-                            nr_queue.force_complete_sync();
-                        }
                     }
 
                     // Dequeue all items
@@ -117,16 +97,6 @@ macro_rules! mpmc_miri_test_queue {
                     // Enqueue multiple items (keeping it at 10 like unit tests)
                     for i in 0..10 {
                         assert!(queue.push(i, 0).is_ok(), "Push {} should succeed", i);
-                    }
-
-                    // Special sync for NRQueue
-                    #[allow(unused_unsafe)]
-                    unsafe {
-                        use std::any::TypeId;
-                        if TypeId::of::<$queue_type>() == TypeId::of::<NRQueue<usize>>() {
-                            let nr_queue = &*(queue as *const _ as *const NRQueue<usize>);
-                            nr_queue.force_complete_sync();
-                        }
                     }
 
                     // Dequeue all items
@@ -249,15 +219,6 @@ macro_rules! mpmc_miri_test_queue {
                         handle.join().unwrap();
                     }
 
-                    // Sync for NRQueue
-                    #[allow(unused_unsafe)]
-                    unsafe {
-                        if TypeId::of::<$queue_type>() == TypeId::of::<NRQueue<usize>>() {
-                            let nr_queue = &*(queue as *const _ as *const NRQueue<usize>);
-                            nr_queue.force_complete_sync();
-                        }
-                    }
-
                     // Try to drain any remaining
                     let mut drain_count = 0;
                     while queue.pop(0).is_ok() && drain_count < items_per_thread {
@@ -310,16 +271,6 @@ macro_rules! mpmc_miri_test_queue {
                         handle.join().unwrap();
                     }
 
-                    // Special sync for NRQueue
-                    #[allow(unused_unsafe)]
-                    unsafe {
-                        use std::any::TypeId;
-                        if TypeId::of::<$queue_type>() == TypeId::of::<NRQueue<usize>>() {
-                            let nr_queue = &*(queue as *const _ as *const NRQueue<usize>);
-                            nr_queue.force_complete_sync();
-                        }
-                    }
-
                     // Verify all items can be dequeued
                     let mut count = 0;
                     let max_attempts = num_threads * items_per_thread * 2;
@@ -344,7 +295,7 @@ macro_rules! mpmc_miri_test_queue {
     };
 }
 
-// Generate tests for each queue type (except those with special handling)
+// Generate tests for each queue type
 mpmc_miri_test_queue!(
     miri_test_yang_crummey,
     YangCrummeyQueue<usize>,
@@ -375,8 +326,6 @@ mpmc_miri_test_queue!(
 
 // Note: The following queue implementations are not tested in Miri because their
 // synchronization mechanisms are too complex for Miri's execution model:
-// - NRQueue: Complex tree propagation that doesn't converge in Miri
-// - JKMQueue: Multi-phase tree synchronization with busy-wait loops
 // - WCQueue: Extensive helping mechanisms with complex state transitions
 // - WFQueue: Requires external helper thread/process
 //
@@ -389,8 +338,6 @@ fn test_type_names() {
     // Simple test to ensure all types are available
     assert!(!std::any::type_name::<YangCrummeyQueue<usize>>().is_empty());
     assert!(!std::any::type_name::<WFQueue<usize>>().is_empty());
-    assert!(!std::any::type_name::<NRQueue<usize>>().is_empty());
-    assert!(!std::any::type_name::<JKMQueue<usize>>().is_empty());
     assert!(!std::any::type_name::<WCQueue<usize>>().is_empty());
     assert!(!std::any::type_name::<TurnQueue<usize>>().is_empty());
     assert!(!std::any::type_name::<FeldmanDechevWFQueue<usize>>().is_empty());
@@ -454,8 +401,7 @@ mod miri_edge_cases {
         unsafe {
             let num_threads = 2;
 
-            // Use TurnQueue instead of YangCrummeyQueue for alternating operations
-            // YangCrummeyQueue can have issues with immediate pop after push in Miri
+            // Use TurnQueue for alternating operations
             let size = TurnQueue::<usize>::shared_size(num_threads);
             let mem = allocate_shared_memory(size);
             let queue = TurnQueue::<usize>::init_in_shared(mem, num_threads);

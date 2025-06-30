@@ -40,7 +40,6 @@ impl Drop for AlignedMemory {
     }
 }
 
-// Macro for systematic testing of all queue types (similar to unit tests)
 macro_rules! test_queue {
     ($queue_type:ty, $capacity:expr, $test_name:ident) => {
         mod $test_name {
@@ -77,7 +76,6 @@ macro_rules! test_queue {
                     match queue.push(i) {
                         Ok(_) => pushed += 1,
                         Err(_) => {
-                            // Handle buffered queues that might need flushing
                             if stringify!($queue_type).contains("BiffqQueue") {
                                 if let Some(biffq) =
                                     (&queue as &dyn Any).downcast_ref::<BiffqQueue<usize>>()
@@ -113,17 +111,12 @@ macro_rules! test_queue {
 
                 assert!(pushed > 0, "Should be able to push at least one item");
 
-                // Test that we can't push more when full
                 assert!(!queue.available() || queue.push(999999).is_err());
 
-                // Test pop and push after popping
                 if pushed > 0 {
                     assert!(queue.pop().is_ok());
 
-                    // Special handling for IffqQueue which has specific behavior
                     if stringify!($queue_type).contains("IffqQueue") {
-                        // IffqQueue needs to pop items from the previous partition
-                        // before space becomes available
                         let mut popped = 1;
                         let mut push_succeeded = false;
 
@@ -177,7 +170,7 @@ macro_rules! test_queue {
             fn test_concurrent_spsc() {
                 let queue = Arc::new(<$queue_type>::with_capacity($capacity));
                 let barrier = Arc::new(Barrier::new(2));
-                let items_to_send = 100.min($capacity / 2); // Adjust for smaller capacities
+                let items_to_send = 100.min($capacity / 2);
 
                 let queue_prod = queue.clone();
                 let barrier_prod = barrier.clone();
@@ -193,7 +186,6 @@ macro_rules! test_queue {
                         }
                     }
 
-                    // Flush buffered queues
                     if let Some(mp_queue) =
                         (queue_prod.as_ref() as &dyn Any).downcast_ref::<MultiPushQueue<usize>>()
                     {
@@ -257,7 +249,7 @@ macro_rules! test_queue {
             #[test]
             fn test_stress_concurrent() {
                 let queue = Arc::new(<$queue_type>::with_capacity($capacity));
-                let num_items = ($capacity * 2).min(1000); // Limit for Miri performance
+                let num_items = ($capacity * 2).min(1000);
                 let barrier = Arc::new(Barrier::new(2));
 
                 let queue_prod = queue.clone();
@@ -276,7 +268,6 @@ macro_rules! test_queue {
                         }
                     }
 
-                    // Flush buffered queues
                     if let Some(mp_queue) =
                         (queue_prod.as_ref() as &dyn Any).downcast_ref::<MultiPushQueue<usize>>()
                     {
@@ -322,14 +313,11 @@ macro_rules! test_queue {
     };
 }
 
-// Apply systematic tests to all standard queue types
 test_queue!(LamportQueue<usize>, MIRI_SMALL_CAPACITY, lamport_tests);
 test_queue!(FfqQueue<usize>, MIRI_MEDIUM_CAPACITY, ffq_tests);
 test_queue!(LlqQueue<usize>, MIRI_MEDIUM_CAPACITY, llq_tests);
 test_queue!(BlqQueue<usize>, MIRI_MEDIUM_CAPACITY, blq_tests);
 test_queue!(IffqQueue<usize>, MIRI_MEDIUM_CAPACITY, iffq_tests);
-
-// Special handling for queues that don't fit the standard pattern
 
 mod biffq_tests {
     use super::*;
@@ -345,7 +333,6 @@ mod biffq_tests {
 
         queue.push(42).unwrap();
 
-        // Flush to ensure visibility
         let _ = queue.flush_producer_buffer();
 
         assert!(!queue.empty());
@@ -391,12 +378,10 @@ mod biffq_tests {
 
         assert!(pushed_total > 0, "Should push at least some items");
 
-        // Test that we can pop and push again
         if pushed_total >= BIFFQ_CAPACITY - 32 {
             let popped = queue.pop();
             assert!(popped.is_ok(), "Should be able to pop from full queue");
 
-            // Try to push after popping
             let mut pushed_after = false;
             for _ in 0..10 {
                 let _ = queue.flush_producer_buffer();
@@ -463,7 +448,6 @@ mod biffq_tests {
                 }
             }
 
-            // Ensure all items are flushed
             while queue_prod.prod.local_count.load(Ordering::Relaxed) > 0 {
                 let _ = queue_prod.flush_producer_buffer();
                 thread::yield_now();
@@ -595,7 +579,7 @@ mod bqueue_tests {
     #[test]
     fn test_capacity_limits() {
         let queue = BQueue::<usize>::new(MIRI_MEDIUM_CAPACITY);
-        let effective_capacity = MIRI_MEDIUM_CAPACITY - 1; // BQueue can hold capacity-1 items
+        let effective_capacity = MIRI_MEDIUM_CAPACITY - 1;
 
         for i in 0..effective_capacity {
             match queue.push(i) {
@@ -780,7 +764,7 @@ mod multipush_tests {
             queue.push(i).unwrap();
         }
 
-        assert!(!queue.empty()); // Items are in local buffer but visible
+        assert!(!queue.empty());
         assert!(queue.flush());
 
         for i in 0..5 {
@@ -792,12 +776,10 @@ mod multipush_tests {
     fn test_multipush_local_buffer_overflow() {
         let queue = MultiPushQueue::<usize>::with_capacity(MIRI_MEDIUM_CAPACITY);
 
-        // Push exactly 32 items to trigger automatic flush
         for i in 0..32 {
             queue.push(i).unwrap();
         }
 
-        // Check that automatic flush happened
         assert_eq!(queue.local_count.load(Ordering::Relaxed), 0);
 
         for i in 0..32 {
@@ -851,9 +833,7 @@ mod dehnavi_tests {
                         items.push(item);
 
                         if let Some(last) = last_seen {
-                            if item <= last {
-                                // This is expected for Dehnavi queue - it can overwrite
-                            }
+                            if item <= last {}
                         }
                         last_seen = Some(item);
                         attempts = 0;
@@ -884,7 +864,6 @@ mod dehnavi_tests {
             "Should receive at least as many items as queue capacity"
         );
 
-        // Check that we see progression in values despite overwrites
         let mut max_seen = items[0];
         let mut increasing_count = 0;
 
@@ -907,12 +886,10 @@ mod unbounded_tests {
 
     #[test]
     fn test_unbounded_basic_operations() {
-        // We can test the shared_size calculation and basic API
         let size = UnboundedQueue::<usize>::shared_size(64, 16);
         assert!(size > 0);
         assert!(size >= std::mem::size_of::<UnboundedQueue<usize>>());
 
-        // Test with different segment sizes and counts
         let size_small = UnboundedQueue::<usize>::shared_size(64, 8);
         let size_large = UnboundedQueue::<usize>::shared_size(8192, 16);
         assert!(size_large >= size_small);
@@ -920,12 +897,9 @@ mod unbounded_tests {
 
     #[test]
     fn test_unbounded_type_safety() {
-        // Test that UnboundedQueue works with different types
         let _size_u8 = UnboundedQueue::<u8>::shared_size(64, 16);
         let _size_string = UnboundedQueue::<String>::shared_size(64, 16);
         let _size_vec = UnboundedQueue::<Vec<u8>>::shared_size(64, 16);
-
-        // All should compile and return reasonable sizes
     }
 
     #[test]
@@ -934,17 +908,14 @@ mod unbounded_tests {
         let mut memory = AlignedMemory::new(shared_size, 128);
         let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 64, 16) };
 
-        // Test empty queue
         assert!(queue.empty());
         assert!(queue.pop().is_err());
 
-        // Test single item
         queue.push(42).unwrap();
         assert!(!queue.empty());
         assert_eq!(queue.pop().unwrap(), 42);
         assert!(queue.empty());
 
-        // Test multiple items within one segment
         for i in 0..50 {
             queue.push(i).unwrap();
         }
@@ -961,7 +932,6 @@ mod unbounded_tests {
         let mut memory = AlignedMemory::new(shared_size, 128);
         let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 64, 16) };
 
-        // Push enough to need multiple segments
         let mut pushed = 0;
         for i in 0..200 {
             match queue.push(i) {
@@ -970,7 +940,6 @@ mod unbounded_tests {
             }
         }
 
-        // Should have pushed at least one segment worth
         assert!(pushed >= 64, "Should push at least one segment");
     }
 
@@ -996,25 +965,18 @@ mod unbounded_tests {
             let mut memory = AlignedMemory::new(shared_size, 128);
             let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 64, 16) };
 
-            // Push items within one segment to avoid cross-segment issues
             let items_to_push = 50;
             for i in 0..items_to_push {
                 queue.push(DropCounter { _value: i }).unwrap();
             }
 
-            // Pop half
             for _ in 0..25 {
                 drop(queue.pop().unwrap());
             }
 
             let drops_after_pop = DROP_COUNT.load(Ordering::SeqCst);
             assert_eq!(drops_after_pop, 25, "Should have dropped 25 items");
-
-            // Remaining items should be dropped when queue goes out of scope
         }
-
-        // Note: We can't reliably test final drop count under Miri
-        // as the queue is in shared memory managed by AlignedMemory
     }
 
     #[test]
@@ -1023,14 +985,11 @@ mod unbounded_tests {
         let mut memory = AlignedMemory::new(shared_size, 128);
         let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 64, 16) };
 
-        // Fill and empty to test segment recycling
         for batch in 0..3 {
-            // Fill segment
             for i in 0..50 {
                 queue.push(batch * 100 + i).unwrap();
             }
 
-            // Empty segment
             for i in 0..50 {
                 assert_eq!(queue.pop().unwrap(), batch * 100 + i);
             }
@@ -1049,7 +1008,7 @@ mod unbounded_tests {
         };
 
         let barrier = Arc::new(Barrier::new(2));
-        let items_to_send = 50; // Within one segment
+        let items_to_send = 50;
 
         let queue_prod = unsafe { &*queue_ptr };
         let barrier_prod = barrier.clone();
@@ -1110,19 +1069,15 @@ mod unbounded_tests {
         let mut memory = AlignedMemory::new(shared_size, 128);
         let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 64, 16) };
 
-        // Stress test within single segment
         for round in 0..10 {
-            // Fill most of segment
             for i in 0..60 {
                 queue.push(round * 1000 + i).unwrap();
             }
 
-            // Pop half
             for _ in 0..30 {
                 queue.pop().unwrap();
             }
 
-            // Fill again
             for i in 60..90 {
                 match queue.push(round * 1000 + i) {
                     Ok(_) => {}
@@ -1130,7 +1085,6 @@ mod unbounded_tests {
                 }
             }
 
-            // Pop all
             while !queue.empty() {
                 queue.pop().unwrap();
             }
@@ -1141,7 +1095,6 @@ mod unbounded_tests {
 
     #[test]
     fn test_unbounded_different_types() {
-        // Test with strings using smaller segments to stay within pre-allocated pool
         {
             let shared_size = UnboundedQueue::<String>::shared_size(8, 16);
             let mut memory = AlignedMemory::new(shared_size, 128);
@@ -1149,7 +1102,6 @@ mod unbounded_tests {
 
             let queue = unsafe { UnboundedQueue::init_in_shared(mem_ptr, 8, 16) };
 
-            // Push fewer items to stay within initial segment
             for i in 0..5 {
                 queue.push(format!("test_{}", i)).unwrap();
             }
@@ -1158,7 +1110,6 @@ mod unbounded_tests {
             }
         }
 
-        // Test with Option - use a simple type that doesn't allocate
         {
             let shared_size = UnboundedQueue::<Option<usize>>::shared_size(8, 16);
             let mut memory = AlignedMemory::new(shared_size, 128);
@@ -1175,7 +1126,6 @@ mod unbounded_tests {
             assert_eq!(queue.pop().unwrap(), Some(100));
         }
 
-        // Test with Vec<u8> - another type that allocates
         {
             let shared_size = UnboundedQueue::<Vec<u8>>::shared_size(8, 16);
             let mut memory = AlignedMemory::new(shared_size, 128);
@@ -1222,8 +1172,7 @@ mod sesd_wrapper_tests {
         let pool_capacity = 100;
         let shared_size = SesdJpSpscBenchWrapper::<usize>::shared_size(pool_capacity);
 
-        // Use AlignedMemory helper that's already defined in the test file
-        let mut memory = AlignedMemory::new(shared_size, 64); // 64-byte alignment for safety
+        let mut memory = AlignedMemory::new(shared_size, 64);
 
         let queue =
             unsafe { SesdJpSpscBenchWrapper::init_in_shared(memory.as_mut_ptr(), pool_capacity) };
@@ -1241,7 +1190,6 @@ mod sesd_wrapper_tests {
         }
         assert!(queue.empty());
 
-        // Test capacity
         let mut pushed = 0;
         for i in 0..pool_capacity {
             match queue.push(i) {
@@ -1329,7 +1277,6 @@ mod sesd_wrapper_tests {
     }
 }
 
-// Macro for systematic shared memory initialization tests
 macro_rules! test_shared_init {
     ($queue_type:ty, $capacity:expr, $alignment:expr, $test_name:ident) => {
         #[test]
@@ -1348,10 +1295,8 @@ macro_rules! test_shared_init {
 
             let queue = unsafe { <$queue_type>::init_in_shared(mem_ptr, $capacity) };
 
-            // Test basic operations
             queue.push(123).unwrap();
 
-            // Handle buffered queues
             if stringify!($queue_type).contains("MultiPushQueue") {
                 if let Some(mp_queue) =
                     (queue as &dyn std::any::Any).downcast_ref::<MultiPushQueue<usize>>()
@@ -1369,7 +1314,6 @@ macro_rules! test_shared_init {
             assert_eq!(queue.pop().unwrap(), 123);
             assert!(queue.empty());
 
-            // Test filling to capacity
             let mut pushed = 0;
             for i in 0..$capacity {
                 match queue.push(i) {
@@ -1380,7 +1324,6 @@ macro_rules! test_shared_init {
 
             assert!(pushed > 0);
 
-            // Flush buffered queues
             if stringify!($queue_type).contains("MultiPushQueue") {
                 if let Some(mp_queue) = (queue as &dyn Any).downcast_ref::<MultiPushQueue<usize>>()
                 {
@@ -1392,7 +1335,6 @@ macro_rules! test_shared_init {
                 }
             }
 
-            // Pop all items
             let mut popped = 0;
             let mut pop_attempts = 0;
             while popped < pushed && pop_attempts < pushed * 2 {
@@ -1466,7 +1408,6 @@ mod shared_memory_tests {
         assert_eq!(queue.pop().unwrap(), 123);
         assert!(queue.empty());
 
-        // Test the lossy nature of Dehnavi queue
         let mut pushed = 0;
         for i in 0..capacity * 2 {
             queue.push(i).unwrap();
@@ -1547,9 +1488,8 @@ mod shared_memory_tests {
     fn test_dspsc_shared() {
         const MIRI_MEDIUM_CAPACITY: usize = 128;
 
-        // Calculate nodes needed for test
         let items_to_push = (MIRI_MEDIUM_CAPACITY / 2) - 10;
-        let nodes_count = items_to_push + 1; // +1 for dummy
+        let nodes_count = items_to_push + 1;
 
         let shared_size = DynListQueue::<usize>::shared_size(MIRI_MEDIUM_CAPACITY, nodes_count);
         let mut memory = AlignedMemory::new(shared_size, 128);
@@ -1581,13 +1521,11 @@ mod shared_memory_tests {
 
         let queue = unsafe { UnboundedQueue::<usize>::init_in_shared(mem_ptr, 64, 16) };
 
-        // Test basic operations
         queue.push(123).unwrap();
         assert_eq!(queue.pop().unwrap(), 123);
         assert!(queue.empty());
 
-        // Test within single segment to avoid cross-segment issues
-        let items = 50; // Less than 64
+        let items = 50;
         for i in 0..items {
             queue.push(i).unwrap();
         }
@@ -1658,8 +1596,6 @@ mod drop_semantics_tests {
         for _ in 0..5 {
             let _ = queue.pop().unwrap();
         }
-
-        // Remaining strings should be dropped when queue is dropped
     }
 
     #[test]
@@ -1682,10 +1618,9 @@ mod drop_semantics_tests {
         DROP_COUNT.store(0, Ordering::SeqCst);
 
         {
-            // Use shared memory allocation
-            let items_to_test = 50; // Less than cache capacity to avoid issues
+            let items_to_test = 50;
             let cache_capacity = 64;
-            let nodes_count = cache_capacity + 10; // Cache capacity + extra for active nodes
+            let nodes_count = cache_capacity + 10;
 
             let shared_size = DynListQueue::<DropCounter>::shared_size(cache_capacity, nodes_count);
             let layout = std::alloc::Layout::from_size_align(shared_size, 128).unwrap();
@@ -1699,26 +1634,21 @@ mod drop_semantics_tests {
                 DynListQueue::<DropCounter>::init_in_shared(mem_ptr, cache_capacity, nodes_count)
             };
 
-            // Push items (less than cache capacity)
             for i in 0..items_to_test {
                 queue.push(DropCounter { _value: i }).unwrap();
             }
 
-            // Pop half
             for _ in 0..25 {
                 drop(queue.pop().unwrap());
             }
 
             assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 25);
 
-            // Clean up - this should drop remaining items
             unsafe {
-                // First drop all remaining items in the queue
                 while let Ok(item) = queue.pop() {
                     drop(item);
                 }
 
-                // Then deallocate the memory
                 std::alloc::dealloc(mem_ptr, layout);
             }
         }
@@ -1779,22 +1709,18 @@ mod edge_case_tests {
     fn test_wraparound() {
         let queue = FfqQueue::<usize>::with_capacity(8);
 
-        // Fill half
         for i in 0..4 {
             queue.push(i).unwrap();
         }
 
-        // Pop half
         for i in 0..4 {
             assert_eq!(queue.pop().unwrap(), i);
         }
 
-        // Fill again - this wraps around
         for i in 4..12 {
             queue.push(i).unwrap();
         }
 
-        // Pop all
         for i in 4..12 {
             assert_eq!(queue.pop().unwrap(), i);
         }
@@ -1802,7 +1728,6 @@ mod edge_case_tests {
 
     #[test]
     fn test_different_payload_types() {
-        // Test with strings
         {
             let queue = LamportQueue::<String>::with_capacity(16);
             for i in 0..10 {
@@ -1813,7 +1738,6 @@ mod edge_case_tests {
             }
         }
 
-        // Test with vectors
         {
             let queue = FfqQueue::<Vec<u32>>::with_capacity(16);
             for i in 0..5 {
@@ -1826,7 +1750,6 @@ mod edge_case_tests {
             }
         }
 
-        // Test with options
         {
             let queue = BlqQueue::<Option<usize>>::with_capacity(32);
             queue.push(Some(42)).unwrap();
@@ -1838,7 +1761,6 @@ mod edge_case_tests {
             assert_eq!(queue.pop().unwrap(), Some(100));
         }
 
-        // Test with tuples
         {
             let queue = IffqQueue::<(usize, String)>::with_capacity(64);
             for i in 0..10 {
@@ -1935,7 +1857,6 @@ mod special_feature_tests {
     fn test_blq_batch_operations() {
         let queue = BlqQueue::<usize>::with_capacity(128);
 
-        // Test batch enqueue
         let space = queue.blq_enq_space(10);
         assert!(space >= 10);
 
@@ -1944,7 +1865,6 @@ mod special_feature_tests {
         }
         queue.blq_enq_publish();
 
-        // Test batch dequeue
         let available = queue.blq_deq_space(10);
         assert_eq!(available, 10);
 
@@ -1955,7 +1875,6 @@ mod special_feature_tests {
     }
 }
 
-// Additional tests that mirror unit tests
 #[test]
 fn test_multiple_queues() {
     let q1 = LamportQueue::<u32>::with_capacity(32);
@@ -2009,7 +1928,6 @@ mod shared_memory_init_tests {
 
     #[test]
     fn test_shared_memory_alignment_all_queues() {
-        // Test that all queue types properly handle different alignments
         struct AlignmentTest {
             queue_type: &'static str,
             min_align: usize,
@@ -2025,7 +1943,6 @@ mod shared_memory_init_tests {
                     let mut mem = AlignedMemory::new(size + align, align);
                     let ptr = mem.as_mut_ptr();
 
-                    // Test with different offsets
                     for offset in [0, 8, 16, 32].iter() {
                         if *offset < align {
                             let test_ptr = unsafe { ptr.add(*offset) };
@@ -2060,29 +1977,24 @@ mod shared_memory_init_tests {
 
     #[test]
     fn test_shared_memory_reinitialization() {
-        // Test that queues can be safely reinitialized in the same memory
         let size = LamportQueue::<usize>::shared_size(64);
         let mut memory = AlignedMemory::new(size, 64);
         let mem_ptr = memory.as_mut_ptr();
 
-        // First initialization
         {
             let queue = unsafe { LamportQueue::init_in_shared(mem_ptr, 64) };
             for i in 0..10 {
                 queue.push(i).unwrap();
             }
-            // Don't pop - leave items in queue
         }
 
-        // Zero memory
         unsafe {
             std::ptr::write_bytes(mem_ptr, 0, size);
         }
 
-        // Reinitialize
         {
             let queue = unsafe { LamportQueue::init_in_shared(mem_ptr, 64) };
-            assert!(queue.empty()); // Should be empty after reinitialization
+            assert!(queue.empty());
 
             queue.push(100).unwrap();
             assert_eq!(queue.pop().unwrap(), 100);
@@ -2091,18 +2003,15 @@ mod shared_memory_init_tests {
 
     #[test]
     fn test_shared_memory_partial_writes() {
-        // Test queues handle partially initialized memory correctly
         let size = BiffqQueue::<String>::shared_size(128);
         let mut memory = AlignedMemory::new(size, 64);
         let mem_ptr = memory.as_mut_ptr();
 
-        // Partially initialize with garbage
         unsafe {
             let garbage: Vec<u8> = (0..size / 2).map(|i| (i % 256) as u8).collect();
             std::ptr::copy_nonoverlapping(garbage.as_ptr(), mem_ptr, size / 2);
         }
 
-        // Should still initialize correctly
         let queue = unsafe { BiffqQueue::init_in_shared(mem_ptr, 128) };
 
         queue.push("test".to_string()).unwrap();
@@ -2112,9 +2021,7 @@ mod shared_memory_init_tests {
 
     #[test]
     fn test_shared_memory_size_calculations() {
-        // Test special queue types with extra parameters
         {
-            // MultiPushQueue
             let size = MultiPushQueue::<usize>::shared_size(128);
             let mut memory = AlignedMemory::new(size, 64);
             let queue =
@@ -2123,7 +2030,6 @@ mod shared_memory_init_tests {
             queue.flush();
             assert_eq!(queue.pop().unwrap(), 42);
 
-            // SesdJpSpscBenchWrapper
             let size = SesdJpSpscBenchWrapper::<usize>::shared_size(100);
             let mut memory = AlignedMemory::new(size, 64);
             let queue = unsafe {
@@ -2132,7 +2038,6 @@ mod shared_memory_init_tests {
             queue.push(42).unwrap();
             assert_eq!(queue.pop().unwrap(), 42);
 
-            // UnboundedQueue with new API
             let size = UnboundedQueue::<usize>::shared_size(64, 16);
             let mut memory = AlignedMemory::new(size, 128);
             let queue =
@@ -2144,22 +2049,18 @@ mod shared_memory_init_tests {
 
     #[test]
     fn test_shared_memory_concurrent_init_safety() {
-        // Test initialization is safe even with concurrent access patterns
         let size = MultiPushQueue::<usize>::shared_size(128);
         let mut memory = AlignedMemory::new(size, 64);
         let mem_ptr = memory.as_mut_ptr();
 
         let queue = unsafe { MultiPushQueue::init_in_shared(mem_ptr, 128) };
 
-        // Simulate concurrent-like access patterns
         for i in 0..32 {
             queue.push(i).unwrap();
         }
 
-        // Force flush (would happen automatically at 32)
         assert!(queue.flush());
 
-        // Verify state is consistent
         assert_eq!(queue.local_count.load(Ordering::Relaxed), 0);
 
         for i in 0..32 {
@@ -2173,13 +2074,12 @@ mod shared_memory_init_tests {
         let mut memory = AlignedMemory::new(size, 128);
         let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 64, 16) };
 
-        // Push items
         let items_to_push = 500;
         let mut actually_pushed = 0;
         for i in 0..items_to_push {
             match queue.push(i) {
                 Ok(_) => actually_pushed += 1,
-                Err(_) => break, // Ran out of pre-allocated segments
+                Err(_) => break,
             }
         }
 
@@ -2188,7 +2088,6 @@ mod shared_memory_init_tests {
             actually_pushed, items_to_push
         );
 
-        // Pop items with retry logic
         let mut popped = 0;
         let mut consecutive_failures = 0;
         let mut i = 0;
@@ -2225,19 +2124,15 @@ mod unbounded_edge_cases {
         let mut memory = AlignedMemory::new(shared_size, 128);
         let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 64, 16) };
 
-        // Test pushing exactly at segment boundary
         for i in 0..64 {
             queue.push(i).unwrap();
         }
 
-        // This should trigger segment allocation
         queue.push(64).unwrap();
 
-        // Pop first segment completely with retry logic
         let mut popped_count = 0;
         let mut consecutive_failures = 0;
 
-        // Try to pop all 65 items
         while popped_count < 65 && consecutive_failures < 1000 {
             match queue.pop() {
                 Ok(val) => {
@@ -2262,14 +2157,11 @@ mod unbounded_edge_cases {
         let mut memory = AlignedMemory::new(shared_size, 128);
         let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 64, 16) };
 
-        // Rapidly cycle through segments
         for cycle in 0..3 {
-            // Fill segment
             for i in 0..60 {
                 queue.push(cycle * 1000 + i).unwrap();
             }
 
-            // Empty segment
             for i in 0..60 {
                 assert_eq!(queue.pop().unwrap(), cycle * 1000 + i);
             }
@@ -2284,17 +2176,14 @@ mod unbounded_edge_cases {
         let mut memory = AlignedMemory::new(shared_size, 128);
         let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 64, 16) };
 
-        // Push partial segment
         for i in 0..30 {
             queue.push(i).unwrap();
         }
 
-        // Pop some but not all
         for i in 0..15 {
             assert_eq!(queue.pop().unwrap(), i);
         }
 
-        // Push more to potentially trigger new segment
         for i in 30..80 {
             match queue.push(i) {
                 Ok(_) => {}
@@ -2302,7 +2191,6 @@ mod unbounded_edge_cases {
             }
         }
 
-        // Verify we can still pop remaining items
         let mut next_expected = 15;
         while let Ok(val) = queue.pop() {
             assert!(val >= next_expected);
@@ -2322,17 +2210,14 @@ mod unbounded_edge_cases {
         assert!(queue.empty());
         assert!(queue.available());
 
-        // Fill first segment
         for i in 0..64 {
             queue.push(i).unwrap();
             assert!(!queue.empty());
         }
 
-        // Start second segment
         queue.push(64).unwrap();
         assert!(!queue.empty());
 
-        // Empty completely with retry logic
         let mut popped = 0;
         let mut consecutive_failures = 0;
 
@@ -2352,7 +2237,6 @@ mod unbounded_edge_cases {
         assert_eq!(popped, 65, "Should pop all 65 items");
         assert!(queue.empty());
 
-        // After emptying, available() should eventually be true
         let mut available = false;
         for _ in 0..10 {
             if queue.available() {
@@ -2373,7 +2257,6 @@ mod unbounded_edge_cases {
         let mut memory = AlignedMemory::new(shared_size, 128);
         let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 64, 16) };
 
-        // Push many ZSTs to test segment handling
         let mut pushed = 0;
         for _ in 0..200 {
             match queue.push(ZeroSized) {
@@ -2382,7 +2265,6 @@ mod unbounded_edge_cases {
             }
         }
 
-        // Pop with retry logic
         let mut popped = 0;
         let mut consecutive_failures = 0;
 

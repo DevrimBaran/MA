@@ -745,7 +745,7 @@ fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(2500))
-        .sample_size(1000)
+        .sample_size(500)
 }
 
 criterion_group! {

@@ -11,27 +11,20 @@ CRITERION_BASE_PATH = './target/criterion/'
 MPMC_QUEUE_GROUPS = [
    "VermaMPMC",
    "YangCrummeyMPMC", 
-   "KhanchandaniWattenhoferMPMC",
-   "BurdenMPMC",
-   "NaderibeniRuppertMPMC",
-   "JohnenKhattabiMilaniMPMC",
    "WCQueueMPMC",
    "TurnQueueMPMC",
    "FeldmanDechevWFMPMC",
-   "StellwagDitterPreikschatMPMC",
    "KoganPetrankMPMC"
 ]
 
 # Process configurations to test (matches PROCESS_COUNTS_TO_TEST in mpmc_bench.rs)
 PROCESS_CONFIGS = [(1, 1), (2, 2), (4, 4), (6, 6)]
 # This should match ITEMS_PER_PROCESS_TARGET from your mpmc_bench.rs
-ITEMS_PER_PROCESS = 5_000
+ITEMS_PER_PROCESS = 170_000
 
 # Output file names
 VIOLIN_PLOT_FILE_TEMPLATE = 'mpmc_performance_violin_{}P_{}C.png'
-SUMMARY_HEATMAP_FILE = 'mpmc_mean_performance_heatmap.png'
 SUMMARY_LINE_PLOT_FILE = 'mpmc_mean_performance_vs_threads.png'
-THROUGHPUT_PLOT_FILE = 'mpmc_throughput_vs_threads.png'
 
 def load_benchmark_data(base_path, queue_group_name, num_producers, num_consumers):
    """
@@ -69,10 +62,7 @@ def load_benchmark_data(base_path, queue_group_name, num_producers, num_consumer
       print(f"Warning: Error loading data for '{queue_group_name}/{benchmark_id}' from '{path_segment}': {e}")
       return None
 
-def calculate_throughput(time_ns, total_items):
-   """Calculate throughput in million operations per second"""
-   time_seconds = time_ns / 1e9
-   return (total_items / time_seconds) / 1e6
+
 
 def main():
    all_benchmark_data = []  # To store data for summary plots
@@ -142,42 +132,6 @@ def main():
          print(f"  Error saving violin plot: {e}")
       plt.close()
 
-   # --- Generate Summary Heatmap ---
-   if all_benchmark_data:
-      # Prepare data for heatmap
-      heatmap_data = {}
-      for record in all_benchmark_data:
-         queue_name = record['Queue Type'].replace('MPMC', '')
-         config_key = f"{record['Producer Count']}P/{record['Consumer Count']}C"
-         
-         if queue_name not in heatmap_data:
-               heatmap_data[queue_name] = {}
-         
-         # Store mean execution time in microseconds
-         heatmap_data[queue_name][config_key] = record['Mean Time (ns)'] / 1000.0
-
-      # Convert to DataFrame
-      df_heatmap = pd.DataFrame(heatmap_data).T
-      # Reorder columns to match process config order
-      column_order = [f"{p}P/{c}C" for p, c in PROCESS_CONFIGS]
-      df_heatmap = df_heatmap[column_order]
-
-      # Create heatmap
-      plt.figure(figsize=(10, 12))
-      sns.heatmap(df_heatmap, annot=True, fmt='.1f', cmap='YlOrRd', 
-                  cbar_kws={'label': 'Mean Execution Time (µs)'})
-      plt.title('MPMC Queue Performance Heatmap', fontsize=16, pad=20)
-      plt.xlabel('Producer/Consumer Configuration', fontsize=12)
-      plt.ylabel('Queue Type', fontsize=12)
-      plt.tight_layout()
-
-      try:
-         plt.savefig(SUMMARY_HEATMAP_FILE, dpi=150, bbox_inches='tight')
-         print(f"\nHeatmap saved to {SUMMARY_HEATMAP_FILE}")
-      except Exception as e:
-         print(f"\nError saving heatmap: {e}")
-      plt.close()
-
    # --- Generate Summary Line Plot (Performance vs Thread Count) ---
    if all_benchmark_data:
       summary_df_data = []
@@ -210,39 +164,6 @@ def main():
          print(f"Error saving summary line plot: {e}")
       plt.close()
 
-   # --- Generate Throughput Plot ---
-   if all_benchmark_data:
-      throughput_data = []
-      for record in all_benchmark_data:
-         mean_throughput = calculate_throughput(record['Mean Time (ns)'], record['Total Items'])
-         throughput_data.append({
-               'Queue Type': record['Queue Type'].replace('MPMC', ''),
-               'Total Threads': record['Total Threads'],
-               'Throughput (M ops/sec)': mean_throughput,
-               'Configuration': f"{record['Producer Count']}P/{record['Consumer Count']}C"
-         })
-
-      df_throughput = pd.DataFrame(throughput_data)
-
-      plt.figure(figsize=(14, 8))
-      sns.lineplot(x='Total Threads', y='Throughput (M ops/sec)', hue='Queue Type', 
-                  data=df_throughput, marker='o', linewidth=2.5, markersize=8)
-      
-      plt.title('MPMC Queues: Throughput vs. Total Thread Count', fontsize=16, pad=20)
-      plt.xlabel("Total Thread Count (Producers + Consumers)", fontsize=12)
-      plt.ylabel('Throughput (Million operations/second)', fontsize=12)
-      plt.xticks([2, 4, 8, 12])  # Based on PROCESS_CONFIGS
-      plt.legend(title='Queue Type', bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
-      plt.grid(True, linestyle=':', alpha=0.7)
-      plt.tight_layout()
-
-      try:
-         plt.savefig(THROUGHPUT_PLOT_FILE, dpi=150, bbox_inches='tight')
-         print(f"Throughput plot saved to {THROUGHPUT_PLOT_FILE}")
-      except Exception as e:
-         print(f"Error saving throughput plot: {e}")
-      plt.close()
-
    # --- Print Summary Statistics ---
    if all_benchmark_data:
       print("\n--- Summary Statistics ---")
@@ -254,16 +175,15 @@ def main():
                                  (df_stats['Consumer Count'] == num_cons)]
          
          if not config_data.empty:
-               print(f"\nConfiguration: {num_prods}P/{num_cons}C")
-               print("Queue Type                        | Mean Time (µs) | Std Dev (µs) | Throughput (M ops/s)")
-               print("-" * 85)
+               print("\nConfiguration: {num_prods}P/{num_cons}C")
+               print("Queue Type                        | Mean Time (µs) | Std Dev (µs)")
+               print("-" * 65)
                
                for _, row in config_data.iterrows():
                   queue_name = row['Queue Type'].replace('MPMC', '')
                   mean_us = row['Mean Time (ns)'] / 1000.0
                   std_us = row['Std Time (ns)'] / 1000.0
-                  throughput = calculate_throughput(row['Mean Time (ns)'], row['Total Items'])
-                  print(f"{queue_name:<32} | {mean_us:>14.2f} | {std_us:>12.2f} | {throughput:>20.2f}")
+                  print(f"{queue_name:<32} | {mean_us:>14.2f} | {std_us:>12.2f}")
 
 if __name__ == '__main__':
    main()

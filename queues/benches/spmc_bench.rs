@@ -12,7 +12,7 @@ use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 const PERFORMANCE_TEST: bool = false;
-const ITEMS_PER_PRODUCER_TARGET: usize = 50_000; // Reduced for testing
+const ITEMS_PER_PRODUCER_TARGET: usize = 5_000; // Reduced for testing
 const CONSUMER_COUNTS_TO_TEST: &[usize] = &[1, 2, 4, 8, 14];
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 100_000_000;
 
@@ -390,7 +390,7 @@ fn bench_david_spmc(c: &mut Criterion) {
     let mut group = c.benchmark_group("DavidSPMC");
 
     for &num_consumers in CONSUMER_COUNTS_TO_TEST {
-        let items_to_produce = ITEMS_PER_PRODUCER_TARGET;
+        let items_to_produce = ITEMS_PER_PRODUCER_TARGET * num_consumers;
 
         group.bench_function(format!("1P_{}C", num_consumers), |b: &mut Bencher| {
             b.iter_custom(|_iters| {
@@ -432,7 +432,7 @@ fn bench_david_spmc(c: &mut Criterion) {
 
 fn custom_criterion() -> Criterion {
     Criterion::default()
-        .warm_up_time(Duration::from_secs(5))
+        .warm_up_time(Duration::from_secs(2))
         .measurement_time(Duration::from_secs(10))
         .sample_size(10)
 }

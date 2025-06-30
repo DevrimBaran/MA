@@ -1,7 +1,7 @@
 // queues/src/spmc/david_queue.rs
 use std::mem;
 use std::ptr;
-use std::sync::atomic::{fence, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::SpmcQueue;
 
@@ -49,15 +49,6 @@ impl SwapCell {
     unsafe fn swap(&self, new_val: usize) -> usize {
         self.value.swap(new_val, Ordering::AcqRel)
     }
-
-    fn load(&self) -> usize {
-        self.value.load(Ordering::Acquire)
-    }
-
-    fn compare_exchange(&self, current: usize, new: usize) -> Result<usize, usize> {
-        self.value
-            .compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
-    }
 }
 
 // Main queue structure
@@ -65,12 +56,9 @@ impl SwapCell {
 pub struct DavidQueue<T: Send + Clone + 'static> {
     // Shared state
     row: AtomicUsize,          // ROW register
+    min_row: AtomicUsize,      // Minimum row that might have items
     head_array_offset: usize,  // Offset to HEAD array
     items_array_offset: usize, // Offset to ITEMS array
-
-    // Tracking
-    total_enqueued: AtomicUsize,
-    total_dequeued: AtomicUsize,
 
     // Queue configuration
     num_consumers: usize,
@@ -142,16 +130,12 @@ impl<T: Send + Clone + 'static> DavidQueue<T> {
         ptr::read(ptr)
     }
 
-    // Enqueue operation - faithful to paper
+    // Enqueue operation - EXACTLY as in the paper
     pub fn enqueue(&self, state: &mut EnqueuerState, item: T) -> Result<(), ()> {
         unsafe {
             // Check bounds
-            if state.tail >= self.items_per_row {
-                state.enq_row += 1;
-                state.tail = 0;
-                if state.enq_row >= self.num_rows {
-                    return Err(());
-                }
+            if state.enq_row >= self.num_rows {
+                return Err(());
             }
 
             let x_ptr = self.allocate_item(item);
@@ -159,174 +143,83 @@ impl<T: Send + Clone + 'static> DavidQueue<T> {
             // Step 1: val ← Swap(ITEMS[enq_row, tail], x)
             let val = self.get_item(state.enq_row, state.tail).swap(x_ptr);
 
-            // Step 2: if val = ⊤ then
+            // Step 2-6: if val = ⊤ then
             if val == TOP {
-                // increment(enq_row); tail ← 0
+                // increment(enq_row)
                 state.enq_row += 1;
-                state.tail = 0;
                 if state.enq_row >= self.num_rows {
                     return Err(());
                 }
 
-                // Swap(ITEMS[enq_row, tail], x)
+                // tail ← 0
+                state.tail = 0;
+
+                // Step 5: Swap(ITEMS[enq_row, tail], x)
                 self.get_item(state.enq_row, state.tail).swap(x_ptr);
 
-                // Write(ROW, enq_row)
+                // Step 6: Write(ROW, enq_row)
                 self.row.store(state.enq_row, Ordering::Release);
             }
 
-            // If val wasn't TOP, we successfully stored in the original position
-            // Always update ROW to ensure visibility
-            self.row.store(state.enq_row, Ordering::Release);
-
-            // increment(tail)
+            // Step 7: increment(tail)
             state.tail += 1;
-
-            // Track enqueue
-            self.total_enqueued.fetch_add(1, Ordering::AcqRel);
 
             Ok(())
         }
     }
 
-    // Dequeue operation - better handling for high contention
-    pub fn dequeue(&self, consumer_id: usize) -> Result<T, ()> {
+    // Dequeue operation - Paper's algorithm with recovery mechanism
+    pub fn dequeue(&self, _consumer_id: usize) -> Result<T, ()> {
         unsafe {
-            // Adaptive retry count based on number of consumers
-            let base_attempts = 20;
-            let extra_attempts = self.num_consumers * 5;
-            let max_attempts = base_attempts + extra_attempts;
+            // First try the paper's exact algorithm
+            // Step 1: deq_row ← Read(ROW)
+            let deq_row = self.row.load(Ordering::Acquire);
 
-            for attempt in 0..max_attempts {
-                // First, check if there's anything to dequeue
-                let enqueued = self.total_enqueued.load(Ordering::Acquire);
-                let dequeued = self.total_dequeued.load(Ordering::Acquire);
+            // Step 2: head ← Fetch&Increment(HEAD[deq_row])
+            let head = self.get_head(deq_row).fetch_increment();
 
-                if dequeued >= enqueued {
-                    // Add small delay to let producer catch up
-                    if attempt < 5 {
-                        std::thread::yield_now();
-                        continue;
-                    }
-                    return Err(());
+            // Step 3: val ← Swap(ITEMS[deq_row, head], ⊤)
+            let val = self.get_item(deq_row, head).swap(TOP);
+
+            // Step 4: if val = ⊥ then return ε else return val
+            if val != BOTTOM && val != TOP {
+                return Ok(self.get_pooled_item(val));
+            }
+
+            // Recovery mechanism: If we got BOTTOM, check previous rows
+            // This violates the 3-step bound but prevents data loss
+
+            let min_row = self.min_row.load(Ordering::Acquire);
+
+            // Try previous rows from most recent to oldest
+            for offset in 1..=(deq_row.saturating_sub(min_row)).min(10) {
+                let try_row = deq_row.saturating_sub(offset);
+
+                if try_row < min_row {
+                    break;
                 }
 
-                // Step 1: deq_row ← Read(ROW)
-                let deq_row = self.row.load(Ordering::Acquire);
+                // Try to get an item from this row
+                let head = self.get_head(try_row).fetch_increment();
 
-                // For high contention, also try previous rows
-                let rows_to_try = if self.num_consumers > 4 { 3 } else { 1 };
-
-                for row_offset in 0..rows_to_try {
-                    let try_row = if row_offset == 0 {
-                        deq_row
-                    } else if deq_row >= row_offset {
-                        deq_row - row_offset
-                    } else {
-                        continue;
-                    };
-
-                    // Step 2: head ← Fetch&Increment(HEAD[deq_row])
-                    let head = self.get_head(try_row).fetch_increment();
-
-                    // Check bounds
-                    if head >= self.items_per_row {
-                        continue;
-                    }
-
-                    // Step 3: val ← Swap(ITEMS[deq_row, head], ⊤)
+                if head < self.items_per_row {
                     let val = self.get_item(try_row, head).swap(TOP);
 
                     if val != BOTTOM && val != TOP {
-                        // Got a valid item!
-                        self.total_dequeued.fetch_add(1, Ordering::AcqRel);
+                        // Found an item! Check if this row is now exhausted
+                        if head + 1 >= self.items_per_row {
+                            // Try to advance min_row
+                            self.min_row
+                                .compare_exchange(
+                                    try_row,
+                                    try_row + 1,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                )
+                                .ok();
+                        }
+
                         return Ok(self.get_pooled_item(val));
-                    }
-                }
-
-                // Didn't get anything this round
-                if attempt > max_attempts / 2 {
-                    // More aggressive scanning in second half of attempts
-                    fence(Ordering::SeqCst);
-
-                    let current_row = self.row.load(Ordering::Acquire);
-                    let scan_rows = (self.num_consumers / 2).max(2).min(10);
-
-                    // Scan recent rows
-                    for row in current_row.saturating_sub(scan_rows)..=current_row {
-                        if row >= self.num_rows {
-                            continue;
-                        }
-
-                        // Random starting position to reduce contention
-                        let start_pos = (consumer_id * 17 + attempt * 7) % self.items_per_row;
-
-                        // Scan from random position
-                        for i in 0..self.items_per_row {
-                            let pos = (start_pos + i) % self.items_per_row;
-                            let cell_val = self.get_item(row, pos).load();
-
-                            if cell_val != BOTTOM && cell_val != TOP {
-                                match self.get_item(row, pos).compare_exchange(cell_val, TOP) {
-                                    Ok(item_ptr) => {
-                                        self.total_dequeued.fetch_add(1, Ordering::AcqRel);
-                                        return Ok(self.get_pooled_item(item_ptr));
-                                    }
-                                    Err(_) => continue,
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Adaptive backoff based on contention
-                if self.num_consumers > 8 {
-                    // High contention - more aggressive backoff
-                    if attempt % 4 == 0 {
-                        std::thread::sleep(std::time::Duration::from_micros(1));
-                    } else {
-                        std::thread::yield_now();
-                    }
-                } else if self.num_consumers > 4 {
-                    // Medium contention
-                    std::thread::yield_now();
-                } else {
-                    // Low contention - just spin
-                    for _ in 0..10 {
-                        std::hint::spin_loop();
-                    }
-                }
-            }
-
-            // Final exhaustive check
-            fence(Ordering::SeqCst);
-            let final_enqueued = self.total_enqueued.load(Ordering::Acquire);
-            let final_dequeued = self.total_dequeued.load(Ordering::Acquire);
-
-            if final_dequeued < final_enqueued {
-                // Really thorough final scan
-                let current_row = self.row.load(Ordering::Acquire);
-
-                // Start from a random row to reduce contention
-                let start_row = (consumer_id * 13) % (current_row + 1);
-
-                for i in 0..=current_row {
-                    let row = (start_row + i) % (current_row + 1);
-                    if row >= self.num_rows {
-                        continue;
-                    }
-
-                    for pos in 0..self.items_per_row {
-                        let cell_val = self.get_item(row, pos).load();
-                        if cell_val != BOTTOM && cell_val != TOP {
-                            match self.get_item(row, pos).compare_exchange(cell_val, TOP) {
-                                Ok(item_ptr) => {
-                                    self.total_dequeued.fetch_add(1, Ordering::AcqRel);
-                                    return Ok(self.get_pooled_item(item_ptr));
-                                }
-                                Err(_) => continue,
-                            }
-                        }
                     }
                 }
             }
@@ -347,10 +240,10 @@ impl<T: Send + Clone + 'static> DavidQueue<T> {
         let queue_size = mem::size_of::<Self>();
         let queue_aligned = (queue_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
-        // Configuration - more rows, smaller size
-        let items_per_row = 512; // Smaller rows
-        let num_rows = 1000; // Many more rows
-        let item_pool_size = 200_000; // Generous pool
+        // Configuration - sized for 1M items with safety margin
+        let items_per_row = 2048; // Larger row size for efficiency
+        let num_rows = 1500; // 1500 * 2048 = 3,072,000 cells (3x overhead)
+        let item_pool_size = 1_500_000; // Pool for 1.5M items
 
         // HEAD array
         let head_array_offset = queue_aligned;
@@ -373,10 +266,9 @@ impl<T: Send + Clone + 'static> DavidQueue<T> {
             queue_ptr,
             Self {
                 row: AtomicUsize::new(0),
+                min_row: AtomicUsize::new(0),
                 head_array_offset,
                 items_array_offset,
-                total_enqueued: AtomicUsize::new(0),
-                total_dequeued: AtomicUsize::new(0),
                 num_consumers,
                 num_rows,
                 items_per_row,
@@ -414,9 +306,9 @@ impl<T: Send + Clone + 'static> DavidQueue<T> {
         let queue_size = mem::size_of::<Self>();
         let queue_aligned = (queue_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
-        let items_per_row = 512;
-        let num_rows = 1000;
-        let item_pool_size = 200_000;
+        let items_per_row = 2048;
+        let num_rows = 1500;
+        let item_pool_size = 1_500_000;
 
         let head_array_size = num_rows * mem::size_of::<FetchIncrement>();
         let head_array_aligned = (head_array_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
@@ -427,13 +319,13 @@ impl<T: Send + Clone + 'static> DavidQueue<T> {
         let item_pool_bytes = item_pool_size * mem::size_of::<T>();
 
         let total = queue_aligned + head_array_aligned + items_array_aligned + item_pool_bytes;
+
+        // About 200MB for the queue structure
         (total + 4095) & !4095
     }
 
     pub fn is_empty(&self) -> bool {
-        let enqueued = self.total_enqueued.load(Ordering::Acquire);
-        let dequeued = self.total_dequeued.load(Ordering::Acquire);
-        dequeued >= enqueued
+        false // Can't reliably determine this in the paper's algorithm
     }
 }
 

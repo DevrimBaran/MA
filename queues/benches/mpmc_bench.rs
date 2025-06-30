@@ -6,8 +6,7 @@ use nix::{
 };
 use queues::mpmc::{self, polylog_queue, ymc_queue};
 use queues::mpmc::{
-    BurdenWFQueue, FeldmanDechevWFQueue, JKMQueue, KPQueue, KWQueue, NRQueue, SDPWFQueue,
-    TurnQueue, WCQueue, WFQueue, YangCrummeyQueue,
+    FeldmanDechevWFQueue, JKMQueue, KPQueue, NRQueue, TurnQueue, WCQueue, WFQueue, YangCrummeyQueue,
 };
 use queues::MpmcQueue;
 use std::ptr;
@@ -16,8 +15,8 @@ use std::time::Duration;
 
 const PERFORMANCE_TEST: bool = false;
 const ITEMS_PER_PROCESS_TARGET: usize = 170_000;
-const PROCESS_COUNTS_TO_TEST: &[(usize, usize)] = &[(1, 1)];
-const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 1_000_000_000;
+const PROCESS_COUNTS_TO_TEST: &[(usize, usize)] = &[(1, 1), (2, 2), (4, 4), (5, 5)];
+const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 100_000_000_000;
 
 trait BenchMpmcQueue<T: Send + Clone>: Send + Sync + 'static {
     fn bench_push(&self, item: T, process_id: usize) -> Result<(), ()>;
@@ -65,24 +64,6 @@ impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for YangCrummeyQueue<T> {
     }
 }
 
-impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for KWQueue<T> {
-    fn bench_push(&self, item: T, process_id: usize) -> Result<(), ()> {
-        self.enqueue(process_id, item)
-    }
-
-    fn bench_pop(&self, process_id: usize) -> Result<T, ()> {
-        self.dequeue(process_id)
-    }
-
-    fn bench_is_empty(&self) -> bool {
-        self.is_empty()
-    }
-
-    fn bench_is_full(&self) -> bool {
-        false
-    }
-}
-
 impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for WFQueue<T> {
     fn bench_push(&self, item: T, process_id: usize) -> Result<(), ()> {
         self.enqueue(process_id, item)
@@ -98,24 +79,6 @@ impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for WFQueue<T> {
 
     fn bench_is_full(&self) -> bool {
         self.is_full()
-    }
-}
-
-impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for BurdenWFQueue<T> {
-    fn bench_push(&self, item: T, process_id: usize) -> Result<(), ()> {
-        self.enqueue(process_id, item)
-    }
-
-    fn bench_pop(&self, process_id: usize) -> Result<T, ()> {
-        self.dequeue(process_id)
-    }
-
-    fn bench_is_empty(&self) -> bool {
-        self.is_empty()
-    }
-
-    fn bench_is_full(&self) -> bool {
-        false
     }
 }
 
@@ -198,30 +161,6 @@ impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for FeldmanDechevWFQueue<T> {
 
     fn bench_pop(&self, process_id: usize) -> Result<T, ()> {
         self.dequeue(process_id)
-    }
-
-    fn bench_is_empty(&self) -> bool {
-        self.is_empty()
-    }
-
-    fn bench_is_full(&self) -> bool {
-        self.is_full()
-    }
-}
-
-impl<T: Send + Clone + 'static> BenchMpmcQueue<T> for SDPWFQueue<T> {
-    fn bench_push(&self, item: T, process_id: usize) -> Result<(), ()> {
-        match self.enqueue(process_id, item) {
-            Ok(()) => Ok(()),
-            Err(_) => Err(()), // Convert any error to unit type
-        }
-    }
-
-    fn bench_pop(&self, process_id: usize) -> Result<T, ()> {
-        match self.dequeue(process_id) {
-            Ok(item) => Ok(item),
-            Err(_) => Err(()), // Convert any error to unit type
-        }
     }
 
     fn bench_is_empty(&self) -> bool {
@@ -977,69 +916,6 @@ fn bench_yang_crummey(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_kw_queue(c: &mut Criterion) {
-    let mut group = c.benchmark_group("KhanchandaniWattenhoferMPMC");
-
-    for &(num_prods, num_cons) in PROCESS_COUNTS_TO_TEST {
-        let items_per_process = ITEMS_PER_PROCESS_TARGET;
-        let total_processes = num_prods + num_cons;
-
-        group.bench_function(
-            format!("{}P_{}C", num_prods, num_cons),
-            |b: &mut Bencher| {
-                b.iter_custom(|_iters| {
-                    fork_and_run_mpmc_with_helper::<KWQueue<usize>, _>(
-                        || {
-                            let bytes = KWQueue::<usize>::shared_size(total_processes);
-                            let shm_ptr = unsafe { map_shared(bytes) };
-                            let q = unsafe { KWQueue::init_in_shared(shm_ptr, total_processes) };
-                            (q, shm_ptr, bytes)
-                        },
-                        num_prods,
-                        num_cons,
-                        items_per_process,
-                        false, // needs_helper = false
-                    )
-                })
-            },
-        );
-    }
-
-    group.finish();
-}
-
-fn bench_burden_wf_queue(c: &mut Criterion) {
-    let mut group = c.benchmark_group("BurdenMPMC");
-
-    for &(num_prods, num_cons) in PROCESS_COUNTS_TO_TEST {
-        let items_per_process = ITEMS_PER_PROCESS_TARGET;
-        let total_processes = num_prods + num_cons;
-
-        group.bench_function(
-            format!("{}P_{}C", num_prods, num_cons),
-            |b: &mut Bencher| {
-                b.iter_custom(|_iters| {
-                    fork_and_run_mpmc_with_helper::<BurdenWFQueue<usize>, _>(
-                        || {
-                            let bytes = BurdenWFQueue::<usize>::shared_size(total_processes);
-                            let shm_ptr = unsafe { map_shared(bytes) };
-                            let q =
-                                unsafe { BurdenWFQueue::init_in_shared(shm_ptr, total_processes) };
-                            (q, shm_ptr, bytes)
-                        },
-                        num_prods,
-                        num_cons,
-                        items_per_process,
-                        false, // needs_helper = false (no helper process needed)
-                    )
-                })
-            },
-        );
-    }
-
-    group.finish();
-}
-
 fn bench_nr_queue(c: &mut Criterion) {
     let mut group = c.benchmark_group("NaderibeniRuppertMPMC");
 
@@ -1197,40 +1073,6 @@ fn bench_feldman_dechev_wf_queue(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_sdp_queue(c: &mut Criterion) {
-    let mut group = c.benchmark_group("StellwagDitterPreikschatMPMC");
-
-    for &(num_prods, num_cons) in PROCESS_COUNTS_TO_TEST {
-        let items_per_process = ITEMS_PER_PROCESS_TARGET;
-        let total_processes = num_prods + num_cons;
-
-        group.bench_function(
-            format!("{}P_{}C", num_prods, num_cons),
-            |b: &mut Bencher| {
-                b.iter_custom(|_iters| {
-                    fork_and_run_mpmc_with_helper::<SDPWFQueue<usize>, _>(
-                        || {
-                            // Always enable helping queue as it's a core optimization in the paper
-                            let bytes = SDPWFQueue::<usize>::shared_size(total_processes, true);
-                            let shm_ptr = unsafe { map_shared(bytes) };
-                            let q = unsafe {
-                                SDPWFQueue::init_in_shared(shm_ptr, total_processes, true)
-                            };
-                            (q, shm_ptr, bytes)
-                        },
-                        num_prods,
-                        num_cons,
-                        items_per_process,
-                        false,
-                    )
-                })
-            },
-        );
-    }
-
-    group.finish();
-}
-
 fn bench_kogan_petrank_queue(c: &mut Criterion) {
     let mut group = c.benchmark_group("KoganPetrankMPMC");
 
@@ -1273,7 +1115,13 @@ criterion_group! {
     name = benches;
     config = custom_criterion();
     targets =
-        bench_sdp_queue,
+        bench_feldman_dechev_wf_queue,
+        bench_wf_queue,
+        bench_yang_crummey,
+        bench_nr_queue,
+        bench_jkm_queue,
+        bench_wcq_queue,
+        bench_turn_queue,
         bench_kogan_petrank_queue
 }
 

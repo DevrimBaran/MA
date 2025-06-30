@@ -22,13 +22,10 @@ pub use mpsc::DrescherQueue;
 pub use mpsc::JayantiPetrovicMpscQueue;
 pub use mpsc::JiffyQueue;
 
-pub use mpmc::BurdenWFQueue;
 pub use mpmc::FeldmanDechevWFQueue;
 pub use mpmc::JKMQueue;
 pub use mpmc::KPQueue;
-pub use mpmc::KWQueue;
 pub use mpmc::NRQueue;
-pub use mpmc::SDPWFQueue;
 pub use mpmc::TurnQueue;
 pub use mpmc::WCQueue;
 pub use mpmc::WFQueue;

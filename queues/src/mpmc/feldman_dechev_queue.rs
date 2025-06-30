@@ -694,7 +694,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         let help_index_aligned = (help_index_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
         // Value pool
-        let items_per_thread = 250_000;
+        let items_per_thread = 100_000;
         let value_pool_size = num_threads * items_per_thread;
         let value_pool_offset = help_index_offset + help_index_aligned;
         let value_pool_bytes = value_pool_size * mem::size_of::<ValueType<usize>>();
@@ -782,7 +782,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         let help_index_size = num_threads * mem::size_of::<AtomicUsize>();
         let help_index_aligned = (help_index_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
-        let items_per_thread = 250_000;
+        let items_per_thread = 100_000;
         let value_pool_size = num_threads * items_per_thread;
         let value_pool_bytes = value_pool_size * mem::size_of::<ValueType<usize>>();
         let value_pool_aligned = (value_pool_bytes + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);

@@ -251,7 +251,7 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
         let state_array_aligned = (state_array_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
         // Node pool
-        let items_per_thread = 700_000;
+        let items_per_thread = 150_000;
         let node_pool_size = num_threads * items_per_thread * 2;
         let nodes_offset = state_array_offset + state_array_aligned;
         let nodes_size = node_pool_size * mem::size_of::<Node<T>>();
@@ -309,7 +309,7 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
             num_threads * FALSE_SHARING_MULTIPLIER * mem::size_of::<Request<T>>();
         let state_array_aligned = (state_array_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
-        let items_per_thread = 700_000;
+        let items_per_thread = 150_000;
         let node_pool_size = num_threads * items_per_thread * 2;
         let nodes_size = node_pool_size * mem::size_of::<Node<T>>();
 

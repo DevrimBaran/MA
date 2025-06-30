@@ -4,7 +4,7 @@ use std::mem::{self, MaybeUninit};
 use std::ptr;
 use std::sync::atomic::{fence, AtomicU8, AtomicUsize, Ordering};
 
-const CACHE_LINE_SIZE: usize = 64;
+const CACHE_LINE_SIZE: usize = 128;
 
 // Status bits for queue elements as described in Table I of the paper
 const INIT_BIT: u8 = 0b100;
@@ -608,7 +608,7 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
         enable_helping_queue: bool,
     ) -> &'static Self {
         let queue_ptr = mem as *mut Self;
-        let elements_per_thread = 750_000;
+        let elements_per_thread = 200_000;
         let total_elements = num_threads * elements_per_thread;
 
         // Calculate memory layout
@@ -697,7 +697,7 @@ impl<T: Send + Clone + 'static> SDPWFQueue<T> {
 
     // Calculate required shared memory size
     pub fn shared_size(num_threads: usize, enable_helping_queue: bool) -> usize {
-        let elements_per_thread = 750_000;
+        let elements_per_thread = 200_000;
         let total_elements = num_threads * elements_per_thread;
 
         let queue_size = mem::size_of::<Self>();

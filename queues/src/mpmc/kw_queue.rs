@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use crate::MpmcQueue;
 
 // Reduced to more reasonable size for testing
-const MAX_OPS: usize = 2_000_000; // 1M instead of 10M
+const MAX_OPS: usize = 1_000_000; // 1M instead of 10M
 
 #[repr(C, align(64))]
 struct THRegister {

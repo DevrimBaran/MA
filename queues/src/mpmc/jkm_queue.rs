@@ -127,7 +127,7 @@ unsafe impl<T: Send + Clone + 'static> Sync for JKMQueue<T> {}
 // ---------- layout helpers ---------------------------------------------------
 impl<T: Send + Clone + 'static> JKMQueue<T> {
     fn layout(n_enq: usize) -> (Layout, [usize; 5]) {
-        let ipp = 50_000;
+        let ipp = 200_000;
         let tree_sz = if n_enq == 0 {
             0
         } else {
@@ -166,7 +166,7 @@ impl<T: Send + Clone + 'static> JKMQueue<T> {
     /// The caller must supply a shared-memory block of at least `shared_size`
     /// bytes, properly aligned.
     pub unsafe fn init_in_shared(mem: *mut u8, n_enq: usize, n_deq: usize) -> &'static mut Self {
-        let ipp = 50_000;
+        let ipp = 200_000;
         let tree_sz = if n_enq == 0 {
             0
         } else {

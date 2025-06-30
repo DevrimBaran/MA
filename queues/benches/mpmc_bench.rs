@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 const PERFORMANCE_TEST: bool = false;
-const ITEMS_PER_PROCESS_TARGET: usize = 1_500_000;
+const ITEMS_PER_PROCESS_TARGET: usize = 170_000;
 const PROCESS_COUNTS_TO_TEST: &[(usize, usize)] = &[(1, 1)];
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 1_000_000_000;
 
@@ -1264,7 +1264,7 @@ fn bench_kogan_petrank_queue(c: &mut Criterion) {
 
 fn custom_criterion() -> Criterion {
     Criterion::default()
-        .warm_up_time(Duration::from_secs(5))
+        .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(15))
         .sample_size(10)
 }
@@ -1273,15 +1273,6 @@ criterion_group! {
     name = benches;
     config = custom_criterion();
     targets =
-        bench_wf_queue,
-        bench_yang_crummey,
-        bench_kw_queue,
-        bench_burden_wf_queue,
-        bench_nr_queue,
-        bench_jkm_queue,
-        bench_wcq_queue,
-        bench_turn_queue,
-        bench_feldman_dechev_wf_queue,
         bench_sdp_queue,
         bench_kogan_petrank_queue
 }

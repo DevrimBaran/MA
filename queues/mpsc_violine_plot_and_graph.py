@@ -10,12 +10,13 @@ CRITERION_BASE_PATH = './target/criterion/'
 MPSC_QUEUE_GROUPS = [
    "DrescherMPSC",
    "JayantiPetrovicMPSC",
-   "JiffyMPSC"
+   "JiffyMPSC",
+   "DQueueMPSC"
 ]
 # Producer counts to generate individual plots for and to use in the summary plot
 PRODUCER_COUNTS = [1, 2, 4, 8, 14]
 # This should match ITEMS_PER_PRODUCER_TARGET from your mpsc_bench.rs
-ITEMS_PER_PRODUCER = 1_000_000 
+ITEMS_PER_PRODUCER = 2_500_000 
 
 # Output file names and titles
 VIOLIN_PLOT_FILE_TEMPLATE = 'mpsc_performance_violin_{}_producers.png'

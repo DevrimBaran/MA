@@ -18,9 +18,9 @@ use nix::{
 };
 use queues::mpsc::dqueue::N_SEGMENT_CAPACITY;
 
-const PERFORMANCE_TEST: bool = true;
-const ITEMS_PER_PRODUCER_TARGET: usize = 3_000_000;
-const JIFFY_NODES_PER_BUFFER_BENCH: usize = 8192;
+const PERFORMANCE_TEST: bool = false;
+const ITEMS_PER_PRODUCER_TARGET: usize = 2_500_000;
+const JIFFY_NODES_PER_BUFFER_BENCH: usize = 32_768;
 const PRODUCER_COUNTS_TO_TEST: &[usize] = &[1, 2, 4, 8, 14];
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 100_000_000;
 
@@ -300,7 +300,7 @@ where
         waitpid(pid, None).expect("waitpid for MPSC producer failed");
     }
 
-    if (!PERFORMANCE_TEST && consumed_count != total_items_to_produce) {
+    if (!PERFORMANCE_TEST && (consumed_count != total_items_to_produce)) {
         eprintln!(
             "Warning (MPSC): Consumed {}/{} items. Q: {}, Prods: {}",
             consumed_count,
@@ -332,7 +332,7 @@ fn bench_drescher_mpsc(c: &mut Criterion) {
                 b.iter_custom(|_iters| {
                     fork_and_run_mpsc::<DrescherQueue<usize>, _>(
                         || {
-                            let node_cap = total_items_run + num_prods_current_run * 2; // Extra nodes for producers
+                            let node_cap = total_items_run * 2; // Extra nodes for producers
                             let bytes = DrescherQueue::<usize>::shared_size(node_cap);
                             let shm_ptr = unsafe { map_shared(bytes) };
                             let q = unsafe { DrescherQueue::init_in_shared(shm_ptr, node_cap) };
@@ -473,8 +473,8 @@ fn bench_d_queue_mpsc(c: &mut Criterion) {
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(2))
-        .measurement_time(Duration::from_secs(60))
-        .sample_size(10)
+        .measurement_time(Duration::from_secs(7000))
+        .sample_size(500)
 }
 
 criterion_group! {
@@ -482,5 +482,8 @@ criterion_group! {
     config = custom_criterion();
     targets =
         bench_drescher_mpsc,
+        bench_jayanti_petrovic_mpsc,
+        bench_jiffy_mpsc,
+        bench_d_queue_mpsc,
 }
 criterion_main!(mpsc_benches);

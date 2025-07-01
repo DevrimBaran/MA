@@ -1,6 +1,4 @@
-// queues/tests/miri_mpmc_tests.rs
-// Miri-compatible tests for MPMC queues
-
+#![allow(clippy::cast_ptr_alignment)]
 use queues::{
     FeldmanDechevWFQueue, KPQueue, MpmcQueue, TurnQueue, WCQueue, WFQueue, YangCrummeyQueue,
 };

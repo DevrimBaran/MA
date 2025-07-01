@@ -20,10 +20,10 @@ enum OpType {
 
 // Request structure that workers use to communicate with helper
 #[repr(C, align(64))]
-struct Request<T> {
-    op_type: AtomicU8,
-    element: UnsafeCell<Option<T>>,
-    is_completed: AtomicBool,
+pub struct Request<T> {
+    pub op_type: AtomicU8,
+    pub element: UnsafeCell<Option<T>>,
+    pub is_completed: AtomicBool,
     _padding: [u8; CACHE_LINE_SIZE - 17], // Ensure cache line alignment
 }
 
@@ -83,14 +83,14 @@ unsafe impl<T: Send + Clone> Send for WFQueue<T> {}
 unsafe impl<T: Send + Clone> Sync for WFQueue<T> {}
 
 // AtomicU8 wrapper for OpType
-struct AtomicU8(AtomicUsize);
+pub struct AtomicU8(AtomicUsize);
 
 impl AtomicU8 {
     fn new(val: u8) -> Self {
         Self(AtomicUsize::new(val as usize))
     }
 
-    fn load(&self, ordering: Ordering) -> u8 {
+    pub fn load(&self, ordering: Ordering) -> u8 {
         self.0.load(ordering) as u8
     }
 
@@ -101,7 +101,7 @@ impl AtomicU8 {
 
 impl<T: Send + Clone + 'static> WFQueue<T> {
     // Get request for a specific thread
-    unsafe fn get_request(&self, thread_id: usize) -> &Request<T> {
+    pub unsafe fn get_request(&self, thread_id: usize) -> &Request<T> {
         let state_array_ptr = self.base_ptr.add(self.state_array_offset) as *const Request<T>;
         // Apply false sharing padding
         let actual_index = thread_id * FALSE_SHARING_MULTIPLIER;

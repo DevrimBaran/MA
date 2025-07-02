@@ -788,99 +788,6 @@ mod multipush_tests {
     }
 }
 
-mod dehnavi_tests {
-    use super::*;
-
-    #[test]
-    fn test_dehnavi_basic() {
-        let queue = DehnaviQueue::<usize>::new(10);
-
-        queue.push(42).unwrap();
-        assert_eq!(queue.pop().unwrap(), 42);
-        assert!(queue.empty());
-    }
-
-    #[test]
-    fn test_dehnavi() {
-        let queue = Arc::new(DehnaviQueue::<usize>::new(4));
-        let barrier = Arc::new(Barrier::new(2));
-
-        let queue_prod = queue.clone();
-        let barrier_prod = barrier.clone();
-
-        let producer = thread::spawn(move || {
-            barrier_prod.wait();
-            for i in 0..20 {
-                queue_prod.push(i).unwrap();
-                if i % 3 == 0 {
-                    thread::yield_now();
-                }
-            }
-        });
-
-        let queue_cons = queue.clone();
-        let barrier_cons = barrier.clone();
-
-        let consumer = thread::spawn(move || {
-            barrier_cons.wait();
-            let mut items = Vec::new();
-            let mut attempts = 0;
-            let mut last_seen = None;
-
-            while attempts < 1000 {
-                match queue_cons.pop() {
-                    Ok(item) => {
-                        items.push(item);
-
-                        if let Some(last) = last_seen {
-                            if item <= last {}
-                        }
-                        last_seen = Some(item);
-                        attempts = 0;
-                    }
-                    Err(_) => {
-                        attempts += 1;
-                        thread::yield_now();
-                    }
-                }
-
-                if items.len() >= 10 {
-                    break;
-                }
-            }
-
-            items
-        });
-
-        producer.join().unwrap();
-        let items = consumer.join().unwrap();
-
-        assert!(
-            !items.is_empty(),
-            "Should have received at least some items"
-        );
-        assert!(
-            items.len() >= 4,
-            "Should receive at least as many items as queue capacity"
-        );
-
-        let mut max_seen = items[0];
-        let mut increasing_count = 0;
-
-        for &item in &items[1..] {
-            if item > max_seen {
-                max_seen = item;
-                increasing_count += 1;
-            }
-        }
-
-        assert!(
-            increasing_count >= items.len() / 3,
-            "Should see general progression in values despite potential overwrites"
-        );
-    }
-}
-
 mod unbounded_tests {
     use super::*;
 
@@ -1396,35 +1303,6 @@ mod shared_memory_tests {
     );
 
     #[test]
-    fn test_dehnavi_shared() {
-        let capacity = 10;
-        let shared_size = DehnaviQueue::<usize>::shared_size(capacity);
-        let mut memory = AlignedMemory::new(shared_size, 64);
-        let mem_ptr = memory.as_mut_ptr();
-
-        let queue = unsafe { DehnaviQueue::<usize>::init_in_shared(mem_ptr, capacity) };
-
-        queue.push(123).unwrap();
-        assert_eq!(queue.pop().unwrap(), 123);
-        assert!(queue.empty());
-
-        let mut pushed = 0;
-        for i in 0..capacity * 2 {
-            queue.push(i).unwrap();
-            pushed += 1;
-        }
-
-        assert!(pushed > 0);
-
-        let mut popped = 0;
-        while !queue.empty() && popped < capacity {
-            queue.pop().unwrap();
-            popped += 1;
-        }
-        assert!(popped > 0);
-    }
-
-    #[test]
     fn test_llq_shared() {
         let shared_size = LlqQueue::<usize>::llq_shared_size(MIRI_MEDIUM_CAPACITY);
         let mut memory = AlignedMemory::new(shared_size, 64);
@@ -1782,12 +1660,6 @@ mod error_handling_tests {
     #[should_panic(expected = "capacity must be power of two")]
     fn test_lamport_invalid_capacity() {
         let _ = LamportQueue::<usize>::with_capacity(15);
-    }
-
-    #[test]
-    #[should_panic(expected = "Capacity (k) must be greater than 0")]
-    fn test_dehnavi_zero_capacity() {
-        let _ = DehnaviQueue::<usize>::new(0);
     }
 
     #[test]
@@ -2200,7 +2072,6 @@ mod unbounded_edge_cases {
         }
     }
 
-    #[test]
     #[test]
     fn test_unbounded_empty_checks_across_segments() {
         let shared_size = UnboundedQueue::<usize>::shared_size(64, 16);

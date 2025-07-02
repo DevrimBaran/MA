@@ -999,99 +999,6 @@ mod unbounded_tests {
     }
 }
 
-mod dehnavi_tests {
-    use super::*;
-
-    #[test]
-    fn test_dehnavi_basic() {
-        let queue = DehnaviQueue::<usize>::new(10);
-
-        queue.push(42).unwrap();
-        assert_eq!(queue.pop().unwrap(), 42);
-        assert!(queue.empty());
-    }
-
-    #[test]
-    fn test_dehnavi() {
-        let queue = Arc::new(DehnaviQueue::<usize>::new(4));
-        let barrier = Arc::new(Barrier::new(2));
-
-        let queue_prod = queue.clone();
-        let barrier_prod = barrier.clone();
-
-        let producer = thread::spawn(move || {
-            barrier_prod.wait();
-            for i in 0..20 {
-                queue_prod.push(i).unwrap();
-                if i % 3 == 0 {
-                    thread::sleep(Duration::from_micros(10));
-                }
-            }
-        });
-
-        let queue_cons = queue.clone();
-        let barrier_cons = barrier.clone();
-
-        let consumer = thread::spawn(move || {
-            barrier_cons.wait();
-            let mut items = Vec::new();
-            let mut attempts = 0;
-            let mut last_seen = None;
-
-            while attempts < 100000 {
-                match queue_cons.pop() {
-                    Ok(item) => {
-                        items.push(item);
-
-                        if let Some(last) = last_seen {
-                            if item < last {}
-                        }
-                        last_seen = Some(item);
-                        attempts = 0;
-                    }
-                    Err(_) => {
-                        attempts += 1;
-                        thread::yield_now();
-                    }
-                }
-
-                if items.len() >= 10 {
-                    break;
-                }
-            }
-
-            items
-        });
-
-        producer.join().unwrap();
-        let items = consumer.join().unwrap();
-
-        assert!(
-            !items.is_empty(),
-            "Should have received at least some items"
-        );
-        assert!(
-            items.len() >= 4,
-            "Should receive at least as many items as queue capacity"
-        );
-
-        let mut max_seen = items[0];
-        let mut increasing_count = 0;
-
-        for &item in &items[1..] {
-            if item > max_seen {
-                max_seen = item;
-                increasing_count += 1;
-            }
-        }
-
-        assert!(
-            increasing_count >= items.len() / 3,
-            "Should see general progression in values despite potential overwrites"
-        );
-    }
-}
-
 fn create_aligned_memory_box(size: usize, alignment: usize) -> Box<[u8]> {
     use std::alloc::{alloc_zeroed, Layout};
 
@@ -1218,39 +1125,6 @@ mod shared_memory_tests {
         64,
         test_multipush_shared
     );
-
-    #[test]
-    fn test_dehnavi_shared() {
-        let capacity = 10;
-        let shared_size = DehnaviQueue::<usize>::shared_size(capacity);
-        let memory = create_aligned_memory_box(shared_size, 64);
-        let mem_ptr = Box::leak(memory).as_mut_ptr();
-
-        let queue = unsafe { DehnaviQueue::<usize>::init_in_shared(mem_ptr, capacity) };
-
-        queue.push(123).unwrap();
-        assert_eq!(queue.pop().unwrap(), 123);
-        assert!(queue.empty());
-
-        let mut pushed = 0;
-        for i in 0..capacity * 2 {
-            queue.push(i).unwrap();
-            pushed += 1;
-        }
-
-        assert!(pushed > 0);
-
-        let mut popped = 0;
-        while !queue.empty() && popped < capacity {
-            queue.pop().unwrap();
-            popped += 1;
-        }
-        assert!(popped > 0);
-
-        unsafe {
-            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
-        }
-    }
 
     #[test]
     fn test_llq_shared() {
@@ -1553,12 +1427,6 @@ mod error_handling_tests {
     #[should_panic]
     fn test_lamport_invalid_capacity() {
         let _ = LamportQueue::<usize>::with_capacity(15);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_dehnavi_zero_capacity() {
-        let _ = DehnaviQueue::<usize>::new(0);
     }
 
     #[test]
@@ -2291,94 +2159,6 @@ mod ipc_tests {
 
                 waitpid(child, None).expect("waitpid failed");
                 assert_eq!(count, NUM_ITEMS);
-
-                unsafe {
-                    unmap_shared(shm_ptr, total_size);
-                }
-            }
-            Err(e) => {
-                unsafe {
-                    unmap_shared(shm_ptr, total_size);
-                }
-                panic!("Fork failed: {}", e);
-            }
-        }
-    }
-
-    #[test]
-    fn test_dehnavi_ipc() {
-        let capacity = 100;
-        let shared_size = DehnaviQueue::<usize>::shared_size(capacity);
-        let sync_size = std::mem::size_of::<AtomicBool>() * 2;
-        let sync_size = (sync_size + 63) & !63;
-        let total_size = shared_size + sync_size;
-
-        let shm_ptr = unsafe { map_shared(total_size) };
-
-        let producer_ready = unsafe { &*(shm_ptr as *const AtomicBool) };
-        let consumer_ready =
-            unsafe { &*(shm_ptr.add(std::mem::size_of::<AtomicBool>()) as *const AtomicBool) };
-
-        producer_ready.store(false, Ordering::SeqCst);
-        consumer_ready.store(false, Ordering::SeqCst);
-
-        let queue_ptr = unsafe { shm_ptr.add(sync_size) };
-        let queue = unsafe { DehnaviQueue::init_in_shared(queue_ptr, capacity) };
-
-        const NUM_ITEMS: usize = 200;
-
-        match unsafe { fork() } {
-            Ok(ForkResult::Child) => {
-                producer_ready.store(true, Ordering::Release);
-                while !consumer_ready.load(Ordering::Acquire) {
-                    std::hint::spin_loop();
-                }
-
-                for i in 0..NUM_ITEMS {
-                    queue.push(i).unwrap();
-                    if i % 10 == 0 {
-                        std::thread::sleep(Duration::from_micros(10));
-                    }
-                }
-
-                unsafe { libc::_exit(0) };
-            }
-            Ok(ForkResult::Parent { child }) => {
-                while !producer_ready.load(Ordering::Acquire) {
-                    std::hint::spin_loop();
-                }
-                consumer_ready.store(true, Ordering::Release);
-
-                std::thread::sleep(Duration::from_millis(10));
-
-                let mut received = Vec::new();
-                let mut attempts = 0;
-
-                while attempts < 100000 {
-                    match queue.pop() {
-                        Ok(item) => {
-                            received.push(item);
-                            attempts = 0;
-                        }
-                        Err(_) => {
-                            attempts += 1;
-                            if attempts > 10000 {
-                                break;
-                            }
-                            std::thread::yield_now();
-                        }
-                    }
-                }
-
-                waitpid(child, None).expect("waitpid failed");
-
-                assert!(!received.is_empty(), "Should have received some items");
-                for i in 1..received.len() {
-                    assert!(
-                        received[i] > received[i - 1],
-                        "Items should be in increasing order"
-                    );
-                }
 
                 unsafe {
                     unmap_shared(shm_ptr, total_size);

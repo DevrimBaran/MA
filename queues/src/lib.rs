@@ -6,14 +6,12 @@ pub mod spsc;
 pub use spsc::BQueue;
 pub use spsc::BiffqQueue;
 pub use spsc::BlqQueue;
-pub use spsc::DehnaviQueue;
 pub use spsc::DynListQueue;
 pub use spsc::FfqQueue;
 pub use spsc::IffqQueue;
 pub use spsc::LamportQueue;
 pub use spsc::LlqQueue;
 pub use spsc::MultiPushQueue;
-pub use spsc::PopError;
 pub use spsc::SesdJpSpscBenchWrapper;
 pub use spsc::UnboundedQueue;
 

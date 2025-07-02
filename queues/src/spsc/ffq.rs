@@ -1,4 +1,4 @@
-// In queues/src/spsc/ffq.rs
+// paper in /paper/spsc/ffq.pdf
 
 use crate::SpscQueue;
 use core::{cell::UnsafeCell, fmt, mem::MaybeUninit, ptr};

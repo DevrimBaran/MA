@@ -1,3 +1,4 @@
+// paper in /paper/bqueue.pdf
 use crate::SpscQueue;
 use std::cell::UnsafeCell;
 use std::mem::{self, MaybeUninit};

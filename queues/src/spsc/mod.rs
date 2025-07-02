@@ -1,7 +1,6 @@
 pub mod biffq;
 pub mod blq;
 pub mod bqueue;
-pub mod dehnavi_queue;
 pub mod dspsc;
 pub mod ffq;
 pub mod iffq;
@@ -14,8 +13,6 @@ pub mod uspsc;
 pub use biffq::BiffqQueue;
 pub use blq::BlqQueue;
 pub use bqueue::BQueue;
-pub use dehnavi_queue::DehnaviQueue;
-pub use dehnavi_queue::PopError;
 pub use dspsc::DynListQueue;
 pub use ffq::FfqQueue;
 pub use iffq::IffqQueue;

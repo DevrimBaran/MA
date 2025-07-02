@@ -1,3 +1,4 @@
+//paper in /paper/spsc/Cache‐aware design of general‐purpose Single‐Producer Single‐Consumer queues.pdf
 use crate::SpscQueue;
 use std::cell::UnsafeCell;
 use std::fmt;

@@ -1,4 +1,4 @@
-// Simplified dSPSC for shared memory only
+// paper in /paper/dspc-uspsc-mspsc-full.pdf and /paper/dspc-uspsc-mspsc.pdf
 use crate::spsc::lamport::LamportQueue;
 use crate::SpscQueue;
 use std::{

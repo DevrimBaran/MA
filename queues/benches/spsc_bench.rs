@@ -14,8 +14,8 @@ use std::time::Duration;
 
 // Import all necessary queue types and the main SpscQueue trait
 use queues::{
-    BQueue, BiffqQueue, BlqQueue, DehnaviQueue, DynListQueue, FfqQueue, IffqQueue, LamportQueue,
-    LlqQueue, MultiPushQueue, SesdJpSpscBenchWrapper, SpscQueue, UnboundedQueue,
+    BQueue, BiffqQueue, BlqQueue, DynListQueue, FfqQueue, IffqQueue, LamportQueue, LlqQueue,
+    MultiPushQueue, SesdJpSpscBenchWrapper, SpscQueue, UnboundedQueue,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -54,16 +54,6 @@ unsafe fn map_shared(bytes: usize) -> *mut u8 {
 unsafe fn unmap_shared(ptr: *mut u8, len: usize) {
     let ret = libc::munmap(ptr.cast(), len);
     assert_eq!(ret, 0, "munmap failed: {}", std::io::Error::last_os_error());
-}
-
-// Implement BenchSpscQueue for all queue types
-impl<T: Send + 'static> BenchSpscQueue<T> for DehnaviQueue<T> {
-    fn bench_push(&self, item: T) -> Result<(), ()> {
-        SpscQueue::push(self, item).map_err(|_| ())
-    }
-    fn bench_pop(&self) -> Result<T, ()> {
-        SpscQueue::pop(self).map_err(|_| ())
-    }
 }
 
 impl<T: Send + 'static> BenchSpscQueue<T> for LamportQueue<T> {
@@ -163,27 +153,6 @@ impl<T: Send + Clone + 'static> BenchSpscQueue<T> for SesdJpSpscBenchWrapper<T> 
     fn bench_pop(&self) -> Result<T, ()> {
         SpscQueue::pop(self).map_err(|_| ())
     }
-}
-
-// Benchmark functions for each queue type
-fn bench_dehnavi(c: &mut Criterion) {
-    c.bench_function("Dehnavi", |b| {
-        b.iter(|| {
-            // Dehnavi is a lossy queue, it will overwrite old items if consumer is too slow
-            // To prevent data loss, we need a capacity at least equal to ITERS
-            // Used ITERS + 1 to ensure the queue never completely fills
-            let dehnavi_capacity = ITERS + 1;
-            let bytes = DehnaviQueue::<usize>::shared_size(dehnavi_capacity);
-            let shm_ptr = unsafe { map_shared(bytes) };
-            let q = unsafe { DehnaviQueue::init_in_shared(shm_ptr, dehnavi_capacity) };
-
-            let dur = fork_and_run(q);
-            unsafe {
-                unmap_shared(shm_ptr, bytes);
-            }
-            dur
-        })
-    });
 }
 
 fn bench_lamport(c: &mut Criterion) {
@@ -641,13 +610,16 @@ criterion_group! {
     name = benches;
     config = custom_criterion();
     targets =
-        bench_unbounded,
+        bench_lamport,
+        bench_bqueue,
+        bench_mp,
         bench_dspsc,
-        bench_dehnavi,
+        bench_unbounded,
         bench_iffq,
         bench_biffq,
         bench_ffq,
         bench_llq,
         bench_blq,
+        bench_sesd_jp
 }
 criterion_main!(benches);

@@ -1,3 +1,4 @@
+// paper in /paper/dspc-uspsc-mspsc-full.pdf and /paper/dspc-uspsc-mspsc.pdf
 use crate::spsc::LamportQueue;
 use crate::SpscQueue;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

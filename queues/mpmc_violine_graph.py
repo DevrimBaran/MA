@@ -72,6 +72,7 @@ def main():
       print(f"\n--- Processing for {num_prods} Producer(s), {num_cons} Consumer(s) ---")
       
       current_config_data = []  # For the current violin plot
+      mean_values_dict = {}  # Store mean values for annotation
       total_items = num_prods * ITEMS_PER_PROCESS
       
       for queue_group in MPMC_QUEUE_GROUPS:
@@ -83,9 +84,12 @@ def main():
                # Convert to microseconds for better readability
                times_us = samples_ns / 1000.0
                
+               queue_name_short = queue_group.replace('MPMC', '')
+               mean_values_dict[queue_name_short] = np.mean(times_us)
+               
                for time_val_us in times_us:
                   current_config_data.append({
-                     'Queue Type': queue_group.replace('MPMC', ''),  # Shorten names
+                     'Queue Type': queue_name_short,  # Shorten names
                      'Execution Time (µs)': time_val_us
                   })
                
@@ -112,14 +116,28 @@ def main():
 
       # Create violin plot
       plt.figure(figsize=(14, 8))
-      sns.violinplot(x='Queue Type', y='Execution Time (µs)', data=df_violin, 
+      ax = sns.violinplot(x='Queue Type', y='Execution Time (µs)', data=df_violin, 
                      palette='mako', cut=0, inner='quartile', scale='width')
+      
+      # Disable scientific notation on y-axis
+      ax.ticklabel_format(style='plain', axis='y')
+      
+      # Add mean value annotations
+      for i, (queue_type, mean_val) in enumerate(mean_values_dict.items()):
+         # Get the maximum value for this queue type to position the text
+         queue_data = df_violin[df_violin['Queue Type'] == queue_type]['Execution Time (µs)']
+         y_pos = queue_data.max() + (df_violin['Execution Time (µs)'].max() - df_violin['Execution Time (µs)'].min()) * 0.02
+         
+         # Add the mean value text
+         ax.text(i, y_pos, f'μ={mean_val:.1f} µs', 
+                ha='center', va='bottom', fontsize=9, 
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='gray', alpha=0.8))
       
       plot_title = f'MPMC Queue Performance ({num_prods} Producers, {num_cons} Consumers, {total_items:,} total items)'
       plt.title(plot_title, fontsize=16, pad=20)
       plt.xticks(rotation=45, ha="right", fontsize=10)
       plt.yticks(fontsize=10)
-      plt.ylabel('Total Execution Time (µs)', fontsize=12)
+      plt.ylabel('Execution Time per Iteration (µs)', fontsize=12)
       plt.xlabel("Queue Type", fontsize=12)
       plt.grid(axis='y', linestyle=':', alpha=0.7)
       plt.tight_layout()
@@ -138,7 +156,7 @@ def main():
       for record in all_benchmark_data:
          summary_df_data.append({
                'Queue Type': record['Queue Type'].replace('MPMC', ''),
-               'Total Threads': record['Total Threads'],
+               'Total Processes': record['Total Threads'],
                'Mean Execution Time (µs)': record['Mean Time (ns)'] / 1000.0,
                'Configuration': f"{record['Producer Count']}P/{record['Consumer Count']}C"
          })
@@ -146,16 +164,19 @@ def main():
       df_summary = pd.DataFrame(summary_df_data)
 
       plt.figure(figsize=(14, 8))
-      sns.lineplot(x='Total Threads', y='Mean Execution Time (µs)', hue='Queue Type', 
-                  data=df_summary, marker='o', linewidth=2.5, markersize=8)
+      ax = sns.lineplot(x='Total Processes', y='Mean Execution Time (µs)', hue='Queue Type', 
+                   data=df_summary, marker='o', linewidth=2.5, markersize=8)
       
-      plt.title('MPMC Queues: Performance vs. Total Thread Count', fontsize=16, pad=20)
-      plt.xlabel("Total Thread Count (Producers + Consumers)", fontsize=12)
+      # Disable scientific notation on y-axis
+      ax.ticklabel_format(style='plain', axis='y')
+      
+      plt.title('MPMC Queues: Performance vs. Total Process Count', fontsize=16, pad=20)
+      plt.xlabel("Total Process Count (Producers + Consumers)", fontsize=12)
       plt.ylabel('Mean Execution Time (µs)', fontsize=12)
       plt.xticks([2, 4, 8, 12])  # Based on PROCESS_CONFIGS
-      plt.legend(title='Queue Type', bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
+      plt.legend(title='Queue Type', fontsize=10, title_fontsize=12)
       plt.grid(True, linestyle=':', alpha=0.7)
-      plt.tight_layout()
+      plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
       try:
          plt.savefig(SUMMARY_LINE_PLOT_FILE, dpi=150, bbox_inches='tight')
@@ -175,7 +196,7 @@ def main():
                                  (df_stats['Consumer Count'] == num_cons)]
          
          if not config_data.empty:
-               print("\nConfiguration: {num_prods}P/{num_cons}C")
+               print(f"\nConfiguration: {num_prods}P/{num_cons}C")
                print("Queue Type                        | Mean Time (µs) | Std Dev (µs)")
                print("-" * 65)
                

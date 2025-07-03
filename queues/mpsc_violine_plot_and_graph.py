@@ -21,7 +21,7 @@ ITEMS_PER_PRODUCER = 2_500_000
 # Output file names and titles
 VIOLIN_PLOT_FILE_TEMPLATE = 'mpsc_performance_violin_{}_producers.png'
 SUMMARY_LINE_PLOT_FILE = 'mpsc_mean_performance_vs_producers.png'
-Y_AXIS_LABEL = 'Execution Time per Total Operations (µs)' # Adjusted for clarity
+Y_AXIS_LABEL = 'Execution Time per Iteration (µs)' # Adjusted for clarity
 # Note: The raw times from Criterion are total duration for all items.
 # We will calculate per-operation time for better comparison if needed, or plot total time.
 # For now, let's plot the total time for processing all items,
@@ -73,6 +73,7 @@ def main():
       print(f"\n--- Processing for {num_prods} Producer(s) ---")
       
       current_producer_count_data = [] # For the current violin plot
+      mean_values_dict = {}  # Store mean values for annotation
       # Structure for violin plot: [{'Queue Type': str, 'Time (µs)': float}]
       
       items_this_run_per_producer = ITEMS_PER_PRODUCER # Each producer sends this many
@@ -86,6 +87,8 @@ def main():
                
                # Convert raw times (total duration for all operations in one benchmark run) to microseconds
                times_us = samples_ns / 1000.0 
+               
+               mean_values_dict[queue_group] = np.mean(times_us)
                
                for time_val_us in times_us:
                   current_producer_count_data.append({
@@ -110,14 +113,28 @@ def main():
       df_violin = pd.DataFrame(current_producer_count_data)
 
       plt.figure(figsize=(12, 8)) # Adjusted size for better readability
-      sns.violinplot(x='Queue Type', y='Execution Time for All Operations (µs)', data=df_violin, 
+      ax = sns.violinplot(x='Queue Type', y='Execution Time for All Operations (µs)', data=df_violin, 
                      palette='viridis', cut=0, inner='quartile', scale='width')
+      
+      # Disable scientific notation on y-axis
+      ax.ticklabel_format(style='plain', axis='y')
+      
+      # Add mean value annotations
+      for i, (queue_type, mean_val) in enumerate(mean_values_dict.items()):
+         # Get the maximum value for this queue type to position the text
+         queue_data = df_violin[df_violin['Queue Type'] == queue_type]['Execution Time for All Operations (µs)']
+         y_pos = queue_data.max() + (df_violin['Execution Time for All Operations (µs)'].max() - df_violin['Execution Time for All Operations (µs)'].min()) * 0.02
+         
+         # Add the mean value text
+         ax.text(i, y_pos, f'μ={mean_val:.1f} µs', 
+               ha='center', va='bottom', fontsize=9, 
+               bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='gray', alpha=0.8))
       
       plot_title_violin = f'MPSC Queue Performance ({num_prods} Producer(s), {items_this_run_per_producer:,} items/prod)'
       plt.title(plot_title_violin, fontsize=16, pad=20)
       plt.xticks(rotation=15, ha="right", fontsize=10) 
       plt.yticks(fontsize=10)
-      plt.ylabel('Total Execution Time (µs)', fontsize=12) # Total time for ITERS operations
+      plt.ylabel('Execution Time per Iteration (µs)', fontsize=12) # Total time for ITERS operations
       plt.xlabel("Queue Type", fontsize=12)
       plt.grid(axis='y', linestyle=':', alpha=0.7)
       plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to prevent title overlap
@@ -155,8 +172,11 @@ def main():
       return
 
    plt.figure(figsize=(14, 8))
-   sns.lineplot(x='Producer Count', y='Mean Total Execution Time (µs)', hue='Queue Type', 
-               data=df_summary, marker='o', linewidth=2.5)
+   ax = sns.lineplot(x='Producer Count', y='Mean Total Execution Time (µs)', hue='Queue Type', 
+                data=df_summary, marker='o', linewidth=2.5)
+   
+   # Disable scientific notation on y-axis
+   ax.ticklabel_format(style='plain', axis='y')
    
    plt.title('MPSC Queues: Mean Performance vs. Number of Producers', fontsize=16, pad=20)
    plt.xlabel("Number of Producers", fontsize=12)

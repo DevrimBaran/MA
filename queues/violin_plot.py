@@ -14,7 +14,6 @@ BENCHMARK_FUNCTION_IDS = [
    "mSPSC",
    "uSPSC",
    "dSPSC",
-   "Dehnavi",
    "Iffq",
    "Biffq",
    "FFq",
@@ -25,7 +24,7 @@ BENCHMARK_FUNCTION_IDS = [
 
 OUTPUT_PLOT_FILE = 'spsc_queue_performance_violin_test.png'
 PLOT_TITLE = 'Performance Comparison for IPC SPSC Queues via shared memory'
-Y_AXIS_LABEL = 'Execution Time per Iteration (microseconds)'
+Y_AXIS_LABEL = 'Execution Time per Iteration (µs)'
 
 def load_benchmark_data(base_path, benchmark_file_stem, function_id_folder_name):
    if benchmark_file_stem:
@@ -70,6 +69,7 @@ def load_benchmark_data(base_path, benchmark_file_stem, function_id_folder_name)
 def main():
    all_data = []
    benchmark_labels_for_plot = []
+   mean_values_dict = {}  # Store mean values for annotation
 
 
    for bench_func_id_from_config in BENCHMARK_FUNCTION_IDS:
@@ -83,10 +83,12 @@ def main():
          print(f"  Successfully loaded {len(samples_ns)} samples for ID '{bench_func_id_from_config}' (from folder '{folder_to_try}')")
          samples_us = samples_ns / 1000.0 
          all_data.append(samples_us)
-         benchmark_labels_for_plot.append(bench_func_id_from_config) 
+         benchmark_labels_for_plot.append(bench_func_id_from_config)
+         mean_values_dict[bench_func_id_from_config] = np.mean(samples_us)
 
    if not all_data:
       print("\nError: No benchmark data found or loaded. Cannot generate plot.")
+      return
 
    plot_data_list = []
    for label, data_array in zip(benchmark_labels_for_plot, all_data):
@@ -96,7 +98,21 @@ def main():
    df = pd.DataFrame(plot_data_list)
 
    plt.figure(figsize=(16, 9)) 
-   sns.violinplot(x='Queue Type', y=Y_AXIS_LABEL, data=df, palette='viridis', cut=0, inner='quartile', scale='width')
+   ax = sns.violinplot(x='Queue Type', y=Y_AXIS_LABEL, data=df, palette='viridis', cut=0, inner='quartile', scale='width')
+   
+   # Disable scientific notation on y-axis
+   ax.ticklabel_format(style='plain', axis='y')
+   
+   # Add mean value annotations
+   for i, (queue_type, mean_val) in enumerate(mean_values_dict.items()):
+      # Get the maximum value for this queue type to position the text
+      queue_data = df[df['Queue Type'] == queue_type][Y_AXIS_LABEL]
+      y_pos = queue_data.max() + (df[Y_AXIS_LABEL].max() - df[Y_AXIS_LABEL].min()) * 0.02
+      
+      # Add the mean value text
+      ax.text(i, y_pos, f'μ={mean_val:.1f} µs', 
+            ha='center', va='bottom', fontsize=9, 
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='gray', alpha=0.8))
    
    plt.title(PLOT_TITLE, fontsize=18, pad=20)
    plt.xticks(rotation=30, ha="right", fontsize=10) 

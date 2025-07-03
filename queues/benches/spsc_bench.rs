@@ -1,6 +1,3 @@
-// TODO: FIX DSPSC
-// spinloops are just there so that producer and consumer can start at the same time and handling temporary empty/full queues
-// Since the algorithms are wait-free, the spinloops will not affect the wait-free synchronization between producer and consumer
 #![allow(clippy::cast_possible_truncation)]
 
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -25,7 +22,7 @@ use queues::spsc::llq::K_CACHE_LINE_SLOTS as LLQ_K_SLOTS;
 
 const PERFORMANCE_TEST: bool = false;
 const RING_CAP: usize = 1024;
-const ITERS: usize = 1_000_000;
+const ITERS: usize = 100_000;
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 1_000_000_000;
 
 // Helper trait for benchmarking for SpscQueue error types
@@ -601,9 +598,9 @@ where
 // Criterion setup with same parameters as your old benchmark
 fn custom_criterion() -> Criterion {
     Criterion::default()
-        .warm_up_time(Duration::from_secs(5))
-        .measurement_time(Duration::from_secs(15))
-        .sample_size(10)
+        .warm_up_time(Duration::from_secs(2))
+        .measurement_time(Duration::from_secs(1000))
+        .sample_size(500)
 }
 
 criterion_group! {

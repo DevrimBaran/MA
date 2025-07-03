@@ -42,6 +42,21 @@ name = "spmc_bench"
 harness = false
 required-features = ["bench"]
 
+[[bench]]
+name = "best_in_mpsc_bench"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "best_in_spmc_bench"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "best_in_spsc_bench"
+harness = false
+required-features = ["bench"]
+
 [profile.release]
 debug = 2
 split-debuginfo = "off"

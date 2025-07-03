@@ -1,0 +1,231 @@
+import json
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+
+# --- Configuration ---
+CRITERION_BASE_PATH = './target/criterion/'
+SPMC_QUEUE_ALGORITHMS = [
+    "David (Native SPMC)",
+    "YMC (MPMC as SPMC)"
+]
+# Consumer counts to test
+CONSUMER_COUNTS = [1, 2, 4, 8, 14]
+# This should match ITEMS_PER_PRODUCER_TARGET from your best_in_spmc_bench.rs
+ITEMS_PER_PRODUCER = 5_000
+
+# Output file names and titles
+VIOLIN_PLOT_FILE_TEMPLATE = 'best_in_spmc_performance_violin_1P{}C.png'
+SUMMARY_LINE_PLOT_FILE = 'best_in_spmc_mean_performance_vs_consumers.png'
+Y_AXIS_LABEL = 'Execution Time per Iteration (µs)'
+
+def load_benchmark_data(base_path, queue_algo_name, num_consumers):
+    """
+    Loads benchmark data for a specific SPMC algorithm and consumer count.
+    Benchmark ID format: "{Algorithm} - 1P{N}C"
+    """
+    benchmark_id = f"{queue_algo_name} - 1P{num_consumers}C"
+    
+    path_segment = os.path.join(base_path, benchmark_id, 'new', 'sample.json')
+
+    if not os.path.exists(path_segment):
+        print(f"Warning: Data file not found: '{path_segment}'")
+        return None
+
+    try:
+        with open(path_segment, 'r') as f:
+            data = json.load(f)
+        
+        # Criterion's sample.json stores iteration times in nanoseconds
+        if isinstance(data, dict) and 'times' in data and isinstance(data['times'], list):
+            if all(isinstance(x, (int, float)) for x in data['times']):
+                return np.array(data['times'])  # Keep in nanoseconds for now
+            else:
+                print(f"Warning: Non-numeric time data in '{path_segment}'")
+                return None
+        else:
+            print(f"Warning: Unexpected JSON structure in '{path_segment}'")
+            return None
+
+    except json.JSONDecodeError:
+        print(f"Warning: Could not decode JSON for '{benchmark_id}' at '{path_segment}'")
+        return None
+    except Exception as e:
+        print(f"Warning: Error loading data for '{benchmark_id}' from '{path_segment}': {e}")
+        return None
+
+def main():
+    all_benchmark_data = []  # To store data for the summary plot
+    # Structure: [{'Algorithm': str, 'Consumer Count': int, 'Mean Time (µs)': float, 'Times (µs)': np.array}]
+
+    # --- Generate Violin Plot for each Consumer Count ---
+    for num_consumers in CONSUMER_COUNTS:
+        print(f"\n--- Processing for 1 Producer, {num_consumers} Consumer(s) ---")
+        
+        current_consumer_count_data = []  # For the current violin plot
+        mean_values_dict = {}  # Store mean values for annotation
+        
+        for queue_algo in SPMC_QUEUE_ALGORITHMS:
+            samples_ns = load_benchmark_data(CRITERION_BASE_PATH, queue_algo, num_consumers)
+            
+            if samples_ns is not None and len(samples_ns) > 0:
+                print(f"  Successfully loaded {len(samples_ns)} samples for {queue_algo} with 1P{num_consumers}C.")
+                
+                # Convert raw times to microseconds
+                times_us = samples_ns / 1000.0 
+                
+                mean_values_dict[queue_algo] = np.mean(times_us)
+                
+                for time_val_us in times_us:
+                    current_consumer_count_data.append({
+                        'Algorithm': queue_algo,
+                        Y_AXIS_LABEL: time_val_us
+                    })
+                
+                # Store data for summary plot
+                all_benchmark_data.append({
+                    'Algorithm': queue_algo,
+                    'Consumer Count': num_consumers,
+                    'Mean Time (µs)': np.mean(times_us),
+                    'Times (µs)': times_us
+                })
+            else:
+                print(f"  No data found or loaded for {queue_algo} with 1P{num_consumers}C.")
+
+        if not current_consumer_count_data:
+            print(f"Error: No benchmark data found for 1P{num_consumers}C. Skipping violin plot.")
+            continue
+
+        df_violin = pd.DataFrame(current_consumer_count_data)
+
+        plt.figure(figsize=(10, 8))
+        ax = sns.violinplot(x='Algorithm', y=Y_AXIS_LABEL, data=df_violin, 
+                        palette='Set2', cut=0, inner='quartile', scale='width')
+        
+        # Disable scientific notation on y-axis
+        ax.ticklabel_format(style='plain', axis='y')
+        
+        # Add mean value annotations
+        for i, (algo, mean_val) in enumerate(mean_values_dict.items()):
+            # Get the maximum value for this algorithm to position the text
+            algo_data = df_violin[df_violin['Algorithm'] == algo][Y_AXIS_LABEL]
+            y_pos = algo_data.max() + (df_violin[Y_AXIS_LABEL].max() - df_violin[Y_AXIS_LABEL].min()) * 0.02
+            
+            # Add the mean value text
+            ax.text(i, y_pos, f'μ={mean_val:.1f} µs', 
+                  ha='center', va='bottom', fontsize=9, 
+                  bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='gray', alpha=0.8))
+        
+        plot_title_violin = f'SPMC Performance Comparison (1 Producer, {num_consumers} Consumer{"s" if num_consumers > 1 else ""}, {ITEMS_PER_PRODUCER:,} items)'
+        plt.title(plot_title_violin, fontsize=16, pad=20)
+        plt.xticks(rotation=15, ha="right", fontsize=12)
+        plt.yticks(fontsize=10)
+        plt.ylabel(Y_AXIS_LABEL, fontsize=12)
+        plt.xlabel("Algorithm", fontsize=12)
+        plt.grid(axis='y', linestyle=':', alpha=0.7)
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+        output_filename_violin = VIOLIN_PLOT_FILE_TEMPLATE.format(num_consumers)
+        try:
+            plt.savefig(output_filename_violin, dpi=150)
+            print(f"  Violin plot saved to {output_filename_violin}")
+        except Exception as e:
+            print(f"  Error saving violin plot: {e}")
+        plt.close()
+
+    # --- Generate Summary Line Graph ---
+    if not all_benchmark_data:
+        print("\nError: No data collected for summary plot. Exiting.")
+        return
+
+    # Prepare data for summary plot
+    summary_data = []
+    for record in all_benchmark_data:
+        summary_data.append({
+            'Algorithm': record['Algorithm'],
+            'Consumer Count': record['Consumer Count'],
+            'Mean Time (µs)': record['Mean Time (µs)']
+        })
+    
+    df_summary = pd.DataFrame(summary_data)
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # Plot lines for each algorithm
+    for algo in SPMC_QUEUE_ALGORITHMS:
+        algo_data = df_summary[df_summary['Algorithm'] == algo].sort_values('Consumer Count')
+        ax.plot(algo_data['Consumer Count'], algo_data['Mean Time (µs)'], 
+                marker='o', markersize=8, linewidth=2, label=algo)
+    
+    # Disable scientific notation on y-axis
+    ax.ticklabel_format(style='plain', axis='y')
+    
+    plt.title('SPMC Performance: Mean Execution Time vs Number of Consumers', fontsize=14)
+    plt.xlabel('Number of Consumers', fontsize=12)
+    plt.ylabel('Mean Total Execution Time (µs)', fontsize=12)
+    plt.legend(loc='best', fontsize=10)
+    plt.grid(True, linestyle=':', alpha=0.7)
+    plt.xticks(CONSUMER_COUNTS)
+    
+    # Add annotation about test parameters
+    plt.text(0.98, 0.02, f"1 Producer, {ITEMS_PER_PRODUCER:,} items", 
+             ha='right', va='bottom', transform=plt.gca().transAxes, 
+             fontsize=9, style='italic', bbox=dict(boxstyle='round,pad=0.3', 
+             facecolor='white', edgecolor='gray', alpha=0.8))
+    
+    plt.tight_layout()
+    
+    try:
+        plt.savefig(SUMMARY_LINE_PLOT_FILE, dpi=150)
+        print(f"\nSummary line plot saved to {SUMMARY_LINE_PLOT_FILE}")
+    except Exception as e:
+        print(f"Error saving summary plot: {e}")
+    
+    # Create a bar chart comparison for all configurations
+    plt.figure(figsize=(12, 8))
+    
+    # Prepare data for grouped bar chart
+    x = np.arange(len(CONSUMER_COUNTS))
+    width = 0.35
+    
+    david_means = []
+    ymc_means = []
+    
+    for num_cons in CONSUMER_COUNTS:
+        david_data = df_summary[(df_summary['Algorithm'] == "David (Native SPMC)") & 
+                               (df_summary['Consumer Count'] == num_cons)]
+        ymc_data = df_summary[(df_summary['Algorithm'] == "YMC (MPMC as SPMC)") & 
+                             (df_summary['Consumer Count'] == num_cons)]
+        
+        david_means.append(david_data['Mean Time (µs)'].values[0] if not david_data.empty else 0)
+        ymc_means.append(ymc_data['Mean Time (µs)'].values[0] if not ymc_data.empty else 0)
+    
+    bars1 = plt.bar(x - width/2, david_means, width, label='David (Native SPMC)', color='#66c2a5')
+    bars2 = plt.bar(x + width/2, ymc_means, width, label='YMC (MPMC as SPMC)', color='#fc8d62')
+    
+    # Add value labels on bars
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            if height > 0:
+                plt.text(bar.get_x() + bar.get_width()/2., height + max(david_means + ymc_means)*0.01,
+                        f'{height:.0f}', ha='center', va='bottom', fontsize=9)
+    
+    plt.title('SPMC Performance Comparison: David vs YMC', fontsize=14)
+    plt.xlabel('Number of Consumers', fontsize=12)
+    plt.ylabel('Mean Total Execution Time (µs)', fontsize=12)
+    plt.xticks(x, [f'1P{c}C' for c in CONSUMER_COUNTS])
+    plt.legend(loc='upper left', fontsize=10)
+    plt.grid(axis='y', linestyle=':', alpha=0.7)
+    plt.tight_layout()
+    
+    bar_output_file = SUMMARY_LINE_PLOT_FILE.replace('.png', '_bar.png')
+    plt.savefig(bar_output_file, dpi=150)
+    print(f"Bar chart saved to {bar_output_file}")
+    
+    plt.show()
+
+if __name__ == "__main__":
+    main()

@@ -2,3 +2,16 @@
 *.log
 queues/src/spsc/testcases.txt
 queues/Project_Backend_as_txt.txt
+
+# Web scraper auto-generated files
+queues/web_scraper/bin/
+queues/web_scraper/include/
+queues/web_scraper/lib/
+queues/web_scraper/lib64
+queues/web_scraper/pyvenv.cfg
+queues/web_scraper/chrome_profile/
+queues/web_scraper/geckodriver-*.tar.gz
+queues/web_scraper/test
+queues/web_scraper/pdfs/
+queues/web_scraper/queue_scraper_results/
+queues/web_scraper/path/

@@ -24,7 +24,7 @@ BENCHMARK_FUNCTION_IDS = [
 
 OUTPUT_PLOT_FILE = 'spsc_queue_performance_violin_test.png'
 PLOT_TITLE = 'Performance Comparison for IPC SPSC Queues via shared memory'
-Y_AXIS_LABEL = 'Execution Time per Iteration (µs)'
+Y_AXIS_LABEL = 'Execution Time per Operation (µs)'
 
 def load_benchmark_data(base_path, benchmark_file_stem, function_id_folder_name):
    if benchmark_file_stem:
@@ -81,7 +81,7 @@ def main():
          
       if samples_ns is not None and len(samples_ns) > 0:
          print(f"  Successfully loaded {len(samples_ns)} samples for ID '{bench_func_id_from_config}' (from folder '{folder_to_try}')")
-         samples_us = samples_ns / 1000.0 
+         samples_us = samples_ns / 1000.0
          all_data.append(samples_us)
          benchmark_labels_for_plot.append(bench_func_id_from_config)
          mean_values_dict[bench_func_id_from_config] = np.mean(samples_us)

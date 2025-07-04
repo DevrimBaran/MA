@@ -2,8 +2,6 @@
 *.log
 queues/src/spsc/testcases.txt
 queues/Project_Backend_as_txt.txt
-
-# Web scraper auto-generated files
 queues/web_scraper/bin/
 queues/web_scraper/include/
 queues/web_scraper/lib/

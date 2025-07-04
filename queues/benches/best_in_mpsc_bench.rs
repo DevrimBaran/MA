@@ -258,7 +258,7 @@ fn bench_dqueue_native(c: &mut Criterion) {
     for &num_producers in PRODUCER_COUNTS_TO_TEST {
         let bench_name = format!("DQueue (Native MPSC) - {}P1C", num_producers);
         c.bench_function(&bench_name, |b| {
-            b.iter(|| {
+            b.iter_custom(|_iters| {
                 let queue_init = |num_prods: usize| {
                     // Calculate segment pool capacity based on expected number of items
                     let total_items = num_prods * ITEMS_PER_PRODUCER_TARGET;
@@ -282,7 +282,7 @@ fn bench_ymc_as_mpsc(c: &mut Criterion) {
     for &num_producers in PRODUCER_COUNTS_TO_TEST {
         let bench_name = format!("YMC (MPMC as MPSC) - {}P1C", num_producers);
         c.bench_function(&bench_name, |b| {
-            b.iter(|| {
+            b.iter_custom(|_iters| {
                 let queue_init = |num_prods: usize| {
                     // YMC needs to know total number of threads
                     // num_producers + 1 consumer

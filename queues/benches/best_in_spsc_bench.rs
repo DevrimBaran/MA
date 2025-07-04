@@ -102,7 +102,7 @@ impl<T: Send + Clone + 'static> BenchSpscQueue<T> for DavidQueueWrapper<T> {
 
 fn bench_iffq_native(c: &mut Criterion) {
     c.bench_function("IffQ (Native SPSC)", |b| {
-        b.iter(|| {
+        b.iter_custom(|_iters| {
             assert!(RING_CAP.is_power_of_two());
             assert_eq!(
                 RING_CAP % 32,
@@ -130,7 +130,7 @@ fn bench_iffq_native(c: &mut Criterion) {
 
 fn bench_dqueue_as_spsc(c: &mut Criterion) {
     c.bench_function("DQueue (MPSC as SPSC)", |b| {
-        b.iter(|| {
+        b.iter_custom(|_iters| {
             // DQueue needs space for segments
             let num_producers = 1; // Single producer for SPSC
             let segment_pool_capacity = 10; // Should be enough for ITERS items
@@ -150,7 +150,7 @@ fn bench_dqueue_as_spsc(c: &mut Criterion) {
 
 fn bench_ymc_as_spsc(c: &mut Criterion) {
     c.bench_function("YMC (MPMC as SPSC)", |b| {
-        b.iter(|| {
+        b.iter_custom(|_iters| {
             // YangCrummeyQueue needs to know number of threads
             // In SPSC scenario: 1 producer + 1 consumer = 2 threads
             let num_threads = 2;
@@ -170,7 +170,7 @@ fn bench_ymc_as_spsc(c: &mut Criterion) {
 
 fn bench_david_as_spsc(c: &mut Criterion) {
     c.bench_function("David (SPMC as SPSC)", |b| {
-        b.iter(|| {
+        b.iter_custom(|_iters| {
             // DavidQueue setup with single consumer
             let num_consumers = 1;
             let bytes = DavidQueue::<usize>::shared_size(num_consumers);

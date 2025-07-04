@@ -287,7 +287,7 @@ fn bench_david_native(c: &mut Criterion) {
     for &num_consumers in CONSUMER_COUNTS_TO_TEST {
         let bench_name = format!("David (Native SPMC) - 1P{}C", num_consumers);
         c.bench_function(&bench_name, |b| {
-            b.iter(|| {
+            b.iter_custom(|_iters| {
                 let queue_init = |num_cons: usize| {
                     let bytes = DavidQueue::<usize>::shared_size(num_cons);
                     let shm_ptr = unsafe { map_shared(bytes) };
@@ -326,7 +326,7 @@ fn bench_ymc_as_spmc(c: &mut Criterion) {
     for &num_consumers in CONSUMER_COUNTS_TO_TEST {
         let bench_name = format!("YMC (MPMC as SPMC) - 1P{}C", num_consumers);
         c.bench_function(&bench_name, |b| {
-            b.iter(|| {
+            b.iter_custom(|_iters| {
                 let queue_init = |num_cons: usize| {
                     // YMC needs to know total number of threads
                     // 1 producer + num_consumers

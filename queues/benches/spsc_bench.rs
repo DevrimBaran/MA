@@ -21,8 +21,8 @@ use queues::spsc::blq::K_CACHE_LINE_SLOTS as BLQ_K_SLOTS;
 use queues::spsc::llq::K_CACHE_LINE_SLOTS as LLQ_K_SLOTS;
 
 const PERFORMANCE_TEST: bool = false;
-const RING_CAP: usize = 1024;
-const ITERS: usize = 100_000;
+const RING_CAP: usize = 524_288;
+const ITERS: usize = 35_000_000;
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 1_000_000_000;
 
 // Helper trait for benchmarking for SpscQueue error types
@@ -154,7 +154,7 @@ impl<T: Send + Clone + 'static> BenchSpscQueue<T> for SesdJpSpscBenchWrapper<T> 
 
 fn bench_lamport(c: &mut Criterion) {
     c.bench_function("Lamport", |b| {
-        b.iter(|| {
+        b.iter_custom(|_iters| {
             let bytes = LamportQueue::<usize>::shared_size(RING_CAP);
             let shm_ptr = unsafe { map_shared(bytes) };
             let q = unsafe { LamportQueue::init_in_shared(shm_ptr, RING_CAP) };
@@ -167,7 +167,7 @@ fn bench_lamport(c: &mut Criterion) {
 
 fn bench_bqueue(c: &mut Criterion) {
     c.bench_function("B-Queue", |b| {
-        b.iter(|| {
+        b.iter_custom(|_iters| {
             let bytes = BQueue::<usize>::shared_size(RING_CAP);
             let shm_ptr = unsafe { map_shared(bytes) };
             let q = unsafe { BQueue::init_in_shared(shm_ptr, RING_CAP) };
@@ -180,7 +180,7 @@ fn bench_bqueue(c: &mut Criterion) {
 
 fn bench_mp(c: &mut Criterion) {
     c.bench_function("mSPSC", |b| {
-        b.iter(|| {
+        b.iter_custom(|_iters| {
             let bytes = MultiPushQueue::<usize>::shared_size(RING_CAP);
             let shm_ptr = unsafe { map_shared(bytes) };
             let q = unsafe { MultiPushQueue::init_in_shared(shm_ptr, RING_CAP) };
@@ -199,7 +199,7 @@ fn bench_mp(c: &mut Criterion) {
 
 fn bench_dspsc(c: &mut Criterion) {
     c.bench_function("dSPSC", |b| {
-        b.iter(|| {
+        b.iter_custom(|_iters| {
             // For dSPSC: need ITERS + 1 nodes for the benchmark
             let nodes_needed = ITERS + 1; // +1 for dummy node
             let bytes = DynListQueue::<usize>::shared_size(RING_CAP, nodes_needed);
@@ -218,7 +218,7 @@ fn bench_dspsc(c: &mut Criterion) {
 
 fn bench_unbounded(c: &mut Criterion) {
     c.bench_function("uSPSC", |b| {
-        b.iter(|| {
+        b.iter_custom(|_iters| {
             // For uSPSC: calculate how many segments we need
             // Each segment holds RING_CAP items
             let segments_needed = (ITERS + RING_CAP - 1) / RING_CAP + 2; // +2 for safety
@@ -239,7 +239,7 @@ fn bench_unbounded(c: &mut Criterion) {
 
 fn bench_iffq(c: &mut Criterion) {
     c.bench_function("Iffq", |b| {
-        b.iter(|| {
+        b.iter_custom(|_iters| {
             assert!(RING_CAP.is_power_of_two());
             // H_PARTITION_SIZE is 32 in iffq.rs
             assert_eq!(
@@ -268,7 +268,7 @@ fn bench_iffq(c: &mut Criterion) {
 
 fn bench_biffq(c: &mut Criterion) {
     c.bench_function("Biffq", |b| {
-        b.iter(|| {
+        b.iter_custom(|_iters| {
             assert!(RING_CAP.is_power_of_two());
             // H_PARTITION_SIZE is 32 in biffq.rs
             assert_eq!(
@@ -297,7 +297,7 @@ fn bench_biffq(c: &mut Criterion) {
 
 fn bench_ffq(c: &mut Criterion) {
     c.bench_function("FFq", |b| {
-        b.iter(|| {
+        b.iter_custom(|_iters| {
             // FFQ does not have H_PARTITION_SIZE constraints, only power of two for capacity.
             assert!(RING_CAP.is_power_of_two() && RING_CAP > 0);
 
@@ -317,7 +317,7 @@ fn bench_ffq(c: &mut Criterion) {
 
 fn bench_llq(c: &mut Criterion) {
     c.bench_function("Llq", |b| {
-        b.iter(|| {
+        b.iter_custom(|_iters| {
             // Ensure capacity is valid for LLQ
             let current_ring_cap = if RING_CAP <= LLQ_K_SLOTS {
                 let min_valid_cap = (LLQ_K_SLOTS + 1).next_power_of_two();
@@ -349,7 +349,7 @@ fn bench_llq(c: &mut Criterion) {
 
 fn bench_blq(c: &mut Criterion) {
     c.bench_function("Blq", |b| {
-        b.iter(|| {
+        b.iter_custom(|_iters| {
             // Ensure capacity is valid for BLQ
             let current_ring_cap = if RING_CAP <= BLQ_K_SLOTS {
                 let mut min_valid_cap = (BLQ_K_SLOTS + 1).next_power_of_two();
@@ -387,7 +387,7 @@ fn bench_blq(c: &mut Criterion) {
 
 fn bench_sesd_jp(c: &mut Criterion) {
     c.bench_function("SesdJpSPSC", |b| {
-        b.iter(|| {
+        b.iter_custom(|_iters| {
             let pool_capacity = ITERS + 1000; // Extra buffer for safety
 
             let bytes = SesdJpSpscBenchWrapper::<usize>::shared_size(pool_capacity);
@@ -516,6 +516,11 @@ where
 
             sync_atomic_flag.store(2, Ordering::Release);
 
+            // Wait for producer to acknowledge consumer is ready
+            while sync_atomic_flag.load(Ordering::Acquire) < 2 {
+                std::hint::spin_loop();
+            }
+
             let start_time = std::time::Instant::now();
             let mut consumed_count = 0;
             let mut pop_spin_attempts = 0;
@@ -599,8 +604,8 @@ where
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(2))
-        .measurement_time(Duration::from_secs(1000))
-        .sample_size(500)
+        .measurement_time(Duration::from_secs(51))
+        .sample_size(10)
 }
 
 criterion_group! {

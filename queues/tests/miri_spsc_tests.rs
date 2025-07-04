@@ -1730,9 +1730,13 @@ mod drop_semantics_tests {
             queue.push(format!("item_{}", i)).unwrap();
         }
 
-        for _ in 0..5 {
+        // Pop all items to ensure they're properly dropped
+        for _ in 0..10 {
             let _ = queue.pop().unwrap();
         }
+
+        // Ensure queue is empty before memory is freed
+        assert!(queue.empty());
     }
 
     #[test]
@@ -1976,6 +1980,10 @@ mod error_handling_tests {
             Err(_) => {}
             Ok(_) => panic!("Push should have failed on full queue"),
         }
+
+        // Clean up the item that was successfully pushed
+        let _ = queue.pop().unwrap();
+        assert!(queue.empty());
     }
 
     #[test]

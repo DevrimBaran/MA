@@ -247,31 +247,7 @@ impl<T: Send + 'static> SpscQueue<T> for BlqQueue<T> {
 }
 
 impl<T: Send + 'static> Drop for BlqQueue<T> {
-    fn drop(&mut self) {
-        if self.owns_buffer {
-            if std::mem::needs_drop::<T>() {
-                let prod_priv = unsafe { &*self.prod_private.get() };
-                let cons_priv = unsafe { &mut *self.cons_private.get() };
-
-                let mut current_read = cons_priv.read_priv;
-                let write_shadow = cons_priv.write_shadow;
-
-                while current_read != write_shadow {
-                    let slot_idx = current_read & self.mask;
-                    unsafe {
-                        (*self.buffer.get_unchecked_mut(slot_idx))
-                            .get_mut()
-                            .assume_init_drop();
-                    }
-                    current_read = current_read.wrapping_add(1);
-                }
-            }
-
-            unsafe {
-                ManuallyDrop::drop(&mut self.buffer);
-            }
-        }
-    }
+    fn drop(&mut self) {}
 }
 
 impl<T: Send + fmt::Debug + 'static> fmt::Debug for BlqQueue<T> {

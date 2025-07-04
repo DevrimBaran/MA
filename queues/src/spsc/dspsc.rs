@@ -195,10 +195,5 @@ impl<T: Send + 'static> SpscQueue<T> for DynListQueue<T> {
 }
 
 impl<T: Send + 'static> Drop for DynListQueue<T> {
-    fn drop(&mut self) {
-        // For shared memory, just drain items
-        while let Ok(item) = SpscQueue::pop(self) {
-            drop(item);
-        }
-    }
+    fn drop(&mut self) {}
 }

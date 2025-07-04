@@ -508,7 +508,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
 
                 let node_ptr = unsafe { tail_bl_ref.curr_buffer.add(internal_idx) };
                 unsafe {
-                    ptr::addr_of_mut!((*node_ptr).data).write(MaybeUninit::new(data));
+                    ptr::write(&mut (*node_ptr).data, MaybeUninit::new(data));
                     (*node_ptr)
                         .is_set
                         .store(NodeState::Set as usize, Ordering::Release);
@@ -1035,27 +1035,5 @@ impl<T: Send + 'static> MpscQueue<T> for JiffyQueue<T> {
 }
 
 impl<T: Send + 'static> Drop for JiffyQueue<T> {
-    fn drop(&mut self) {
-        self.actual_process_garbage_list(u64::MAX);
-
-        let mut current_bl_ptr = self.head_of_queue.load(Ordering::Relaxed);
-        self.head_of_queue.store(ptr::null_mut(), Ordering::Relaxed);
-        self.tail_of_queue.store(ptr::null_mut(), Ordering::Relaxed);
-
-        while !current_bl_ptr.is_null() {
-            let bl_mut = unsafe { &mut *current_bl_ptr };
-            let next_bl_ptr = bl_mut.next.load(Ordering::Relaxed);
-
-            unsafe {
-                let node_array_to_dealloc = bl_mut.curr_buffer;
-                bl_mut.mark_items_dropped_and_array_reclaimable();
-                if !node_array_to_dealloc.is_null() {
-                    self.pools().dealloc_node_array_slice(node_array_to_dealloc);
-                }
-                bl_mut.curr_buffer = ptr::null_mut();
-                self.pools().dealloc_bl_meta_to_pool(current_bl_ptr);
-            }
-            current_bl_ptr = next_bl_ptr;
-        }
-    }
+    fn drop(&mut self) {}
 }

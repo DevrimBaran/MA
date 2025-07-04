@@ -219,25 +219,5 @@ impl<T: Send + 'static> SpscQueue<T> for BQueue<T> {
 }
 
 impl<T: Send + 'static> Drop for BQueue<T> {
-    fn drop(&mut self) {
-        if std::mem::needs_drop::<T>() {
-            let mut tail = self.tail.load(Ordering::Relaxed);
-            let head = self.head.load(Ordering::Relaxed);
-
-            while tail != head {
-                unsafe {
-                    if (*self.valid.add(tail)).load(Ordering::Relaxed) {
-                        let item = ptr::read(self.buf.add(tail));
-                        drop(item.assume_init());
-                    }
-                }
-                tail = self.next(tail);
-            }
-        }
-
-        unsafe {
-            let _ = Box::from_raw(std::slice::from_raw_parts_mut(self.buf, self.cap));
-            let _ = Box::from_raw(std::slice::from_raw_parts_mut(self.valid, self.cap));
-        }
-    }
+    fn drop(&mut self) {}
 }

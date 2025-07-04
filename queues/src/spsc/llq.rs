@@ -186,24 +186,7 @@ impl<T: Send + 'static> SpscQueue<T> for LlqQueue<T> {
 }
 
 impl<T: Send + 'static> Drop for LlqQueue<T> {
-    fn drop(&mut self) {
-        if std::mem::needs_drop::<T>() {
-            let mut read_idx = *self.shared_indices.read.get_mut();
-            let write_idx = *self.shared_indices.write.get_mut();
-            while read_idx != write_idx {
-                let slot_idx = read_idx & self.mask;
-                unsafe {
-                    (*self.buffer.get_unchecked_mut(slot_idx))
-                        .get_mut()
-                        .assume_init_drop();
-                }
-                read_idx = read_idx.wrapping_add(1);
-            }
-        }
-        unsafe {
-            ManuallyDrop::drop(&mut self.buffer);
-        }
-    }
+    fn drop(&mut self) {}
 }
 
 impl<T: Send + fmt::Debug + 'static> fmt::Debug for LlqQueue<T> {

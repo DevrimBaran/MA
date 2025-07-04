@@ -140,30 +140,5 @@ impl<T: Send + 'static> SpscQueue<T> for LamportQueue<T> {
 }
 
 impl<T: Send> Drop for LamportQueue<T> {
-    fn drop(&mut self) {
-        if std::mem::needs_drop::<T>() {
-            let head = *self.head.get_mut();
-            let tail = *self.tail.get_mut();
-
-            // Drop all remaining items in the queue
-            let mut current = head;
-            while current != tail {
-                let slot = self.idx(current);
-                unsafe {
-                    // Take the item out and drop it
-                    if let Some(item) = (*self.buf[slot].get()).take() {
-                        drop(item);
-                    }
-                }
-                current = current.wrapping_add(1);
-            }
-        }
-
-        // Only drop the buffer if we own it
-        if self.owns_buffer {
-            unsafe {
-                ManuallyDrop::drop(&mut self.buf);
-            }
-        }
-    }
+    fn drop(&mut self) {}
 }

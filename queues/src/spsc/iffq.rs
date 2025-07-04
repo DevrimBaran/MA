@@ -252,27 +252,7 @@ impl<T: Send + 'static> SpscQueue<T> for IffqQueue<T> {
 }
 
 impl<T: Send + 'static> Drop for IffqQueue<T> {
-    fn drop(&mut self) {
-        if self.owns_buffer {
-            unsafe {
-                // Drop any remaining items
-                if std::mem::needs_drop::<T>() {
-                    for i in 0..self.capacity {
-                        let slot = self.get_slot(i);
-                        if slot.flag.load(Ordering::Relaxed) {
-                            ptr::drop_in_place((*slot.data.get()).as_mut_ptr());
-                        }
-                    }
-                }
-
-                let layout = std::alloc::Layout::array::<Slot<T>>(self.capacity)
-                    .unwrap()
-                    .align_to(64)
-                    .unwrap();
-                std::alloc::dealloc(self.buffer as *mut u8, layout);
-            }
-        }
-    }
+    fn drop(&mut self) {}
 }
 
 impl<T: Send + fmt::Debug + 'static> fmt::Debug for IffqQueue<T> {

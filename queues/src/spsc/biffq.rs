@@ -335,46 +335,7 @@ impl<T: Send + 'static> SpscQueue<T> for BiffqQueue<T> {
 }
 
 impl<T: Send + 'static> Drop for BiffqQueue<T> {
-    fn drop(&mut self) {
-        if self.owns_buffer {
-            // Flush any items in local buffer
-            let local_count = *self.prod.local_count.get_mut();
-            if local_count > 0 {
-                let _ = self.publish_batch_internal();
-            }
-
-            // Drop items still in local buffer after flush attempt
-            let remaining_local = *self.prod.local_count.get_mut();
-            if remaining_local > 0 {
-                unsafe {
-                    let local_buf_ptr = (*self.prod.local_buffer.get_mut()).as_mut_ptr();
-                    if std::mem::needs_drop::<T>() {
-                        for i in 0..remaining_local {
-                            ptr::drop_in_place((*local_buf_ptr.add(i)).as_mut_ptr());
-                        }
-                    }
-                }
-            }
-
-            // Drop any remaining items in slots
-            unsafe {
-                if std::mem::needs_drop::<T>() {
-                    for i in 0..self.capacity {
-                        let slot = self.get_slot(i);
-                        if slot.flag.load(Ordering::Relaxed) {
-                            ptr::drop_in_place((*slot.data.get()).as_mut_ptr());
-                        }
-                    }
-                }
-
-                let layout = std::alloc::Layout::array::<Slot<T>>(self.capacity)
-                    .unwrap()
-                    .align_to(64)
-                    .unwrap();
-                std::alloc::dealloc(self.buffer as *mut u8, layout);
-            }
-        }
-    }
+    fn drop(&mut self) {}
 }
 
 impl<T: Send + fmt::Debug + 'static> fmt::Debug for BiffqQueue<T> {

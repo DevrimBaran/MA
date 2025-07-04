@@ -273,10 +273,5 @@ impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
 }
 
 impl<T: Send + 'static> Drop for UnboundedQueue<T> {
-    fn drop(&mut self) {
-        // Just drain items - buffers are in shared memory
-        while let Ok(item) = SpscQueue::pop(self) {
-            drop(item);
-        }
-    }
+    fn drop(&mut self) {}
 }

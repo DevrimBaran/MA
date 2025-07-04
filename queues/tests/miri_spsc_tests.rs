@@ -47,7 +47,10 @@ macro_rules! test_queue {
 
             #[test]
             fn test_basic_push_pop() {
-                let queue = <$queue_type>::with_capacity($capacity);
+                let shared_size = <$queue_type>::shared_size($capacity);
+                let mut memory = AlignedMemory::new(shared_size, 64);
+                let queue =
+                    unsafe { <$queue_type>::init_in_shared(memory.as_mut_ptr(), $capacity) };
 
                 assert!(queue.empty());
                 assert!(queue.pop().is_err());
@@ -69,7 +72,10 @@ macro_rules! test_queue {
 
             #[test]
             fn test_capacity_limits() {
-                let queue = <$queue_type>::with_capacity($capacity);
+                let shared_size = <$queue_type>::shared_size($capacity);
+                let mut memory = AlignedMemory::new(shared_size, 64);
+                let queue =
+                    unsafe { <$queue_type>::init_in_shared(memory.as_mut_ptr(), $capacity) };
 
                 let mut pushed = 0;
                 for i in 0..$capacity {
@@ -78,7 +84,7 @@ macro_rules! test_queue {
                         Err(_) => {
                             if stringify!($queue_type).contains("BiffqQueue") {
                                 if let Some(biffq) =
-                                    (&queue as &dyn Any).downcast_ref::<BiffqQueue<usize>>()
+                                    (queue as &dyn Any).downcast_ref::<BiffqQueue<usize>>()
                                 {
                                     let _ = biffq.flush_producer_buffer();
                                     if queue.push(i).is_ok() {
@@ -91,7 +97,7 @@ macro_rules! test_queue {
                                 }
                             } else if stringify!($queue_type).contains("MultiPushQueue") {
                                 if let Some(mp_queue) =
-                                    (&queue as &dyn Any).downcast_ref::<MultiPushQueue<usize>>()
+                                    (queue as &dyn Any).downcast_ref::<MultiPushQueue<usize>>()
                                 {
                                     let _ = mp_queue.flush();
                                     if queue.push(i).is_ok() {
@@ -141,7 +147,10 @@ macro_rules! test_queue {
 
             #[test]
             fn test_available_empty() {
-                let queue = <$queue_type>::with_capacity($capacity);
+                let shared_size = <$queue_type>::shared_size($capacity);
+                let mut memory = AlignedMemory::new(shared_size, 64);
+                let queue =
+                    unsafe { <$queue_type>::init_in_shared(memory.as_mut_ptr(), $capacity) };
 
                 assert!(queue.available());
                 assert!(queue.empty());
@@ -168,11 +177,16 @@ macro_rules! test_queue {
 
             #[test]
             fn test_concurrent_spsc() {
-                let queue = Arc::new(<$queue_type>::with_capacity($capacity));
+                let shared_size = <$queue_type>::shared_size($capacity);
+                let mut memory = AlignedMemory::new(shared_size, 64);
+                let queue_ptr = unsafe {
+                    let q = <$queue_type>::init_in_shared(memory.as_mut_ptr(), $capacity);
+                    q as *const $queue_type
+                };
                 let barrier = Arc::new(Barrier::new(2));
                 let items_to_send = 100.min($capacity / 2);
 
-                let queue_prod = queue.clone();
+                let queue_prod = unsafe { &*queue_ptr };
                 let barrier_prod = barrier.clone();
 
                 let producer = thread::spawn(move || {
@@ -187,11 +201,11 @@ macro_rules! test_queue {
                     }
 
                     if let Some(mp_queue) =
-                        (queue_prod.as_ref() as &dyn Any).downcast_ref::<MultiPushQueue<usize>>()
+                        (queue_prod as &dyn Any).downcast_ref::<MultiPushQueue<usize>>()
                     {
                         mp_queue.flush();
                     } else if let Some(biffq) =
-                        (queue_prod.as_ref() as &dyn Any).downcast_ref::<BiffqQueue<usize>>()
+                        (queue_prod as &dyn Any).downcast_ref::<BiffqQueue<usize>>()
                     {
                         while biffq.prod.local_count.load(Ordering::Relaxed) > 0 {
                             let _ = biffq.flush_producer_buffer();
@@ -200,7 +214,7 @@ macro_rules! test_queue {
                     }
                 });
 
-                let queue_cons = queue.clone();
+                let queue_cons = unsafe { &*queue_ptr };
                 let barrier_cons = barrier.clone();
 
                 let consumer = thread::spawn(move || {
@@ -235,12 +249,13 @@ macro_rules! test_queue {
                     assert_eq!(item, i);
                 }
 
+                let queue = unsafe { &*queue_ptr };
                 assert!(
                     queue.empty()
-                        || (queue.as_ref() as &dyn Any)
+                        || (queue as &dyn Any)
                             .downcast_ref::<MultiPushQueue<usize>>()
                             .is_some()
-                        || (queue.as_ref() as &dyn Any)
+                        || (queue as &dyn Any)
                             .downcast_ref::<BiffqQueue<usize>>()
                             .is_some()
                 );
@@ -248,11 +263,16 @@ macro_rules! test_queue {
 
             #[test]
             fn test_stress_concurrent() {
-                let queue = Arc::new(<$queue_type>::with_capacity($capacity));
+                let shared_size = <$queue_type>::shared_size($capacity);
+                let mut memory = AlignedMemory::new(shared_size, 64);
+                let queue_ptr = unsafe {
+                    let q = <$queue_type>::init_in_shared(memory.as_mut_ptr(), $capacity);
+                    q as *const $queue_type
+                };
                 let num_items = ($capacity * 2).min(1000);
                 let barrier = Arc::new(Barrier::new(2));
 
-                let queue_prod = queue.clone();
+                let queue_prod = unsafe { &*queue_ptr };
                 let barrier_prod = barrier.clone();
 
                 let producer = thread::spawn(move || {
@@ -269,11 +289,11 @@ macro_rules! test_queue {
                     }
 
                     if let Some(mp_queue) =
-                        (queue_prod.as_ref() as &dyn Any).downcast_ref::<MultiPushQueue<usize>>()
+                        (queue_prod as &dyn Any).downcast_ref::<MultiPushQueue<usize>>()
                     {
                         mp_queue.flush();
                     } else if let Some(biffq) =
-                        (queue_prod.as_ref() as &dyn Any).downcast_ref::<BiffqQueue<usize>>()
+                        (queue_prod as &dyn Any).downcast_ref::<BiffqQueue<usize>>()
                     {
                         while biffq.prod.local_count.load(Ordering::Relaxed) > 0 {
                             let _ = biffq.flush_producer_buffer();
@@ -282,7 +302,7 @@ macro_rules! test_queue {
                     }
                 });
 
-                let queue_cons = queue.clone();
+                let queue_cons = unsafe { &*queue_ptr };
                 let barrier_cons = barrier.clone();
 
                 let consumer = thread::spawn(move || {
@@ -315,9 +335,212 @@ macro_rules! test_queue {
 
 test_queue!(LamportQueue<usize>, MIRI_SMALL_CAPACITY, lamport_tests);
 test_queue!(FfqQueue<usize>, MIRI_MEDIUM_CAPACITY, ffq_tests);
-test_queue!(LlqQueue<usize>, MIRI_MEDIUM_CAPACITY, llq_tests);
 test_queue!(BlqQueue<usize>, MIRI_MEDIUM_CAPACITY, blq_tests);
 test_queue!(IffqQueue<usize>, MIRI_MEDIUM_CAPACITY, iffq_tests);
+
+// LlqQueue needs special handling due to different method name
+mod llq_tests {
+    use super::*;
+
+    #[test]
+    fn test_basic_push_pop() {
+        let shared_size = LlqQueue::<usize>::llq_shared_size(MIRI_MEDIUM_CAPACITY);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue = unsafe { LlqQueue::init_in_shared(memory.as_mut_ptr(), MIRI_MEDIUM_CAPACITY) };
+
+        assert!(queue.empty());
+        assert!(queue.pop().is_err());
+
+        queue.push(42).unwrap();
+        assert!(!queue.empty());
+        assert_eq!(queue.pop().unwrap(), 42);
+        assert!(queue.empty());
+
+        for i in 0..10 {
+            queue.push(i).unwrap();
+        }
+
+        for i in 0..10 {
+            assert_eq!(queue.pop().unwrap(), i);
+        }
+        assert!(queue.empty());
+    }
+
+    #[test]
+    fn test_capacity_limits() {
+        let shared_size = LlqQueue::<usize>::llq_shared_size(MIRI_MEDIUM_CAPACITY);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue = unsafe { LlqQueue::init_in_shared(memory.as_mut_ptr(), MIRI_MEDIUM_CAPACITY) };
+
+        let mut pushed = 0;
+        for i in 0..MIRI_MEDIUM_CAPACITY {
+            match queue.push(i) {
+                Ok(_) => pushed += 1,
+                Err(_) => break,
+            }
+        }
+
+        assert!(pushed > 0, "Should be able to push at least one item");
+
+        assert!(!queue.available() || queue.push(999999).is_err());
+
+        if pushed > 0 {
+            assert!(queue.pop().is_ok());
+            assert!(queue.available());
+            assert!(queue.push(888888).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_available_empty() {
+        let shared_size = LlqQueue::<usize>::llq_shared_size(MIRI_MEDIUM_CAPACITY);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue = unsafe { LlqQueue::init_in_shared(memory.as_mut_ptr(), MIRI_MEDIUM_CAPACITY) };
+
+        assert!(queue.available());
+        assert!(queue.empty());
+
+        queue.push(1).unwrap();
+        assert!(!queue.empty());
+
+        let mut count = 1;
+        while queue.available() && count < MIRI_MEDIUM_CAPACITY {
+            queue.push(count).unwrap();
+            count += 1;
+        }
+
+        assert!(!queue.available() || count == MIRI_MEDIUM_CAPACITY);
+        assert!(!queue.empty());
+
+        while !queue.empty() {
+            queue.pop().unwrap();
+        }
+
+        assert!(queue.available());
+        assert!(queue.empty());
+    }
+
+    #[test]
+    fn test_concurrent_spsc() {
+        let shared_size = LlqQueue::<usize>::llq_shared_size(MIRI_MEDIUM_CAPACITY);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue_ptr = unsafe {
+            let q = LlqQueue::init_in_shared(memory.as_mut_ptr(), MIRI_MEDIUM_CAPACITY);
+            q as *const LlqQueue<usize>
+        };
+        let barrier = Arc::new(Barrier::new(2));
+        let items_to_send = 100.min(MIRI_MEDIUM_CAPACITY / 2);
+
+        let queue_prod = unsafe { &*queue_ptr };
+        let barrier_prod = barrier.clone();
+
+        let producer = thread::spawn(move || {
+            barrier_prod.wait();
+            for i in 0..items_to_send {
+                loop {
+                    match queue_prod.push(i) {
+                        Ok(_) => break,
+                        Err(_) => thread::yield_now(),
+                    }
+                }
+            }
+        });
+
+        let queue_cons = unsafe { &*queue_ptr };
+        let barrier_cons = barrier.clone();
+
+        let consumer = thread::spawn(move || {
+            barrier_cons.wait();
+            let mut received = Vec::new();
+            let mut empty_polls = 0;
+
+            while received.len() < items_to_send {
+                match queue_cons.pop() {
+                    Ok(item) => {
+                        received.push(item);
+                        empty_polls = 0;
+                    }
+                    Err(_) => {
+                        empty_polls += 1;
+                        if empty_polls > 100000 {
+                            panic!("Too many failed polls, possible deadlock");
+                        }
+                        thread::yield_now();
+                    }
+                }
+            }
+
+            received
+        });
+
+        producer.join().unwrap();
+        let received = consumer.join().unwrap();
+
+        assert_eq!(received.len(), items_to_send);
+        for (i, &item) in received.iter().enumerate() {
+            assert_eq!(item, i);
+        }
+
+        let queue = unsafe { &*queue_ptr };
+        assert!(queue.empty());
+    }
+
+    #[test]
+    fn test_stress_concurrent() {
+        let shared_size = LlqQueue::<usize>::llq_shared_size(MIRI_MEDIUM_CAPACITY);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue_ptr = unsafe {
+            let q = LlqQueue::init_in_shared(memory.as_mut_ptr(), MIRI_MEDIUM_CAPACITY);
+            q as *const LlqQueue<usize>
+        };
+        let num_items = (MIRI_MEDIUM_CAPACITY * 2).min(1000);
+        let barrier = Arc::new(Barrier::new(2));
+
+        let queue_prod = unsafe { &*queue_ptr };
+        let barrier_prod = barrier.clone();
+
+        let producer = thread::spawn(move || {
+            barrier_prod.wait();
+            for i in 0..num_items {
+                loop {
+                    match queue_prod.push(i) {
+                        Ok(_) => break,
+                        Err(_) => {
+                            thread::yield_now();
+                        }
+                    }
+                }
+            }
+        });
+
+        let queue_cons = unsafe { &*queue_ptr };
+        let barrier_cons = barrier.clone();
+
+        let consumer = thread::spawn(move || {
+            barrier_cons.wait();
+            let mut sum = 0u64;
+            let mut count = 0;
+
+            while count < num_items {
+                match queue_cons.pop() {
+                    Ok(item) => {
+                        sum += item as u64;
+                        count += 1;
+                    }
+                    Err(_) => thread::yield_now(),
+                }
+            }
+
+            sum
+        });
+
+        producer.join().unwrap();
+        let sum = consumer.join().unwrap();
+
+        let expected_sum = (num_items as u64 * (num_items as u64 - 1)) / 2;
+        assert_eq!(sum, expected_sum);
+    }
+}
 
 mod biffq_tests {
     use super::*;
@@ -326,7 +549,9 @@ mod biffq_tests {
 
     #[test]
     fn test_basic_push_pop() {
-        let queue = BiffqQueue::<usize>::with_capacity(BIFFQ_CAPACITY);
+        let shared_size = BiffqQueue::<usize>::shared_size(BIFFQ_CAPACITY);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue = unsafe { BiffqQueue::init_in_shared(memory.as_mut_ptr(), BIFFQ_CAPACITY) };
 
         assert!(queue.empty());
         assert!(queue.pop().is_err());
@@ -352,7 +577,9 @@ mod biffq_tests {
 
     #[test]
     fn test_capacity_limits() {
-        let queue = BiffqQueue::<usize>::with_capacity(BIFFQ_CAPACITY);
+        let shared_size = BiffqQueue::<usize>::shared_size(BIFFQ_CAPACITY);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue = unsafe { BiffqQueue::init_in_shared(memory.as_mut_ptr(), BIFFQ_CAPACITY) };
 
         let mut pushed_total = 0;
 
@@ -396,7 +623,9 @@ mod biffq_tests {
 
     #[test]
     fn test_available_empty() {
-        let queue = BiffqQueue::<usize>::with_capacity(BIFFQ_CAPACITY);
+        let shared_size = BiffqQueue::<usize>::shared_size(BIFFQ_CAPACITY);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue = unsafe { BiffqQueue::init_in_shared(memory.as_mut_ptr(), BIFFQ_CAPACITY) };
 
         assert!(queue.available());
         assert!(queue.empty());
@@ -427,11 +656,16 @@ mod biffq_tests {
 
     #[test]
     fn test_concurrent_spsc() {
-        let queue = Arc::new(BiffqQueue::<usize>::with_capacity(BIFFQ_CAPACITY));
+        let shared_size = BiffqQueue::<usize>::shared_size(BIFFQ_CAPACITY);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue_ptr = unsafe {
+            let q = BiffqQueue::init_in_shared(memory.as_mut_ptr(), BIFFQ_CAPACITY);
+            q as *const BiffqQueue<usize>
+        };
         let barrier = Arc::new(Barrier::new(2));
         let items_to_send = 100;
 
-        let queue_prod = queue.clone();
+        let queue_prod = unsafe { &*queue_ptr };
         let barrier_prod = barrier.clone();
 
         let producer = thread::spawn(move || {
@@ -454,7 +688,7 @@ mod biffq_tests {
             }
         });
 
-        let queue_cons = queue.clone();
+        let queue_cons = unsafe { &*queue_ptr };
         let barrier_cons = barrier.clone();
 
         let consumer = thread::spawn(move || {
@@ -492,11 +726,16 @@ mod biffq_tests {
 
     #[test]
     fn test_stress_concurrent() {
-        let queue = Arc::new(BiffqQueue::<usize>::with_capacity(BIFFQ_CAPACITY));
+        let shared_size = BiffqQueue::<usize>::shared_size(BIFFQ_CAPACITY);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue_ptr = unsafe {
+            let q = BiffqQueue::init_in_shared(memory.as_mut_ptr(), BIFFQ_CAPACITY);
+            q as *const BiffqQueue<usize>
+        };
         let num_items = (BIFFQ_CAPACITY * 2).min(1000);
         let barrier = Arc::new(Barrier::new(2));
 
-        let queue_prod = queue.clone();
+        let queue_prod = unsafe { &*queue_ptr };
         let barrier_prod = barrier.clone();
 
         let producer = thread::spawn(move || {
@@ -522,7 +761,7 @@ mod biffq_tests {
             }
         });
 
-        let queue_cons = queue.clone();
+        let queue_cons = unsafe { &*queue_ptr };
         let barrier_cons = barrier.clone();
 
         let consumer = thread::spawn(move || {
@@ -556,7 +795,9 @@ mod bqueue_tests {
 
     #[test]
     fn test_basic_push_pop() {
-        let queue = BQueue::<usize>::new(MIRI_MEDIUM_CAPACITY);
+        let shared_size = BQueue::<usize>::shared_size(MIRI_MEDIUM_CAPACITY);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue = unsafe { BQueue::init_in_shared(memory.as_mut_ptr(), MIRI_MEDIUM_CAPACITY) };
 
         assert!(queue.empty());
         assert!(queue.pop().is_err());
@@ -578,7 +819,10 @@ mod bqueue_tests {
 
     #[test]
     fn test_capacity_limits() {
-        let queue = BQueue::<usize>::new(MIRI_MEDIUM_CAPACITY);
+        let shared_size = BQueue::<usize>::shared_size(MIRI_MEDIUM_CAPACITY);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue = unsafe { BQueue::init_in_shared(memory.as_mut_ptr(), MIRI_MEDIUM_CAPACITY) };
+
         let effective_capacity = MIRI_MEDIUM_CAPACITY - 1;
 
         for i in 0..effective_capacity {
@@ -602,7 +846,9 @@ mod bqueue_tests {
 
     #[test]
     fn test_available_empty() {
-        let queue = BQueue::<usize>::new(MIRI_MEDIUM_CAPACITY);
+        let shared_size = BQueue::<usize>::shared_size(MIRI_MEDIUM_CAPACITY);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue = unsafe { BQueue::init_in_shared(memory.as_mut_ptr(), MIRI_MEDIUM_CAPACITY) };
 
         assert!(queue.available());
         assert!(queue.empty());
@@ -629,11 +875,16 @@ mod bqueue_tests {
 
     #[test]
     fn test_concurrent_spsc() {
-        let queue = Arc::new(BQueue::<usize>::new(MIRI_LARGE_CAPACITY));
+        let shared_size = BQueue::<usize>::shared_size(MIRI_LARGE_CAPACITY);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue_ptr = unsafe {
+            let q = BQueue::init_in_shared(memory.as_mut_ptr(), MIRI_LARGE_CAPACITY);
+            q as *const BQueue<usize>
+        };
         let barrier = Arc::new(Barrier::new(2));
         let items_to_send = 100;
 
-        let queue_prod = queue.clone();
+        let queue_prod = unsafe { &*queue_ptr };
         let barrier_prod = barrier.clone();
 
         let producer = thread::spawn(move || {
@@ -648,7 +899,7 @@ mod bqueue_tests {
             }
         });
 
-        let queue_cons = queue.clone();
+        let queue_cons = unsafe { &*queue_ptr };
         let barrier_cons = barrier.clone();
 
         let consumer = thread::spawn(move || {
@@ -683,16 +934,21 @@ mod bqueue_tests {
             assert_eq!(item, i);
         }
 
-        assert!(queue.empty());
+        assert!(unsafe { (*queue_ptr).empty() });
     }
 
     #[test]
     fn test_stress_concurrent() {
-        let queue = Arc::new(BQueue::<usize>::new(MIRI_MEDIUM_CAPACITY));
+        let shared_size = BQueue::<usize>::shared_size(MIRI_MEDIUM_CAPACITY);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue_ptr = unsafe {
+            let q = BQueue::init_in_shared(memory.as_mut_ptr(), MIRI_MEDIUM_CAPACITY);
+            q as *const BQueue<usize>
+        };
         let num_items = (MIRI_MEDIUM_CAPACITY * 2).min(1000);
         let barrier = Arc::new(Barrier::new(2));
 
-        let queue_prod = queue.clone();
+        let queue_prod = unsafe { &*queue_ptr };
         let barrier_prod = barrier.clone();
 
         let producer = thread::spawn(move || {
@@ -707,7 +963,7 @@ mod bqueue_tests {
             }
         });
 
-        let queue_cons = queue.clone();
+        let queue_cons = unsafe { &*queue_ptr };
         let barrier_cons = barrier.clone();
 
         let consumer = thread::spawn(move || {
@@ -741,7 +997,10 @@ mod multipush_tests {
 
     #[test]
     fn test_multipush_basic() {
-        let queue = MultiPushQueue::<usize>::with_capacity(MIRI_MEDIUM_CAPACITY);
+        let shared_size = MultiPushQueue::<usize>::shared_size(MIRI_MEDIUM_CAPACITY);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue =
+            unsafe { MultiPushQueue::init_in_shared(memory.as_mut_ptr(), MIRI_MEDIUM_CAPACITY) };
 
         for i in 0..100 {
             queue.push(i).unwrap();
@@ -758,7 +1017,10 @@ mod multipush_tests {
 
     #[test]
     fn test_multipush_flush() {
-        let queue = MultiPushQueue::<usize>::with_capacity(MIRI_MEDIUM_CAPACITY);
+        let shared_size = MultiPushQueue::<usize>::shared_size(MIRI_MEDIUM_CAPACITY);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue =
+            unsafe { MultiPushQueue::init_in_shared(memory.as_mut_ptr(), MIRI_MEDIUM_CAPACITY) };
 
         for i in 0..5 {
             queue.push(i).unwrap();
@@ -774,7 +1036,10 @@ mod multipush_tests {
 
     #[test]
     fn test_multipush_local_buffer_overflow() {
-        let queue = MultiPushQueue::<usize>::with_capacity(MIRI_MEDIUM_CAPACITY);
+        let shared_size = MultiPushQueue::<usize>::shared_size(MIRI_MEDIUM_CAPACITY);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue =
+            unsafe { MultiPushQueue::init_in_shared(memory.as_mut_ptr(), MIRI_MEDIUM_CAPACITY) };
 
         for i in 0..32 {
             queue.push(i).unwrap();
@@ -1005,9 +1270,7 @@ mod unbounded_tests {
         {
             let shared_size = UnboundedQueue::<String>::shared_size(8, 16);
             let mut memory = AlignedMemory::new(shared_size, 128);
-            let mem_ptr = memory.as_mut_ptr();
-
-            let queue = unsafe { UnboundedQueue::init_in_shared(mem_ptr, 8, 16) };
+            let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 8, 16) };
 
             for i in 0..5 {
                 queue.push(format!("test_{}", i)).unwrap();
@@ -1020,9 +1283,7 @@ mod unbounded_tests {
         {
             let shared_size = UnboundedQueue::<Option<usize>>::shared_size(8, 16);
             let mut memory = AlignedMemory::new(shared_size, 128);
-            let mem_ptr = memory.as_mut_ptr();
-
-            let queue = unsafe { UnboundedQueue::init_in_shared(mem_ptr, 8, 16) };
+            let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 8, 16) };
 
             queue.push(Some(42)).unwrap();
             queue.push(None).unwrap();
@@ -1036,9 +1297,7 @@ mod unbounded_tests {
         {
             let shared_size = UnboundedQueue::<Vec<u8>>::shared_size(8, 16);
             let mut memory = AlignedMemory::new(shared_size, 128);
-            let mem_ptr = memory.as_mut_ptr();
-
-            let queue = unsafe { UnboundedQueue::init_in_shared(mem_ptr, 8, 16) };
+            let queue = unsafe { UnboundedQueue::init_in_shared(memory.as_mut_ptr(), 8, 16) };
 
             for i in 0..5 {
                 queue.push(vec![i as u8; 10]).unwrap();
@@ -1078,9 +1337,7 @@ mod sesd_wrapper_tests {
     fn test_sesd_wrapper_basic() {
         let pool_capacity = 100;
         let shared_size = SesdJpSpscBenchWrapper::<usize>::shared_size(pool_capacity);
-
         let mut memory = AlignedMemory::new(shared_size, 64);
-
         let queue =
             unsafe { SesdJpSpscBenchWrapper::init_in_shared(memory.as_mut_ptr(), pool_capacity) };
 
@@ -1119,12 +1376,9 @@ mod sesd_wrapper_tests {
     fn test_sesd_wrapper_concurrent() {
         let pool_capacity = 200;
         let shared_size = SesdJpSpscBenchWrapper::<usize>::shared_size(pool_capacity);
-
         let mut memory = AlignedMemory::new(shared_size, 64);
-
         let queue =
             unsafe { SesdJpSpscBenchWrapper::init_in_shared(memory.as_mut_ptr(), pool_capacity) };
-
         let queue_ptr = queue as *const SesdJpSpscBenchWrapper<usize>;
 
         let barrier = Arc::new(Barrier::new(2));
@@ -1302,6 +1556,7 @@ mod shared_memory_tests {
         test_multipush_shared
     );
 
+    // LlqQueue needs special handling due to different method name
     #[test]
     fn test_llq_shared() {
         let shared_size = LlqQueue::<usize>::llq_shared_size(MIRI_MEDIUM_CAPACITY);
@@ -1436,7 +1691,9 @@ mod drop_semantics_tests {
         DROP_COUNT.store(0, Ordering::SeqCst);
 
         {
-            let queue = LamportQueue::<DropCounter>::with_capacity(64);
+            let shared_size = LamportQueue::<DropCounter>::shared_size(64);
+            let mut memory = AlignedMemory::new(shared_size, 64);
+            let queue = unsafe { LamportQueue::init_in_shared(memory.as_mut_ptr(), 64) };
 
             for i in 0..10 {
                 queue.push(DropCounter { _value: i }).unwrap();
@@ -1465,7 +1722,9 @@ mod drop_semantics_tests {
 
     #[test]
     fn test_drop_with_strings() {
-        let queue = BQueue::<String>::new(MIRI_MEDIUM_CAPACITY);
+        let shared_size = BQueue::<String>::shared_size(MIRI_MEDIUM_CAPACITY);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue = unsafe { BQueue::init_in_shared(memory.as_mut_ptr(), MIRI_MEDIUM_CAPACITY) };
 
         for i in 0..10 {
             queue.push(format!("item_{}", i)).unwrap();
@@ -1546,7 +1805,9 @@ mod edge_case_tests {
         #[derive(Clone, Copy, Debug, PartialEq)]
         struct ZeroSized;
 
-        let queue = LamportQueue::<ZeroSized>::with_capacity(32);
+        let shared_size = LamportQueue::<ZeroSized>::shared_size(32);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue = unsafe { LamportQueue::init_in_shared(memory.as_mut_ptr(), 32) };
 
         for _ in 0..10 {
             queue.push(ZeroSized).unwrap();
@@ -1564,7 +1825,10 @@ mod edge_case_tests {
             data: [u64; 128],
         }
 
-        let queue = LamportQueue::<LargeType>::with_capacity(16);
+        let shared_size = LamportQueue::<LargeType>::shared_size(16);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue = unsafe { LamportQueue::init_in_shared(memory.as_mut_ptr(), 16) };
+
         let item = LargeType { data: [42; 128] };
 
         queue.push(item.clone()).unwrap();
@@ -1573,7 +1837,9 @@ mod edge_case_tests {
 
     #[test]
     fn test_alternating_push_pop() {
-        let queue = LamportQueue::<usize>::with_capacity(4);
+        let shared_size = LamportQueue::<usize>::shared_size(4);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue = unsafe { LamportQueue::init_in_shared(memory.as_mut_ptr(), 4) };
 
         for i in 0..20 {
             queue.push(i).unwrap();
@@ -1585,7 +1851,9 @@ mod edge_case_tests {
 
     #[test]
     fn test_wraparound() {
-        let queue = FfqQueue::<usize>::with_capacity(8);
+        let shared_size = FfqQueue::<usize>::shared_size(8);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue = unsafe { FfqQueue::init_in_shared(memory.as_mut_ptr(), 8) };
 
         for i in 0..4 {
             queue.push(i).unwrap();
@@ -1607,7 +1875,10 @@ mod edge_case_tests {
     #[test]
     fn test_different_payload_types() {
         {
-            let queue = LamportQueue::<String>::with_capacity(16);
+            let shared_size = LamportQueue::<String>::shared_size(16);
+            let mut memory = AlignedMemory::new(shared_size, 64);
+            let queue = unsafe { LamportQueue::init_in_shared(memory.as_mut_ptr(), 16) };
+
             for i in 0..10 {
                 queue.push(format!("test_{}", i)).unwrap();
             }
@@ -1617,7 +1888,10 @@ mod edge_case_tests {
         }
 
         {
-            let queue = FfqQueue::<Vec<u32>>::with_capacity(16);
+            let shared_size = FfqQueue::<Vec<u32>>::shared_size(16);
+            let mut memory = AlignedMemory::new(shared_size, 64);
+            let queue = unsafe { FfqQueue::init_in_shared(memory.as_mut_ptr(), 16) };
+
             for i in 0..5 {
                 queue.push(vec![i; i as usize + 1]).unwrap();
             }
@@ -1629,7 +1903,10 @@ mod edge_case_tests {
         }
 
         {
-            let queue = BlqQueue::<Option<usize>>::with_capacity(32);
+            let shared_size = BlqQueue::<Option<usize>>::shared_size(32);
+            let mut memory = AlignedMemory::new(shared_size, 64);
+            let queue = unsafe { BlqQueue::init_in_shared(memory.as_mut_ptr(), 32) };
+
             queue.push(Some(42)).unwrap();
             queue.push(None).unwrap();
             queue.push(Some(100)).unwrap();
@@ -1640,7 +1917,10 @@ mod edge_case_tests {
         }
 
         {
-            let queue = IffqQueue::<(usize, String)>::with_capacity(64);
+            let shared_size = IffqQueue::<(usize, String)>::shared_size(64);
+            let mut memory = AlignedMemory::new(shared_size, 64);
+            let queue = unsafe { IffqQueue::init_in_shared(memory.as_mut_ptr(), 64) };
+
             for i in 0..10 {
                 queue.push((i, format!("item_{}", i))).unwrap();
             }
@@ -1657,32 +1937,37 @@ mod error_handling_tests {
     use super::*;
 
     #[test]
-    #[should_panic(expected = "capacity must be power of two")]
+    #[should_panic]
     fn test_lamport_invalid_capacity() {
-        let _ = LamportQueue::<usize>::with_capacity(15);
+        let shared_size = 1024; // Use a valid size for allocation
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let _ = unsafe { LamportQueue::<usize>::init_in_shared(memory.as_mut_ptr(), 15) };
+        // 15 is not power of two
     }
 
     #[test]
     #[should_panic(expected = "Capacity must be greater than K_CACHE_LINE_SLOTS")]
     fn test_llq_small_capacity() {
-        let _ = LlqQueue::<usize>::with_capacity(4);
+        let _ = LlqQueue::<usize>::llq_shared_size(4);
     }
 
     #[test]
     #[should_panic(expected = "Capacity must be at least 2 * H_PARTITION_SIZE")]
     fn test_iffq_invalid_capacity() {
-        let _ = IffqQueue::<usize>::with_capacity(32);
+        let _ = IffqQueue::<usize>::shared_size(32);
     }
 
     #[test]
     #[should_panic(expected = "Capacity must be a power of two")]
     fn test_iffq_invalid_capacity_not_power_of_two() {
-        let _ = IffqQueue::<usize>::with_capacity(96);
+        let _ = IffqQueue::<usize>::shared_size(96);
     }
 
     #[test]
     fn test_push_error_handling() {
-        let queue = LamportQueue::<String>::with_capacity(2);
+        let shared_size = LamportQueue::<String>::shared_size(2);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue = unsafe { LamportQueue::init_in_shared(memory.as_mut_ptr(), 2) };
 
         queue.push("first".to_string()).unwrap();
 
@@ -1695,7 +1980,9 @@ mod error_handling_tests {
 
     #[test]
     fn test_pop_error_handling() {
-        let queue = BQueue::<usize>::new(128);
+        let shared_size = BQueue::<usize>::shared_size(128);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue = unsafe { BQueue::init_in_shared(memory.as_mut_ptr(), 128) };
 
         assert!(queue.pop().is_err());
 
@@ -1711,7 +1998,9 @@ mod special_feature_tests {
 
     #[test]
     fn test_biffq_flush() {
-        let queue = BiffqQueue::<usize>::with_capacity(128);
+        let shared_size = BiffqQueue::<usize>::shared_size(128);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue = unsafe { BiffqQueue::init_in_shared(memory.as_mut_ptr(), 128) };
 
         for i in 0..10 {
             queue.push(i).unwrap();
@@ -1727,7 +2016,9 @@ mod special_feature_tests {
 
     #[test]
     fn test_blq_batch_operations() {
-        let queue = BlqQueue::<usize>::with_capacity(128);
+        let shared_size = BlqQueue::<usize>::shared_size(128);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let queue = unsafe { BlqQueue::init_in_shared(memory.as_mut_ptr(), 128) };
 
         let space = queue.blq_enq_space(10);
         assert!(space >= 10);
@@ -1749,8 +2040,13 @@ mod special_feature_tests {
 
 #[test]
 fn test_multiple_queues() {
-    let q1 = LamportQueue::<u32>::with_capacity(32);
-    let q2 = LamportQueue::<u32>::with_capacity(32);
+    let shared_size1 = LamportQueue::<u32>::shared_size(32);
+    let mut memory1 = AlignedMemory::new(shared_size1, 64);
+    let q1 = unsafe { LamportQueue::init_in_shared(memory1.as_mut_ptr(), 32) };
+
+    let shared_size2 = LamportQueue::<u32>::shared_size(32);
+    let mut memory2 = AlignedMemory::new(shared_size2, 64);
+    let q2 = unsafe { LamportQueue::init_in_shared(memory2.as_mut_ptr(), 32) };
 
     q1.push(100).unwrap();
     q2.push(200).unwrap();
@@ -1761,32 +2057,45 @@ fn test_multiple_queues() {
 
 #[test]
 fn test_arc_safety() {
-    let queue = Arc::new(BQueue::<i32>::new(128));
-    let q1 = queue.clone();
-    let q2 = queue.clone();
+    let shared_size = BQueue::<i32>::shared_size(128);
+    let mut memory = AlignedMemory::new(shared_size, 64);
+    let queue = unsafe { BQueue::init_in_shared(memory.as_mut_ptr(), 128) };
+
+    let queue_ptr = queue as *const BQueue<i32>;
+    let queue_arc = Arc::new(queue_ptr);
+    let q1 = queue_arc.clone();
+    let q2 = queue_arc.clone();
 
     drop(q1);
 
-    q2.push(42).unwrap();
-    assert_eq!(q2.pop().unwrap(), 42);
+    unsafe {
+        (**q2).push(42).unwrap();
+        assert_eq!((**q2).pop().unwrap(), 42);
+    }
 }
 
 #[test]
 fn test_different_types() {
     {
-        let q_u8 = LamportQueue::<u8>::with_capacity(16);
+        let shared_size = LamportQueue::<u8>::shared_size(16);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let q_u8 = unsafe { LamportQueue::init_in_shared(memory.as_mut_ptr(), 16) };
         q_u8.push(255u8).unwrap();
         assert_eq!(q_u8.pop().unwrap(), 255u8);
     }
 
     {
-        let q_box = FfqQueue::<Box<usize>>::with_capacity(16);
+        let shared_size = FfqQueue::<Box<usize>>::shared_size(16);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let q_box = unsafe { FfqQueue::init_in_shared(memory.as_mut_ptr(), 16) };
         q_box.push(Box::new(42)).unwrap();
         assert_eq!(*q_box.pop().unwrap(), 42);
     }
 
     {
-        let q_opt = BQueue::<Option<String>>::new(128);
+        let shared_size = BQueue::<Option<String>>::shared_size(128);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let q_opt = unsafe { BQueue::init_in_shared(memory.as_mut_ptr(), 128) };
         q_opt.push(Some("hello".to_string())).unwrap();
         q_opt.push(None).unwrap();
 

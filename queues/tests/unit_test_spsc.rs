@@ -10,6 +10,21 @@ const SMALL_CAPACITY: usize = 64;
 const MEDIUM_CAPACITY: usize = 1024;
 const LARGE_CAPACITY: usize = 8192;
 
+fn create_aligned_memory_box(size: usize, alignment: usize) -> Box<[u8]> {
+    use std::alloc::{alloc_zeroed, Layout};
+
+    unsafe {
+        let layout = Layout::from_size_align(size, alignment).unwrap();
+        let ptr = alloc_zeroed(layout);
+        if ptr.is_null() {
+            panic!("Failed to allocate aligned memory");
+        }
+
+        let slice = std::slice::from_raw_parts_mut(ptr, size);
+        Box::from_raw(slice)
+    }
+}
+
 macro_rules! test_queue {
     ($queue_type:ty, $capacity:expr, $test_name:ident) => {
         mod $test_name {
@@ -17,7 +32,10 @@ macro_rules! test_queue {
 
             #[test]
             fn test_basic_push_pop() {
-                let queue = <$queue_type>::with_capacity($capacity);
+                let shared_size = <$queue_type>::shared_size($capacity);
+                let memory = create_aligned_memory_box(shared_size, 64);
+                let mem_ptr = Box::leak(memory).as_mut_ptr();
+                let queue = unsafe { <$queue_type>::init_in_shared(mem_ptr, $capacity) };
 
                 assert!(queue.empty());
                 assert!(queue.pop().is_err());
@@ -35,11 +53,18 @@ macro_rules! test_queue {
                     assert_eq!(queue.pop().unwrap(), i);
                 }
                 assert!(queue.empty());
+
+                unsafe {
+                    let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+                }
             }
 
             #[test]
             fn test_capacity_limits() {
-                let queue = <$queue_type>::with_capacity($capacity);
+                let shared_size = <$queue_type>::shared_size($capacity);
+                let memory = create_aligned_memory_box(shared_size, 64);
+                let mem_ptr = Box::leak(memory).as_mut_ptr();
+                let queue = unsafe { <$queue_type>::init_in_shared(mem_ptr, $capacity) };
 
                 let mut pushed = 0;
                 for i in 0..$capacity {
@@ -48,7 +73,7 @@ macro_rules! test_queue {
                         Err(_) => {
                             if stringify!($queue_type).contains("BiffqQueue") {
                                 if let Some(biffq) =
-                                    (&queue as &dyn Any).downcast_ref::<BiffqQueue<usize>>()
+                                    (queue as &dyn Any).downcast_ref::<BiffqQueue<usize>>()
                                 {
                                     let _ = biffq.flush_producer_buffer();
                                     if queue.push(i).is_ok() {
@@ -61,7 +86,7 @@ macro_rules! test_queue {
                                 }
                             } else if stringify!($queue_type).contains("MultiPushQueue") {
                                 if let Some(mp_queue) =
-                                    (&queue as &dyn Any).downcast_ref::<MultiPushQueue<usize>>()
+                                    (queue as &dyn Any).downcast_ref::<MultiPushQueue<usize>>()
                                 {
                                     let _ = mp_queue.flush();
                                     if queue.push(i).is_ok() {
@@ -88,7 +113,6 @@ macro_rules! test_queue {
 
                     if stringify!($queue_type).contains("IffqQueue") {
                         let mut popped = 1;
-                        let mut push_succeeded = false;
 
                         for _ in 0..33 {
                             if queue.pop().is_ok() {
@@ -96,7 +120,6 @@ macro_rules! test_queue {
                             }
 
                             if queue.push(888888).is_ok() {
-                                push_succeeded = true;
                                 break;
                             }
                         }
@@ -107,11 +130,18 @@ macro_rules! test_queue {
                         assert!(queue.push(888888).is_ok());
                     }
                 }
+
+                unsafe {
+                    let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+                }
             }
 
             #[test]
             fn test_available_empty() {
-                let queue = <$queue_type>::with_capacity($capacity);
+                let shared_size = <$queue_type>::shared_size($capacity);
+                let memory = create_aligned_memory_box(shared_size, 64);
+                let mem_ptr = Box::leak(memory).as_mut_ptr();
+                let queue = unsafe { <$queue_type>::init_in_shared(mem_ptr, $capacity) };
 
                 assert!(queue.available());
                 assert!(queue.empty());
@@ -134,15 +164,25 @@ macro_rules! test_queue {
 
                 assert!(queue.available());
                 assert!(queue.empty());
+
+                unsafe {
+                    let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+                }
             }
 
             #[test]
             fn test_concurrent_spsc() {
-                let queue = Arc::new(<$queue_type>::with_capacity($capacity));
+                let shared_size = <$queue_type>::shared_size($capacity);
+                let memory = create_aligned_memory_box(shared_size, 64);
+                let mem_ptr = Box::leak(memory).as_mut_ptr();
+                let queue_ptr = unsafe {
+                    let q = <$queue_type>::init_in_shared(mem_ptr, $capacity);
+                    q as *const $queue_type
+                };
                 let barrier = Arc::new(Barrier::new(2));
                 let items_to_send = 100;
 
-                let queue_prod = queue.clone();
+                let queue_prod = unsafe { &*queue_ptr };
                 let barrier_prod = barrier.clone();
 
                 let producer = thread::spawn(move || {
@@ -157,7 +197,7 @@ macro_rules! test_queue {
                     }
                 });
 
-                let queue_cons = queue.clone();
+                let queue_cons = unsafe { &*queue_ptr };
                 let barrier_cons = barrier.clone();
 
                 let consumer = thread::spawn(move || {
@@ -192,16 +232,27 @@ macro_rules! test_queue {
                     assert_eq!(item, i);
                 }
 
+                let queue = unsafe { &*queue_ptr };
                 assert!(queue.empty());
+
+                unsafe {
+                    let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+                }
             }
 
             #[test]
             fn test_stress_concurrent() {
-                let queue = Arc::new(<$queue_type>::with_capacity($capacity));
+                let shared_size = <$queue_type>::shared_size($capacity);
+                let memory = create_aligned_memory_box(shared_size, 64);
+                let mem_ptr = Box::leak(memory).as_mut_ptr();
+                let queue_ptr = unsafe {
+                    let q = <$queue_type>::init_in_shared(mem_ptr, $capacity);
+                    q as *const $queue_type
+                };
                 let num_items = $capacity * 10;
                 let barrier = Arc::new(Barrier::new(2));
 
-                let queue_prod = queue.clone();
+                let queue_prod = unsafe { &*queue_ptr };
                 let barrier_prod = barrier.clone();
 
                 let producer = thread::spawn(move || {
@@ -218,7 +269,7 @@ macro_rules! test_queue {
                     }
                 });
 
-                let queue_cons = queue.clone();
+                let queue_cons = unsafe { &*queue_ptr };
                 let barrier_cons = barrier.clone();
 
                 let consumer = thread::spawn(move || {
@@ -244,6 +295,10 @@ macro_rules! test_queue {
 
                 let expected_sum = (num_items as u64 * (num_items as u64 - 1)) / 2;
                 assert_eq!(sum, expected_sum);
+
+                unsafe {
+                    let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+                }
             }
         }
     };
@@ -251,9 +306,237 @@ macro_rules! test_queue {
 
 test_queue!(LamportQueue<usize>, SMALL_CAPACITY, lamport_tests);
 test_queue!(FfqQueue<usize>, MEDIUM_CAPACITY, ffq_tests);
-test_queue!(LlqQueue<usize>, MEDIUM_CAPACITY, llq_tests);
 test_queue!(BlqQueue<usize>, MEDIUM_CAPACITY, blq_tests);
 test_queue!(IffqQueue<usize>, MEDIUM_CAPACITY, iffq_tests);
+
+// LlqQueue needs special handling due to different method name
+mod llq_tests {
+    use super::*;
+
+    #[test]
+    fn test_basic_push_pop() {
+        let shared_size = LlqQueue::<usize>::llq_shared_size(MEDIUM_CAPACITY);
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue = unsafe { LlqQueue::init_in_shared(mem_ptr, MEDIUM_CAPACITY) };
+
+        assert!(queue.empty());
+        assert!(queue.pop().is_err());
+
+        queue.push(42).unwrap();
+        assert!(!queue.empty());
+        assert_eq!(queue.pop().unwrap(), 42);
+        assert!(queue.empty());
+
+        for i in 0..10 {
+            queue.push(i).unwrap();
+        }
+
+        for i in 0..10 {
+            assert_eq!(queue.pop().unwrap(), i);
+        }
+        assert!(queue.empty());
+
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+        }
+    }
+
+    #[test]
+    fn test_capacity_limits() {
+        let shared_size = LlqQueue::<usize>::llq_shared_size(MEDIUM_CAPACITY);
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue = unsafe { LlqQueue::init_in_shared(mem_ptr, MEDIUM_CAPACITY) };
+
+        let mut pushed = 0;
+        for i in 0..MEDIUM_CAPACITY {
+            match queue.push(i) {
+                Ok(_) => pushed += 1,
+                Err(_) => break,
+            }
+        }
+
+        assert!(pushed > 0, "Should be able to push at least one item");
+
+        assert!(!queue.available() || queue.push(999999).is_err());
+
+        if pushed > 0 {
+            assert!(queue.pop().is_ok());
+            assert!(queue.available());
+            assert!(queue.push(888888).is_ok());
+        }
+
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+        }
+    }
+
+    #[test]
+    fn test_available_empty() {
+        let shared_size = LlqQueue::<usize>::llq_shared_size(MEDIUM_CAPACITY);
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue = unsafe { LlqQueue::init_in_shared(mem_ptr, MEDIUM_CAPACITY) };
+
+        assert!(queue.available());
+        assert!(queue.empty());
+
+        queue.push(1).unwrap();
+        assert!(!queue.empty());
+
+        let mut count = 1;
+        while queue.available() && count < MEDIUM_CAPACITY {
+            queue.push(count).unwrap();
+            count += 1;
+        }
+
+        assert!(!queue.available());
+        assert!(!queue.empty());
+
+        while !queue.empty() {
+            queue.pop().unwrap();
+        }
+
+        assert!(queue.available());
+        assert!(queue.empty());
+
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+        }
+    }
+
+    #[test]
+    fn test_concurrent_spsc() {
+        let shared_size = LlqQueue::<usize>::llq_shared_size(MEDIUM_CAPACITY);
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue_ptr = unsafe {
+            let q = LlqQueue::init_in_shared(mem_ptr, MEDIUM_CAPACITY);
+            q as *const LlqQueue<usize>
+        };
+        let barrier = Arc::new(Barrier::new(2));
+        let items_to_send = 100;
+
+        let queue_prod = unsafe { &*queue_ptr };
+        let barrier_prod = barrier.clone();
+
+        let producer = thread::spawn(move || {
+            barrier_prod.wait();
+            for i in 0..items_to_send {
+                loop {
+                    match queue_prod.push(i) {
+                        Ok(_) => break,
+                        Err(_) => thread::yield_now(),
+                    }
+                }
+            }
+        });
+
+        let queue_cons = unsafe { &*queue_ptr };
+        let barrier_cons = barrier.clone();
+
+        let consumer = thread::spawn(move || {
+            barrier_cons.wait();
+            let mut received = Vec::new();
+            let mut empty_polls = 0;
+
+            while received.len() < items_to_send {
+                match queue_cons.pop() {
+                    Ok(item) => {
+                        received.push(item);
+                        empty_polls = 0;
+                    }
+                    Err(_) => {
+                        empty_polls += 1;
+                        if empty_polls > 1000000 {
+                            panic!("Too many failed polls, possible deadlock");
+                        }
+                        thread::yield_now();
+                    }
+                }
+            }
+
+            received
+        });
+
+        producer.join().unwrap();
+        let received = consumer.join().unwrap();
+
+        assert_eq!(received.len(), items_to_send);
+        for (i, &item) in received.iter().enumerate() {
+            assert_eq!(item, i);
+        }
+
+        let queue = unsafe { &*queue_ptr };
+        assert!(queue.empty());
+
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+        }
+    }
+
+    #[test]
+    fn test_stress_concurrent() {
+        let shared_size = LlqQueue::<usize>::llq_shared_size(MEDIUM_CAPACITY);
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue_ptr = unsafe {
+            let q = LlqQueue::init_in_shared(mem_ptr, MEDIUM_CAPACITY);
+            q as *const LlqQueue<usize>
+        };
+        let num_items = MEDIUM_CAPACITY * 10;
+        let barrier = Arc::new(Barrier::new(2));
+
+        let queue_prod = unsafe { &*queue_ptr };
+        let barrier_prod = barrier.clone();
+
+        let producer = thread::spawn(move || {
+            barrier_prod.wait();
+            for i in 0..num_items {
+                loop {
+                    match queue_prod.push(i) {
+                        Ok(_) => break,
+                        Err(_) => {
+                            thread::yield_now();
+                        }
+                    }
+                }
+            }
+        });
+
+        let queue_cons = unsafe { &*queue_ptr };
+        let barrier_cons = barrier.clone();
+
+        let consumer = thread::spawn(move || {
+            barrier_cons.wait();
+            let mut sum = 0u64;
+            let mut count = 0;
+
+            while count < num_items {
+                match queue_cons.pop() {
+                    Ok(item) => {
+                        sum += item as u64;
+                        count += 1;
+                    }
+                    Err(_) => thread::yield_now(),
+                }
+            }
+
+            sum
+        });
+
+        producer.join().unwrap();
+        let sum = consumer.join().unwrap();
+
+        let expected_sum = (num_items as u64 * (num_items as u64 - 1)) / 2;
+        assert_eq!(sum, expected_sum);
+
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+        }
+    }
+}
 
 mod biffq_tests {
     use super::*;
@@ -262,7 +545,10 @@ mod biffq_tests {
 
     #[test]
     fn test_basic_push_pop() {
-        let queue = BiffqQueue::<usize>::with_capacity(BIFFQ_CAPACITY);
+        let shared_size = BiffqQueue::<usize>::shared_size(BIFFQ_CAPACITY);
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue = unsafe { BiffqQueue::init_in_shared(mem_ptr, BIFFQ_CAPACITY) };
 
         assert!(queue.empty());
         assert!(queue.pop().is_err());
@@ -284,11 +570,18 @@ mod biffq_tests {
             assert_eq!(queue.pop().unwrap(), i);
         }
         assert!(queue.empty());
+
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+        }
     }
 
     #[test]
     fn test_capacity_limits() {
-        let queue = BiffqQueue::<usize>::with_capacity(BIFFQ_CAPACITY);
+        let shared_size = BiffqQueue::<usize>::shared_size(BIFFQ_CAPACITY);
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue = unsafe { BiffqQueue::init_in_shared(mem_ptr, BIFFQ_CAPACITY) };
 
         let mut pushed_total = 0;
 
@@ -342,11 +635,18 @@ mod biffq_tests {
             );
             let _ = queue.flush_producer_buffer();
         }
+
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+        }
     }
 
     #[test]
     fn test_available_empty() {
-        let queue = BiffqQueue::<usize>::with_capacity(BIFFQ_CAPACITY);
+        let shared_size = BiffqQueue::<usize>::shared_size(BIFFQ_CAPACITY);
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue = unsafe { BiffqQueue::init_in_shared(mem_ptr, BIFFQ_CAPACITY) };
 
         assert!(queue.available());
         assert!(queue.empty());
@@ -375,15 +675,25 @@ mod biffq_tests {
 
         assert!(queue.available());
         assert!(queue.empty());
+
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+        }
     }
 
     #[test]
     fn test_concurrent_spsc() {
-        let queue = Arc::new(BiffqQueue::<usize>::with_capacity(BIFFQ_CAPACITY));
+        let shared_size = BiffqQueue::<usize>::shared_size(BIFFQ_CAPACITY);
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue_ptr = unsafe {
+            let q = BiffqQueue::init_in_shared(mem_ptr, BIFFQ_CAPACITY);
+            q as *const BiffqQueue<usize>
+        };
         let barrier = Arc::new(Barrier::new(2));
         let items_to_send = 100;
 
-        let queue_prod = queue.clone();
+        let queue_prod = unsafe { &*queue_ptr };
         let barrier_prod = barrier.clone();
 
         let producer = thread::spawn(move || {
@@ -406,7 +716,7 @@ mod biffq_tests {
             }
         });
 
-        let queue_cons = queue.clone();
+        let queue_cons = unsafe { &*queue_ptr };
         let barrier_cons = barrier.clone();
 
         let consumer = thread::spawn(move || {
@@ -441,16 +751,26 @@ mod biffq_tests {
             assert_eq!(item, i);
         }
 
-        assert!(queue.empty());
+        assert!(unsafe { (*queue_ptr).empty() });
+
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+        }
     }
 
     #[test]
     fn test_stress_concurrent() {
-        let queue = Arc::new(BiffqQueue::<usize>::with_capacity(BIFFQ_CAPACITY));
+        let shared_size = BiffqQueue::<usize>::shared_size(BIFFQ_CAPACITY);
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue_ptr = unsafe {
+            let q = BiffqQueue::init_in_shared(mem_ptr, BIFFQ_CAPACITY);
+            q as *const BiffqQueue<usize>
+        };
         let num_items = BIFFQ_CAPACITY * 10;
         let barrier = Arc::new(Barrier::new(2));
 
-        let queue_prod = queue.clone();
+        let queue_prod = unsafe { &*queue_ptr };
         let barrier_prod = barrier.clone();
 
         let producer = thread::spawn(move || {
@@ -476,7 +796,7 @@ mod biffq_tests {
             }
         });
 
-        let queue_cons = queue.clone();
+        let queue_cons = unsafe { &*queue_ptr };
         let barrier_cons = barrier.clone();
 
         let consumer = thread::spawn(move || {
@@ -502,6 +822,10 @@ mod biffq_tests {
 
         let expected_sum = (num_items as u64 * (num_items as u64 - 1)) / 2;
         assert_eq!(sum, expected_sum);
+
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+        }
     }
 }
 
@@ -510,7 +834,10 @@ mod bqueue_tests {
 
     #[test]
     fn test_basic_push_pop() {
-        let queue = BQueue::<usize>::new(MEDIUM_CAPACITY);
+        let shared_size = BQueue::<usize>::shared_size(MEDIUM_CAPACITY);
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue = unsafe { BQueue::init_in_shared(mem_ptr, MEDIUM_CAPACITY) };
 
         assert!(queue.empty());
         assert!(queue.pop().is_err());
@@ -528,11 +855,19 @@ mod bqueue_tests {
             assert_eq!(queue.pop().unwrap(), i);
         }
         assert!(queue.empty());
+
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+        }
     }
 
     #[test]
     fn test_capacity_limits() {
-        let queue = BQueue::<usize>::new(MEDIUM_CAPACITY);
+        let shared_size = BQueue::<usize>::shared_size(MEDIUM_CAPACITY);
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue = unsafe { BQueue::init_in_shared(mem_ptr, MEDIUM_CAPACITY) };
+
         let effective_capacity = MEDIUM_CAPACITY - 1;
 
         for i in 0..effective_capacity {
@@ -540,6 +875,9 @@ mod bqueue_tests {
                 Ok(_) => {}
                 Err(_) => {
                     assert!(i > 0, "Should be able to push at least one item");
+                    unsafe {
+                        let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+                    }
                     return;
                 }
             }
@@ -552,11 +890,18 @@ mod bqueue_tests {
         assert!(queue.available());
         queue.push(999).unwrap();
         assert!(!queue.available());
+
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+        }
     }
 
     #[test]
     fn test_available_empty() {
-        let queue = BQueue::<usize>::new(MEDIUM_CAPACITY);
+        let shared_size = BQueue::<usize>::shared_size(MEDIUM_CAPACITY);
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue = unsafe { BQueue::init_in_shared(mem_ptr, MEDIUM_CAPACITY) };
 
         assert!(queue.available());
         assert!(queue.empty());
@@ -579,15 +924,25 @@ mod bqueue_tests {
 
         assert!(queue.available());
         assert!(queue.empty());
+
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+        }
     }
 
     #[test]
     fn test_concurrent_spsc() {
-        let queue = Arc::new(BQueue::<usize>::new(MEDIUM_CAPACITY));
+        let shared_size = BQueue::<usize>::shared_size(MEDIUM_CAPACITY);
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue_ptr = unsafe {
+            let q = BQueue::init_in_shared(mem_ptr, MEDIUM_CAPACITY);
+            q as *const BQueue<usize>
+        };
         let barrier = Arc::new(Barrier::new(2));
         let items_to_send = 100;
 
-        let queue_prod = queue.clone();
+        let queue_prod = unsafe { &*queue_ptr };
         let barrier_prod = barrier.clone();
 
         let producer = thread::spawn(move || {
@@ -602,7 +957,7 @@ mod bqueue_tests {
             }
         });
 
-        let queue_cons = queue.clone();
+        let queue_cons = unsafe { &*queue_ptr };
         let barrier_cons = barrier.clone();
 
         let consumer = thread::spawn(move || {
@@ -637,16 +992,26 @@ mod bqueue_tests {
             assert_eq!(item, i);
         }
 
-        assert!(queue.empty());
+        assert!(unsafe { (*queue_ptr).empty() });
+
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+        }
     }
 
     #[test]
     fn test_stress_concurrent() {
-        let queue = Arc::new(BQueue::<usize>::new(MEDIUM_CAPACITY));
+        let shared_size = BQueue::<usize>::shared_size(MEDIUM_CAPACITY);
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue_ptr = unsafe {
+            let q = BQueue::init_in_shared(mem_ptr, MEDIUM_CAPACITY);
+            q as *const BQueue<usize>
+        };
         let num_items = MEDIUM_CAPACITY * 10;
         let barrier = Arc::new(Barrier::new(2));
 
-        let queue_prod = queue.clone();
+        let queue_prod = unsafe { &*queue_ptr };
         let barrier_prod = barrier.clone();
 
         let producer = thread::spawn(move || {
@@ -661,7 +1026,7 @@ mod bqueue_tests {
             }
         });
 
-        let queue_cons = queue.clone();
+        let queue_cons = unsafe { &*queue_ptr };
         let barrier_cons = barrier.clone();
 
         let consumer = thread::spawn(move || {
@@ -687,6 +1052,10 @@ mod bqueue_tests {
 
         let expected_sum = (num_items as u64 * (num_items as u64 - 1)) / 2;
         assert_eq!(sum, expected_sum);
+
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+        }
     }
 }
 
@@ -695,7 +1064,10 @@ mod multipush_tests {
 
     #[test]
     fn test_multipush_basic() {
-        let queue = MultiPushQueue::<usize>::with_capacity(MEDIUM_CAPACITY);
+        let shared_size = MultiPushQueue::<usize>::shared_size(MEDIUM_CAPACITY);
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue = unsafe { MultiPushQueue::init_in_shared(mem_ptr, MEDIUM_CAPACITY) };
 
         for i in 0..100 {
             queue.push(i).unwrap();
@@ -708,11 +1080,18 @@ mod multipush_tests {
         }
 
         assert!(queue.empty());
+
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+        }
     }
 
     #[test]
     fn test_multipush_flush() {
-        let queue = MultiPushQueue::<usize>::with_capacity(MEDIUM_CAPACITY);
+        let shared_size = MultiPushQueue::<usize>::shared_size(MEDIUM_CAPACITY);
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue = unsafe { MultiPushQueue::init_in_shared(mem_ptr, MEDIUM_CAPACITY) };
 
         for i in 0..5 {
             queue.push(i).unwrap();
@@ -724,18 +1103,31 @@ mod multipush_tests {
         for i in 0..5 {
             assert_eq!(queue.pop().unwrap(), i);
         }
+
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+        }
     }
 
     #[test]
     fn test_multipush_local_buffer_overflow() {
-        let queue = MultiPushQueue::<usize>::with_capacity(MEDIUM_CAPACITY);
+        let shared_size = MultiPushQueue::<usize>::shared_size(MEDIUM_CAPACITY);
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue = unsafe { MultiPushQueue::init_in_shared(mem_ptr, MEDIUM_CAPACITY) };
 
         for i in 0..32 {
             queue.push(i).unwrap();
         }
 
+        assert_eq!(queue.local_count.load(Ordering::Relaxed), 0);
+
         for i in 0..32 {
             assert_eq!(queue.pop().unwrap(), i);
+        }
+
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
         }
     }
 }
@@ -743,48 +1135,22 @@ mod multipush_tests {
 mod unbounded_tests {
     use super::*;
 
-    fn allocate_aligned_memory(size: usize, alignment: usize) -> Vec<u8> {
-        let total_size = size + alignment;
-        let mut memory = vec![0u8; total_size];
+    #[test]
+    fn test_unbounded_basic_operations() {
+        let size = UnboundedQueue::<usize>::shared_size(64, 16);
+        assert!(size > 0);
+        assert!(size >= std::mem::size_of::<UnboundedQueue<usize>>());
 
-        let ptr = memory.as_mut_ptr();
-        let addr = ptr as usize;
-        let aligned_addr = (addr + alignment - 1) & !(alignment - 1);
-        let offset = aligned_addr - addr;
-
-        let mut aligned_memory = Vec::with_capacity(size);
-        unsafe {
-            aligned_memory.set_len(size);
-            std::ptr::copy_nonoverlapping(
-                memory.as_ptr().add(offset),
-                aligned_memory.as_mut_ptr(),
-                size,
-            );
-        }
-
-        assert_eq!(
-            aligned_memory.as_ptr() as usize % alignment,
-            0,
-            "Memory not properly aligned to {} bytes",
-            alignment
-        );
-
-        aligned_memory
+        let size_small = UnboundedQueue::<usize>::shared_size(64, 8);
+        let size_large = UnboundedQueue::<usize>::shared_size(8192, 16);
+        assert!(size_large >= size_small);
     }
 
-    fn allocate_aligned_box(size: usize, alignment: usize) -> Box<[u8]> {
-        use std::alloc::{alloc_zeroed, Layout};
-
-        unsafe {
-            let layout = Layout::from_size_align(size, alignment).unwrap();
-            let ptr = alloc_zeroed(layout);
-            if ptr.is_null() {
-                panic!("Failed to allocate aligned memory");
-            }
-
-            let slice = std::slice::from_raw_parts_mut(ptr, size);
-            Box::from_raw(slice)
-        }
+    #[test]
+    fn test_unbounded_type_safety() {
+        let _size_u8 = UnboundedQueue::<u8>::shared_size(64, 16);
+        let _size_string = UnboundedQueue::<String>::shared_size(64, 16);
+        let _size_vec = UnboundedQueue::<Vec<u8>>::shared_size(64, 16);
     }
 
     #[test]
@@ -795,7 +1161,7 @@ mod unbounded_tests {
 
         const ALIGNMENT: usize = 128;
 
-        let memory = allocate_aligned_box(shared_size, ALIGNMENT);
+        let memory = create_aligned_memory_box(shared_size, ALIGNMENT);
         let mem_ptr = Box::leak(memory).as_mut_ptr();
 
         assert_eq!(
@@ -823,7 +1189,7 @@ mod unbounded_tests {
         let shared_size = UnboundedQueue::<usize>::shared_size(segment_size, num_segments);
         const ALIGNMENT: usize = 128;
 
-        let memory = allocate_aligned_box(shared_size, ALIGNMENT);
+        let memory = create_aligned_memory_box(shared_size, ALIGNMENT);
         let mem_ptr = Box::leak(memory).as_mut_ptr();
 
         let queue = unsafe { UnboundedQueue::init_in_shared(mem_ptr, segment_size, num_segments) };
@@ -879,7 +1245,7 @@ mod unbounded_tests {
                 UnboundedQueue::<DropCounter>::shared_size(segment_size, num_segments);
             const ALIGNMENT: usize = 128;
 
-            let memory = allocate_aligned_box(shared_size, ALIGNMENT);
+            let memory = create_aligned_memory_box(shared_size, ALIGNMENT);
             let mem_ptr = Box::leak(memory).as_mut_ptr();
 
             let queue =
@@ -920,7 +1286,7 @@ mod unbounded_tests {
             let segment_size = 8192;
             let num_segments = 16;
             let shared_size = UnboundedQueue::<()>::shared_size(segment_size, num_segments);
-            let memory = allocate_aligned_box(shared_size, ALIGNMENT);
+            let memory = create_aligned_memory_box(shared_size, ALIGNMENT);
             let mem_ptr = Box::leak(memory).as_mut_ptr();
 
             let queue = unsafe {
@@ -951,7 +1317,7 @@ mod unbounded_tests {
             let segment_size = 8192;
             let num_segments = 8;
             let shared_size = UnboundedQueue::<Vec<u8>>::shared_size(segment_size, num_segments);
-            let memory = allocate_aligned_box(shared_size, ALIGNMENT);
+            let memory = create_aligned_memory_box(shared_size, ALIGNMENT);
             let mem_ptr = Box::leak(memory).as_mut_ptr();
 
             let queue = unsafe {
@@ -975,7 +1341,7 @@ mod unbounded_tests {
             let segment_size = 8192;
             let num_segments = 8;
             let shared_size = UnboundedQueue::<String>::shared_size(segment_size, num_segments);
-            let memory = allocate_aligned_box(shared_size, ALIGNMENT);
+            let memory = create_aligned_memory_box(shared_size, ALIGNMENT);
             let mem_ptr = Box::leak(memory).as_mut_ptr();
 
             let queue = unsafe {
@@ -996,21 +1362,6 @@ mod unbounded_tests {
                 let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
             }
         }
-    }
-}
-
-fn create_aligned_memory_box(size: usize, alignment: usize) -> Box<[u8]> {
-    use std::alloc::{alloc_zeroed, Layout};
-
-    unsafe {
-        let layout = Layout::from_size_align(size, alignment).unwrap();
-        let ptr = alloc_zeroed(layout);
-        if ptr.is_null() {
-            panic!("Failed to allocate aligned memory");
-        }
-
-        let slice = std::slice::from_raw_parts_mut(ptr, size);
-        Box::from_raw(slice)
     }
 }
 
@@ -1126,6 +1477,7 @@ mod shared_memory_tests {
         test_multipush_shared
     );
 
+    // LlqQueue needs special handling due to different method name
     #[test]
     fn test_llq_shared() {
         let shared_size = LlqQueue::<usize>::llq_shared_size(MEDIUM_CAPACITY);
@@ -1265,9 +1617,17 @@ mod edge_case_tests {
         #[derive(Clone, Copy, Debug, PartialEq)]
         struct ZeroSized;
 
-        let queue = LamportQueue::<ZeroSized>::with_capacity(64);
+        let shared_size = LamportQueue::<ZeroSized>::shared_size(64);
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue = unsafe { LamportQueue::init_in_shared(mem_ptr, 64) };
+
         queue.push(ZeroSized).unwrap();
         assert_eq!(queue.pop().unwrap(), ZeroSized);
+
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+        }
     }
 
     #[test]
@@ -1277,11 +1637,19 @@ mod edge_case_tests {
             data: [u64; 128],
         }
 
-        let queue = LamportQueue::<LargeType>::with_capacity(16);
+        let shared_size = LamportQueue::<LargeType>::shared_size(16);
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue = unsafe { LamportQueue::init_in_shared(mem_ptr, 16) };
+
         let item = LargeType { data: [42; 128] };
 
         queue.push(item.clone()).unwrap();
         assert_eq!(queue.pop().unwrap(), item);
+
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+        }
     }
 
     #[test]
@@ -1303,7 +1671,10 @@ mod edge_case_tests {
         DROP_COUNT.store(0, Ordering::SeqCst);
 
         {
-            let queue = LamportQueue::<DropCounter>::with_capacity(64);
+            let shared_size = LamportQueue::<DropCounter>::shared_size(64);
+            let memory = create_aligned_memory_box(shared_size, 64);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+            let queue = unsafe { LamportQueue::init_in_shared(mem_ptr, 64) };
 
             for i in 0..10 {
                 queue.push(DropCounter { _value: i }).unwrap();
@@ -1318,6 +1689,10 @@ mod edge_case_tests {
                 mid_count, 5,
                 "5 items should be dropped after explicit drops"
             );
+
+            unsafe {
+                let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+            }
         }
 
         std::thread::sleep(Duration::from_millis(10));
@@ -1338,7 +1713,10 @@ mod special_feature_tests {
 
     #[test]
     fn test_biffq_flush() {
-        let queue = BiffqQueue::<usize>::with_capacity(128);
+        let shared_size = BiffqQueue::<usize>::shared_size(128);
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue = unsafe { BiffqQueue::init_in_shared(mem_ptr, 128) };
 
         for i in 0..10 {
             queue.push(i).unwrap();
@@ -1350,11 +1728,18 @@ mod special_feature_tests {
         for i in 0..10 {
             assert_eq!(queue.pop().unwrap(), i);
         }
+
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+        }
     }
 
     #[test]
     fn test_blq_batch_operations() {
-        let queue = BlqQueue::<usize>::with_capacity(128);
+        let shared_size = BlqQueue::<usize>::shared_size(128);
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue = unsafe { BlqQueue::init_in_shared(mem_ptr, 128) };
 
         let space = queue.blq_enq_space(10);
         assert!(space >= 10);
@@ -1371,6 +1756,10 @@ mod special_feature_tests {
             assert_eq!(queue.blq_deq_local().unwrap(), i);
         }
         queue.blq_deq_publish();
+
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
+        }
     }
 
     #[test]
@@ -1426,12 +1815,18 @@ mod error_handling_tests {
     #[test]
     #[should_panic]
     fn test_lamport_invalid_capacity() {
-        let _ = LamportQueue::<usize>::with_capacity(15);
+        let shared_size = 1024; // Use a valid size for allocation
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let _ = unsafe { LamportQueue::<usize>::init_in_shared(mem_ptr, 15) }; // 15 is not power of two
     }
 
     #[test]
     fn test_push_error_handling() {
-        let queue = LamportQueue::<String>::with_capacity(2);
+        let shared_size = LamportQueue::<String>::shared_size(2);
+        let memory = create_aligned_memory_box(shared_size, 64);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+        let queue = unsafe { LamportQueue::init_in_shared(mem_ptr, 2) };
 
         queue.push("first".to_string()).unwrap();
 
@@ -1439,6 +1834,10 @@ mod error_handling_tests {
         match queue.push(failed_item.clone()) {
             Err(_) => {}
             Ok(_) => panic!("Push should have failed on full queue"),
+        }
+
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));
         }
     }
 }
@@ -1875,7 +2274,6 @@ mod ipc_tests {
 
                 let mut received = Vec::new();
                 let mut empty_count = 0;
-                let mut total_empty_polls = 0;
 
                 while received.len() < NUM_ITEMS {
                     match queue.pop() {
@@ -1898,7 +2296,6 @@ mod ipc_tests {
                         }
                         Err(_) => {
                             empty_count += 1;
-                            total_empty_polls += 1;
                             if empty_count > 10_000_000 {
                                 eprintln!(
                                     "Consumer: Too many empty polls, breaking. Received {} items",

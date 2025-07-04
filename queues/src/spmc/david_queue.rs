@@ -99,14 +99,30 @@ impl EnqueuerState {
 impl<T: Send + Clone + 'static> DavidQueue<T> {
     // Get pointer to HEAD[row]
     unsafe fn get_head(&self, row: usize) -> &FetchIncrement {
+        if row >= self.num_rows {
+            panic!("get_head: row {} >= num_rows {}", row, self.num_rows);
+        }
         let heads_ptr = self.base_ptr.add(self.head_array_offset) as *const FetchIncrement;
         &*heads_ptr.add(row)
     }
 
     // Get pointer to ITEMS[row, col]
     unsafe fn get_item(&self, row: usize, col: usize) -> &SwapCell {
+        if row >= self.num_rows {
+            panic!("get_item: row {} >= num_rows {}", row, self.num_rows);
+        }
+        if col >= self.items_per_row {
+            panic!(
+                "get_item: col {} >= items_per_row {}",
+                col, self.items_per_row
+            );
+        }
         let items_ptr = self.base_ptr.add(self.items_array_offset) as *const SwapCell;
         let index = row * self.items_per_row + col;
+        let max_index = self.num_rows * self.items_per_row;
+        if index >= max_index {
+            panic!("get_item: index {} >= max_index {}", index, max_index);
+        }
         &*items_ptr.add(index)
     }
 
@@ -118,10 +134,21 @@ impl<T: Send + Clone + 'static> DavidQueue<T> {
         }
 
         let items_ptr = self.base_ptr.add(self.item_pool_offset) as *mut T;
-        ptr::write(items_ptr.add(idx), item);
+        let item_ptr = items_ptr.add(idx);
+
+        // Debug check
+        if item_ptr as usize >= (self.base_ptr as usize + self.total_size) {
+            panic!(
+                "Item pointer out of bounds: {:p} >= {:p}",
+                item_ptr,
+                self.base_ptr.add(self.total_size)
+            );
+        }
+
+        ptr::write(item_ptr, item);
 
         // Return pointer as usize
-        items_ptr.add(idx) as usize
+        item_ptr as usize
     }
 
     // Retrieve item from pool
@@ -322,6 +349,100 @@ impl<T: Send + Clone + 'static> DavidQueue<T> {
 
         // About 200MB for the queue structure
         (total + 4095) & !4095
+    }
+
+    pub fn spsc_shared_size() -> usize {
+        let queue_size = mem::size_of::<Self>();
+        let queue_aligned = (queue_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
+
+        let items_per_row = 16_384; // Larger row size for efficiency
+        let num_rows = 10000; // Increased for 15M items
+        let item_pool_size = 50_000_000; // 16M pool for 15M items with safety margin
+
+        let head_array_size = num_rows * mem::size_of::<FetchIncrement>();
+        let head_array_aligned = (head_array_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
+
+        let items_array_size = num_rows * items_per_row * mem::size_of::<SwapCell>();
+        let items_array_aligned = (items_array_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
+
+        let item_pool_bytes = item_pool_size * mem::size_of::<T>();
+
+        let total = queue_aligned + head_array_aligned + items_array_aligned + item_pool_bytes;
+
+        (total + 4095) & !4095
+    }
+
+    pub unsafe fn init_in_shared_spsc(
+        mem: *mut u8,
+        enqueuer_state: &mut EnqueuerState,
+    ) -> &'static mut Self {
+        let queue_ptr = mem as *mut Self;
+
+        // Calculate memory layout
+        let queue_size = mem::size_of::<Self>();
+        let queue_aligned = (queue_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
+
+        // Configuration - sized for 15M items with safety margin
+        let items_per_row = 16_384; // Larger row size for efficiency
+        let num_rows = 10000; // Increased for 15M items
+        let item_pool_size = 50_000_000; // Pool for 16M items (15M + margin)
+        let num_consumers = 1; // SPSC has 1 consumer
+
+        // HEAD array
+        let head_array_offset = queue_aligned;
+        let head_array_size = num_rows * mem::size_of::<FetchIncrement>();
+        let head_array_aligned = (head_array_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
+
+        // ITEMS array
+        let items_array_offset = head_array_offset + head_array_aligned;
+        let items_array_size = num_rows * items_per_row * mem::size_of::<SwapCell>();
+        let items_array_aligned = (items_array_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
+
+        // Item pool
+        let item_pool_offset = items_array_offset + items_array_aligned;
+        let item_pool_bytes = item_pool_size * mem::size_of::<T>();
+
+        let total_size = (item_pool_offset + item_pool_bytes + 4095) & !4095;
+
+        // Initialize queue structure
+        ptr::write(
+            queue_ptr,
+            Self {
+                row: AtomicUsize::new(0),
+                min_row: AtomicUsize::new(0),
+                head_array_offset,
+                items_array_offset,
+                num_consumers,
+                num_rows,
+                items_per_row,
+                base_ptr: mem,
+                total_size,
+                item_pool_offset,
+                item_pool_size,
+                next_item: AtomicUsize::new(0),
+                _phantom: std::marker::PhantomData,
+            },
+        );
+
+        let queue = &mut *queue_ptr;
+
+        // Initialize HEAD array
+        let heads_ptr = mem.add(head_array_offset) as *mut FetchIncrement;
+        for i in 0..num_rows {
+            ptr::write(heads_ptr.add(i), FetchIncrement::new());
+        }
+
+        // Initialize ITEMS array
+        let items_ptr = mem.add(items_array_offset) as *mut SwapCell;
+        for i in 0..(num_rows * items_per_row) {
+            ptr::write(items_ptr.add(i), SwapCell::new());
+        }
+
+        // Initialize enqueuer state
+        enqueuer_state.enq_row = 0;
+        enqueuer_state.tail = 0;
+
+        queue
     }
 
     pub fn is_empty(&self) -> bool {

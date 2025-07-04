@@ -1,5 +1,3 @@
-// spinloops are just there so that producer and consumer can start at the same time and handling temporary empty/full queues
-// Since the algorithms are wait-free, the spinloops will not affect the wait-free synchronization between producer and consumer
 #![allow(clippy::cast_possible_truncation)]
 
 use criterion::{criterion_group, criterion_main, Bencher, Criterion};

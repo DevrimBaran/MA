@@ -1,5 +1,4 @@
-// Fixed version of feldman_dechev_queue.rs with improvements for high thread counts
-
+// paper in /paper/mpmc/feldman_dechev_v1.pdf and feldman_dechev_v2.pdf and feldman_dechev_v3.pdf
 use std::cell::UnsafeCell;
 use std::mem;
 use std::ptr;

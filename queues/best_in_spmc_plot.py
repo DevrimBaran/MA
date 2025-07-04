@@ -183,48 +183,6 @@ def main():
     except Exception as e:
         print(f"Error saving summary plot: {e}")
     
-    # Create a bar chart comparison for all configurations
-    plt.figure(figsize=(12, 8))
-    
-    # Prepare data for grouped bar chart
-    x = np.arange(len(CONSUMER_COUNTS))
-    width = 0.35
-    
-    david_means = []
-    ymc_means = []
-    
-    for num_cons in CONSUMER_COUNTS:
-        david_data = df_summary[(df_summary['Algorithm'] == "David (Native SPMC)") & 
-                               (df_summary['Consumer Count'] == num_cons)]
-        ymc_data = df_summary[(df_summary['Algorithm'] == "YMC (MPMC as SPMC)") & 
-                             (df_summary['Consumer Count'] == num_cons)]
-        
-        david_means.append(david_data['Mean Time (µs)'].values[0] if not david_data.empty else 0)
-        ymc_means.append(ymc_data['Mean Time (µs)'].values[0] if not ymc_data.empty else 0)
-    
-    bars1 = plt.bar(x - width/2, david_means, width, label='David (Native SPMC)', color='#66c2a5')
-    bars2 = plt.bar(x + width/2, ymc_means, width, label='YMC (MPMC as SPMC)', color='#fc8d62')
-    
-    # Add value labels on bars
-    for bars in [bars1, bars2]:
-        for bar in bars:
-            height = bar.get_height()
-            if height > 0:
-                plt.text(bar.get_x() + bar.get_width()/2., height + max(david_means + ymc_means)*0.01,
-                        f'{height:.0f}', ha='center', va='bottom', fontsize=9)
-    
-    plt.title('SPMC Performance Comparison: David vs YMC', fontsize=14)
-    plt.xlabel('Number of Consumers', fontsize=12)
-    plt.ylabel('Mean Total Execution Time (µs)', fontsize=12)
-    plt.xticks(x, [f'1P{c}C' for c in CONSUMER_COUNTS])
-    plt.legend(loc='upper left', fontsize=10)
-    plt.grid(axis='y', linestyle=':', alpha=0.7)
-    plt.tight_layout()
-    
-    bar_output_file = SUMMARY_LINE_PLOT_FILE.replace('.png', '_bar.png')
-    plt.savefig(bar_output_file, dpi=150)
-    print(f"Bar chart saved to {bar_output_file}")
-    
     plt.show()
 
 if __name__ == "__main__":

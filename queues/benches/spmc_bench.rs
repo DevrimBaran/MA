@@ -1,4 +1,3 @@
-// queues/benches/spmc_bench.rs
 use criterion::{criterion_group, criterion_main, Bencher, Criterion};
 use nix::{
     libc,

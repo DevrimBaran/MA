@@ -1,3 +1,4 @@
+// paper in /paper/mpsc/drescher.pdf
 use std::mem::{self, MaybeUninit};
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};

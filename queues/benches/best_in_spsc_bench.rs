@@ -12,13 +12,13 @@ use std::time::Duration;
 // Import all the best-performing queue types
 use queues::{
     spmc::{DavidQueue, EnqueuerState},
-    DQueue, IffqQueue, SpscQueue, YangCrummeyQueue,
+    BiffqQueue, DQueue, SpscQueue, YangCrummeyQueue,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 
 const PERFORMANCE_TEST: bool = false;
-const RING_CAP: usize = 1024;
-const ITERS: usize = 10_000;  // Reduced to match other benchmarks
+const RING_CAP: usize = 16_384; // 512K - same as spsc_bench.rs for consistency
+const ITERS: usize = 300_000; // Reduced to match other benchmarks
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 1_000_000_000;
 
 // Helper trait for benchmarking different queue types in SPSC scenario
@@ -48,8 +48,8 @@ unsafe fn unmap_shared(ptr: *mut u8, len: usize) {
     assert_eq!(ret, 0, "munmap failed: {}", std::io::Error::last_os_error());
 }
 
-// IffqQueue (SPSC) - native SPSC implementation
-impl<T: Send + 'static> BenchSpscQueue<T> for IffqQueue<T> {
+// BiffqQueue (SPSC) - native SPSC implementation
+impl<T: Copy + Send + Default + 'static> BenchSpscQueue<T> for BiffqQueue<T> {
     fn bench_push(&self, item: T) -> Result<(), ()> {
         SpscQueue::push(self, item).map_err(|_e| ())
     }
@@ -100,23 +100,23 @@ impl<T: Send + Clone + 'static> BenchSpscQueue<T> for DavidQueueWrapper<T> {
     }
 }
 
-fn bench_iffq_native(c: &mut Criterion) {
-    c.bench_function("IffQ (Native SPSC)", |b| {
+fn bench_biffq_native(c: &mut Criterion) {
+    c.bench_function("BiffQ (Native SPSC)", |b| {
         b.iter_custom(|_iters| {
             assert!(RING_CAP.is_power_of_two());
             assert_eq!(
                 RING_CAP % 32,
                 0,
-                "RING_CAP must be a multiple of IFFQ H_PARTITION_SIZE (32)"
+                "RING_CAP must be a multiple of BIFFQ H_PARTITION_SIZE (32)"
             );
             assert!(
                 RING_CAP >= 2 * 32,
-                "RING_CAP must be >= 2 * IFFQ H_PARTITION_SIZE (64)"
+                "RING_CAP must be >= 2 * BIFFQ H_PARTITION_SIZE (64)"
             );
 
-            let bytes = IffqQueue::<usize>::shared_size(RING_CAP);
+            let bytes = BiffqQueue::<usize>::shared_size(RING_CAP);
             let shm_ptr = unsafe { map_shared(bytes) };
-            let q = unsafe { IffqQueue::init_in_shared(shm_ptr, RING_CAP) };
+            let q = unsafe { BiffqQueue::init_in_shared(shm_ptr, RING_CAP) };
 
             let dur = fork_and_run(q);
 
@@ -133,10 +133,12 @@ fn bench_dqueue_as_spsc(c: &mut Criterion) {
         b.iter_custom(|_iters| {
             // DQueue needs space for segments
             let num_producers = 1; // Single producer for SPSC
-            let segment_pool_capacity = 10; // Should be enough for ITERS items
+                                   // N_SEGMENT_CAPACITY is 262144 in DQueue
+            let segment_pool_capacity = (ITERS / 262144) + 10; // ~38 segments for 10M items
             let bytes = DQueue::<usize>::shared_size(num_producers, segment_pool_capacity);
             let shm_ptr = unsafe { map_shared(bytes) };
-            let q = unsafe { DQueue::init_in_shared(shm_ptr, num_producers, segment_pool_capacity) };
+            let q =
+                unsafe { DQueue::init_in_shared(shm_ptr, num_producers, segment_pool_capacity) };
 
             let dur = fork_and_run(q);
 
@@ -151,12 +153,10 @@ fn bench_dqueue_as_spsc(c: &mut Criterion) {
 fn bench_ymc_as_spsc(c: &mut Criterion) {
     c.bench_function("YMC (MPMC as SPSC)", |b| {
         b.iter_custom(|_iters| {
-            // YangCrummeyQueue needs to know number of threads
-            // In SPSC scenario: 1 producer + 1 consumer = 2 threads
-            let num_threads = 2;
-            let bytes = YangCrummeyQueue::<usize>::shared_size(num_threads);
+            // Use SPSC-specific methods that support 10M items
+            let bytes = YangCrummeyQueue::<usize>::spsc_shared_size();
             let shm_ptr = unsafe { map_shared(bytes) };
-            let q = unsafe { YangCrummeyQueue::init_in_shared(shm_ptr, num_threads) };
+            let q = unsafe { YangCrummeyQueue::init_in_shared_spsc(shm_ptr) };
 
             let dur = fork_and_run(q);
 
@@ -171,9 +171,8 @@ fn bench_ymc_as_spsc(c: &mut Criterion) {
 fn bench_david_as_spsc(c: &mut Criterion) {
     c.bench_function("David (SPMC as SPSC)", |b| {
         b.iter_custom(|_iters| {
-            // DavidQueue setup with single consumer
-            let num_consumers = 1;
-            let bytes = DavidQueue::<usize>::shared_size(num_consumers);
+            // Use SPSC-specific methods that support 15M items
+            let bytes = DavidQueue::<usize>::spsc_shared_size();
             let shm_ptr = unsafe { map_shared(bytes) };
 
             // Create enqueuer state
@@ -184,8 +183,7 @@ fn bench_david_as_spsc(c: &mut Criterion) {
                 ptr::write(enqueuer_state, EnqueuerState::new());
             }
 
-            let q =
-                unsafe { DavidQueue::init_in_shared(shm_ptr, num_consumers, &mut *enqueuer_state) };
+            let q = unsafe { DavidQueue::init_in_shared_spsc(shm_ptr, &mut *enqueuer_state) };
 
             let wrapper = Box::leak(Box::new(DavidQueueWrapper {
                 queue: q,
@@ -243,6 +241,17 @@ where
                     push_attempts += 1;
                     if push_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS {
                         panic!("Producer exceeded max spin retry attempts for push");
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+
+            // Flush BiffqQueue's local buffer if needed
+            if let Some(biffq_queue) = (q as &dyn std::any::Any).downcast_ref::<BiffqQueue<usize>>()
+            {
+                for _attempt in 0..1000 {
+                    if biffq_queue.flush_producer_buffer().is_ok() {
+                        break;
                     }
                     std::hint::spin_loop();
                 }
@@ -310,8 +319,8 @@ where
 // Criterion setup with same parameters as other benchmarks
 fn custom_criterion() -> Criterion {
     Criterion::default()
-        .warm_up_time(Duration::from_secs(2))
-        .measurement_time(Duration::from_secs(10))
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(60))
         .sample_size(10)
 }
 
@@ -319,9 +328,9 @@ criterion_group! {
     name = benches;
     config = custom_criterion();
     targets =
+        bench_biffq_native,
         bench_dqueue_as_spsc,
-        bench_iffq_native,
         bench_ymc_as_spsc,
-        bench_david_as_spsc
+        bench_david_as_spsc,
 }
 criterion_main!(benches);

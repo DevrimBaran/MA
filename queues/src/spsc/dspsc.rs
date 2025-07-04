@@ -200,6 +200,5 @@ impl<T: Send + 'static> Drop for DynListQueue<T> {
         while let Ok(item) = SpscQueue::pop(self) {
             drop(item);
         }
-        // Nodes are in shared memory, don't free
     }
 }

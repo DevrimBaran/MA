@@ -257,6 +257,92 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
         (total + 4095) & !4095
     }
 
+    pub fn spsc_shared_size() -> usize {
+        // For SPSC benchmarks, support up to 10M items
+        let num_segments = 25_000;
+        let num_threads = 2; // Always 2 for SPSC
+
+        let queue_size = mem::size_of::<Self>();
+        let handles_size = num_threads * mem::size_of::<Handle>();
+        let segments_size = num_segments * mem::size_of::<Segment>();
+
+        let total = queue_size + handles_size + segments_size + 8192;
+        (total + 4095) & !4095
+    }
+
+    pub unsafe fn init_in_shared_spsc(mem: *mut u8) -> &'static mut Self {
+        let queue_ptr = mem as *mut Self;
+        let num_threads = 2; // Always 2 for SPSC
+        let num_segments = 25_000;
+
+        let queue_size = mem::size_of::<Self>();
+        let handles_offset = (queue_size + 127) & !127;
+        let segment_offset = handles_offset + num_threads * mem::size_of::<Handle>();
+        let segment_offset = (segment_offset + 63) & !63;
+
+        // Pre-allocate segments
+        let mut prev_seg: *mut Segment = null_mut();
+        let mut first_seg: *mut Segment = null_mut();
+
+        for seg_id in 0..num_segments {
+            let seg_ptr = (mem.add(segment_offset) as *mut Segment).add(seg_id);
+            ptr::write(
+                seg_ptr,
+                Segment {
+                    id: seg_id,
+                    next: AtomicPtr::new(null_mut()),
+                    cells: MaybeUninit::uninit(),
+                },
+            );
+
+            let cells_ptr = (*seg_ptr).cells.as_mut_ptr() as *mut Cell;
+            for i in 0..SEGMENT_SIZE {
+                ptr::write(cells_ptr.add(i), Cell::new());
+            }
+
+            if seg_id == 0 {
+                first_seg = seg_ptr;
+            } else {
+                (*prev_seg).next.store(seg_ptr, Ordering::Release);
+            }
+            prev_seg = seg_ptr;
+        }
+
+        // Initialize handles
+        let handles_base = mem.add(handles_offset) as *mut Handle;
+        for i in 0..num_threads {
+            let handle_ptr = handles_base.add(i);
+            ptr::write(handle_ptr, Handle::new());
+            (*handle_ptr).tail.store(first_seg, Ordering::Release);
+            (*handle_ptr).head.store(first_seg, Ordering::Release);
+        }
+
+        // Link handles in ring for peer helping
+        for i in 0..num_threads {
+            let curr = handles_base.add(i);
+            let next = handles_base.add((i + 1) % num_threads);
+            (*curr).next = next;
+            (*curr).enq_peer.store(next, Ordering::Release);
+            (*curr).deq_peer.store(next, Ordering::Release);
+        }
+
+        // Initialize queue
+        ptr::write(
+            queue_ptr,
+            Self {
+                q: AtomicPtr::new(first_seg),
+                t: AtomicU64::new(0),
+                h: AtomicU64::new(0),
+                handles: handles_base,
+                num_threads,
+                _phantom: std::marker::PhantomData,
+            },
+        );
+
+        fence(Ordering::SeqCst);
+        &mut *queue_ptr
+    }
+
     unsafe fn find_cell(&self, sp: &mut *mut Segment, cell_id: u64) -> *mut Cell {
         let seg_id = (cell_id / SEGMENT_SIZE as u64) as usize;
         let cell_idx = (cell_id % SEGMENT_SIZE as u64) as usize;

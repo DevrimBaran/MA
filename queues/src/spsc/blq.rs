@@ -54,40 +54,6 @@ pub struct BlqPushError<T>(pub T);
 pub struct BlqPopError;
 
 impl<T: Send + 'static> BlqQueue<T> {
-    pub fn with_capacity(capacity: usize) -> Self {
-        assert!(
-            capacity.is_power_of_two(),
-            "Capacity must be a power of two."
-        );
-        assert!(
-            capacity > K_CACHE_LINE_SLOTS,
-            "Capacity must be greater than K_CACHE_LINE_SLOTS"
-        );
-
-        let mut buffer_mem: Vec<UnsafeCell<MaybeUninit<T>>> = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            buffer_mem.push(UnsafeCell::new(MaybeUninit::uninit()));
-        }
-
-        Self {
-            shared_indices: SharedIndices {
-                write: AtomicUsize::new(0),
-                read: AtomicUsize::new(0),
-            },
-            prod_private: UnsafeCell::new(ProducerPrivate {
-                read_shadow: 0,
-                write_priv: 0,
-            }),
-            cons_private: UnsafeCell::new(ConsumerPrivate {
-                write_shadow: 0,
-                read_priv: 0,
-            }),
-            capacity,
-            mask: capacity - 1,
-            buffer: ManuallyDrop::new(buffer_mem.into_boxed_slice()),
-            owns_buffer: true,
-        }
-    }
     pub fn shared_size(capacity: usize) -> usize {
         assert!(
             capacity.is_power_of_two(),

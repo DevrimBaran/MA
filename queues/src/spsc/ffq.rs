@@ -50,39 +50,6 @@ pub struct FfqPushError<T>(pub T);
 pub struct FfqPopError;
 
 impl<T: Send + 'static> FfqQueue<T> {
-    pub fn with_capacity(capacity: usize) -> Self {
-        assert!(capacity.is_power_of_two() && capacity > 0);
-
-        let layout = std::alloc::Layout::array::<Slot<T>>(capacity)
-            .unwrap()
-            .align_to(64)
-            .unwrap();
-
-        let ptr = unsafe { std::alloc::alloc(layout) as *mut Slot<T> };
-
-        if ptr.is_null() {
-            panic!("Failed to allocate buffer");
-        }
-
-        unsafe {
-            for i in 0..capacity {
-                ptr::write(ptr.add(i), Slot::new());
-            }
-        }
-
-        Self {
-            head: AtomicUsize::new(0),
-            _pad1: [0u8; 64 - std::mem::size_of::<AtomicUsize>()],
-            tail: AtomicUsize::new(0),
-            _pad2: [0u8; 64 - std::mem::size_of::<AtomicUsize>()],
-            capacity,
-            mask: capacity - 1,
-            buffer: ptr,
-            owns_buffer: true,
-            initialized: AtomicBool::new(true),
-        }
-    }
-
     pub fn shared_size(capacity: usize) -> usize {
         assert!(capacity.is_power_of_two() && capacity > 0);
         let self_layout = core::alloc::Layout::new::<Self>();

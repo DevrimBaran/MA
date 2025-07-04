@@ -19,23 +19,6 @@ unsafe impl<T: Send> Sync for LamportQueue<T> {}
 unsafe impl<T: Send> Send for LamportQueue<T> {}
 
 impl<T: Send> LamportQueue<T> {
-    pub fn with_capacity(cap: usize) -> Self {
-        assert!(cap.is_power_of_two(), "capacity must be power of two");
-
-        let boxed = (0..cap)
-            .map(|_| UnsafeCell::new(None))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-
-        Self {
-            mask: cap - 1,
-            buf: ManuallyDrop::new(boxed),
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(0),
-            owns_buffer: true,
-        }
-    }
-
     #[inline]
     pub fn idx(&self, i: usize) -> usize {
         i & self.mask

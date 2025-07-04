@@ -23,38 +23,6 @@ unsafe impl<T: Send + 'static> Sync for BQueue<T> {}
 unsafe impl<T: Send + 'static> Send for BQueue<T> {}
 
 impl<T: Send + 'static> BQueue<T> {
-    pub fn new(capacity: usize) -> Self {
-        assert!(capacity.is_power_of_two(), "capacity must be power of two");
-        assert!(
-            capacity > BATCH_SIZE * 2,
-            "capacity must be greater than 2 * BATCH_SIZE"
-        );
-
-        let mut buf_vec: Vec<MaybeUninit<T>> = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            buf_vec.push(MaybeUninit::uninit());
-        }
-        let buf = Box::into_raw(buf_vec.into_boxed_slice()) as *mut MaybeUninit<T>;
-
-        // Create atomic bool array
-        let mut valid_vec: Vec<AtomicBool> = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            valid_vec.push(AtomicBool::new(false));
-        }
-        let valid = Box::into_raw(valid_vec.into_boxed_slice()) as *mut AtomicBool;
-
-        BQueue {
-            buf,
-            valid,
-            cap: capacity,
-            mask: capacity - 1,
-            head: AtomicUsize::new(0),
-            batch_head: UnsafeCell::new(0),
-            tail: AtomicUsize::new(0),
-            batch_tail: UnsafeCell::new(0),
-        }
-    }
-
     pub const fn shared_size(capacity: usize) -> usize {
         mem::size_of::<Self>()
             + capacity * mem::size_of::<MaybeUninit<T>>()

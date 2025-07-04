@@ -62,56 +62,6 @@ pub struct IffqPushError<T>(pub T);
 pub struct IffqPopError;
 
 impl<T: Send + 'static> IffqQueue<T> {
-    pub fn with_capacity(capacity: usize) -> Self {
-        assert!(
-            capacity.is_power_of_two(),
-            "Capacity must be a power of two."
-        );
-        assert_eq!(
-            capacity % H_PARTITION_SIZE,
-            0,
-            "Capacity must be a multiple of H_PARTITION_SIZE ({}).",
-            H_PARTITION_SIZE
-        );
-        assert!(
-            capacity >= 2 * H_PARTITION_SIZE,
-            "Capacity must be at least 2 * H_PARTITION_SIZE."
-        );
-
-        let layout = std::alloc::Layout::array::<Slot<T>>(capacity)
-            .unwrap()
-            .align_to(64)
-            .unwrap();
-
-        let buffer_ptr = unsafe {
-            let ptr = std::alloc::alloc(layout) as *mut Slot<T>;
-            if ptr.is_null() {
-                std::alloc::handle_alloc_error(layout);
-            }
-            // Initialize all slots
-            for i in 0..capacity {
-                ptr::write(ptr.add(i), Slot::new());
-            }
-            ptr
-        };
-
-        Self {
-            prod: ProducerFields {
-                write: AtomicUsize::new(H_PARTITION_SIZE),
-                limit: AtomicUsize::new(2 * H_PARTITION_SIZE),
-            },
-            cons: ConsumerFields {
-                read: AtomicUsize::new(H_PARTITION_SIZE),
-                clear: AtomicUsize::new(0),
-            },
-            capacity,
-            mask: capacity - 1,
-            h_mask: H_PARTITION_SIZE - 1,
-            buffer: buffer_ptr,
-            owns_buffer: true,
-        }
-    }
-
     pub fn shared_size(capacity: usize) -> usize {
         assert!(
             capacity > 0 && capacity.is_power_of_two(),

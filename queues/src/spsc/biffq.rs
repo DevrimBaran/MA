@@ -62,61 +62,6 @@ pub struct BiffqPushError<T>(pub T);
 pub struct BiffqPopError;
 
 impl<T: Send + 'static> BiffqQueue<T> {
-    pub fn with_capacity(capacity: usize) -> Self {
-        assert!(
-            capacity.is_power_of_two(),
-            "Capacity must be a power of two."
-        );
-        assert_eq!(
-            capacity % H_PARTITION_SIZE,
-            0,
-            "Capacity must be a multiple of H_PARTITION_SIZE."
-        );
-        assert!(
-            capacity >= 2 * H_PARTITION_SIZE,
-            "Capacity must be at least 2 * H_PARTITION_SIZE."
-        );
-
-        // Allocate buffer with proper alignment
-        let layout = std::alloc::Layout::array::<Slot<T>>(capacity)
-            .unwrap()
-            .align_to(64)
-            .unwrap();
-
-        let buffer_ptr = unsafe {
-            let ptr = std::alloc::alloc(layout) as *mut Slot<T>;
-            if ptr.is_null() {
-                std::alloc::handle_alloc_error(layout);
-            }
-            // Initialize all slots as empty
-            for i in 0..capacity {
-                ptr::write(ptr.add(i), Slot::new());
-            }
-            ptr
-        };
-
-        let local_buf_uninit: [MaybeUninit<T>; LOCAL_BATCH_SIZE] =
-            unsafe { MaybeUninit::uninit().assume_init() };
-
-        Self {
-            prod: ProducerFieldsB {
-                write: AtomicUsize::new(H_PARTITION_SIZE),
-                limit: AtomicUsize::new(2 * H_PARTITION_SIZE),
-                local_buffer: UnsafeCell::new(local_buf_uninit),
-                local_count: AtomicUsize::new(0),
-            },
-            cons: ConsumerFieldsB {
-                read: AtomicUsize::new(H_PARTITION_SIZE),
-                clear: AtomicUsize::new(0),
-            },
-            capacity,
-            mask: capacity - 1,
-            h_mask: H_PARTITION_SIZE - 1,
-            buffer: buffer_ptr,
-            owns_buffer: true,
-        }
-    }
-
     pub fn shared_size(capacity: usize) -> usize {
         assert!(
             capacity > 0 && capacity.is_power_of_two(),

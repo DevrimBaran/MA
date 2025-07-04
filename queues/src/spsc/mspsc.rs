@@ -18,11 +18,6 @@ unsafe impl<T: Send> Send for MultiPushQueue<T> {}
 unsafe impl<T: Send> Sync for MultiPushQueue<T> {}
 
 impl<T: Send + 'static> MultiPushQueue<T> {
-    pub fn with_capacity(capacity: usize) -> Self {
-        let boxed_lamport = Box::new(LamportQueue::with_capacity(capacity));
-        Self::from_raw(Box::into_raw(boxed_lamport), false)
-    }
-
     pub unsafe fn init_in_shared(mem: *mut u8, capacity: usize) -> &'static mut Self {
         let self_ptr = mem as *mut MaybeUninit<Self>;
 

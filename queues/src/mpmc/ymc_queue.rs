@@ -10,40 +10,40 @@ const PATIENCE: usize = 10;
 const CACHE_LINE_SIZE: usize = 64;
 
 // Using negative values that will never conflict with actual data
-const BOTTOM: usize = usize::MAX; // -1 in two's complement
-const TOP: usize = usize::MAX - 1; // -2 in two's complement
+pub const BOTTOM: usize = usize::MAX; // -1 in two's complement
+pub const TOP: usize = usize::MAX - 1; // -2 in two's complement
 const EMPTY_ENQ: *mut EnqReq = 1 as *mut EnqReq;
 const TOP_ENQ: *mut EnqReq = 2 as *mut EnqReq;
 const BOTTOM_DEQ: *mut DeqReq = null_mut();
 const TOP_DEQ: *mut DeqReq = 2 as *mut DeqReq;
 
 #[repr(C)]
-struct EnqReq {
-    val: AtomicUsize,
-    state: AtomicU64,
+pub struct EnqReq {
+    pub val: AtomicUsize,
+    pub state: AtomicU64,
 }
 
 impl EnqReq {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             val: AtomicUsize::new(BOTTOM),
             state: AtomicU64::new(0),
         }
     }
 
-    fn get_state(&self) -> (bool, u64) {
+    pub fn get_state(&self) -> (bool, u64) {
         let s = self.state.load(Ordering::SeqCst);
         let pending = (s >> 63) != 0;
         let id = s & 0x7FFFFFFFFFFFFFFF;
         (pending, id)
     }
 
-    fn set_state(&self, pending: bool, id: u64) {
+    pub fn set_state(&self, pending: bool, id: u64) {
         let s = ((pending as u64) << 63) | (id & 0x7FFFFFFFFFFFFFFF);
         self.state.store(s, Ordering::SeqCst);
     }
 
-    fn try_claim(&self, old_id: u64, new_id: u64) -> bool {
+    pub fn try_claim(&self, old_id: u64, new_id: u64) -> bool {
         let old = (1u64 << 63) | old_id;
         let new = new_id & 0x7FFFFFFFFFFFFFFF;
         self.state
@@ -53,32 +53,32 @@ impl EnqReq {
 }
 
 #[repr(C)]
-struct DeqReq {
-    id: AtomicU64,
-    state: AtomicU64,
+pub struct DeqReq {
+    pub id: AtomicU64,
+    pub state: AtomicU64,
 }
 
 impl DeqReq {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             id: AtomicU64::new(0),
             state: AtomicU64::new(0),
         }
     }
 
-    fn get_state(&self) -> (bool, u64) {
+    pub fn get_state(&self) -> (bool, u64) {
         let s = self.state.load(Ordering::SeqCst);
         let pending = (s >> 63) != 0;
         let idx = s & 0x7FFFFFFFFFFFFFFF;
         (pending, idx)
     }
 
-    fn set_state(&self, pending: bool, idx: u64) {
+    pub fn set_state(&self, pending: bool, idx: u64) {
         let s = ((pending as u64) << 63) | (idx & 0x7FFFFFFFFFFFFFFF);
         self.state.store(s, Ordering::SeqCst);
     }
 
-    fn try_announce(&self, old_idx: u64, new_idx: u64) -> bool {
+    pub fn try_announce(&self, old_idx: u64, new_idx: u64) -> bool {
         let old = (1u64 << 63) | old_idx;
         let new = (1u64 << 63) | new_idx;
         self.state
@@ -86,7 +86,7 @@ impl DeqReq {
             .is_ok()
     }
 
-    fn try_complete(&self, idx: u64) -> bool {
+    pub fn try_complete(&self, idx: u64) -> bool {
         let old = (1u64 << 63) | idx;
         let new = idx; // pending = 0
         self.state

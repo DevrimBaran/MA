@@ -1,7 +1,9 @@
 #![cfg(miri)]
 
 use queues::{mpsc::*, MpscQueue};
+use queues::mpsc::dqueue::{N_SEGMENT_CAPACITY, Segment};
 use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 const MIRI_PRODUCERS: usize = 2;
@@ -1341,6 +1343,134 @@ fn test_miri_is_working() {
     assert_eq!(x, 42);
 }
 
+mod miri_dqueue_enhanced_tests {
+    use super::*;
+    use std::ptr;
+
+    #[test]
+    fn test_dqueue_segment_management_miri() {
+        let num_producers = 2;
+        let segment_pool_capacity = 3;
+
+        let shared_size = DQueue::<usize>::shared_size(num_producers, segment_pool_capacity);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let mem_ptr = memory.as_mut_ptr();
+
+        let queue =
+            unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
+
+        unsafe {
+            // Test new_segment
+            let seg1: *mut Segment<i32> = queue.new_segment(1);
+            assert!(!seg1.is_null());
+            assert_eq!((*seg1).id, 1);
+
+            // Test release_segment_to_pool
+            queue.release_segment_to_pool(seg1);
+
+            // Test releasing null segment (should not crash)
+            queue.release_segment_to_pool(ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn test_dqueue_pop_error_paths_miri() {
+        let num_producers = 1;
+        let segment_pool_capacity = 2;
+
+        let shared_size = DQueue::<usize>::shared_size(num_producers, segment_pool_capacity);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let mem_ptr = memory.as_mut_ptr();
+
+        let queue =
+            unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
+
+        // Test pop on empty queue
+        assert!(queue.dequeue().is_none());
+
+        // Add and remove items
+        for i in 0..10 {
+            queue.enqueue(0, i).unwrap();
+        }
+
+        unsafe {
+            queue.dump_local_buffer(0);
+        }
+
+        let mut count = 0;
+        while queue.dequeue().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 10);
+
+        // Test pop on empty queue after draining
+        assert!(queue.dequeue().is_none());
+    }
+
+    #[test]
+    fn test_dqueue_find_segment_edge_cases_miri() {
+        let num_producers = 1;
+        let segment_pool_capacity = 3;
+
+        let shared_size = DQueue::<usize>::shared_size(num_producers, segment_pool_capacity);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let mem_ptr = memory.as_mut_ptr();
+
+        let queue =
+            unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
+
+        unsafe {
+            // Test find_segment with null cache
+            let seg: *mut Segment<i32> = queue.find_segment(ptr::null_mut(), 0);
+            assert!(!seg.is_null());
+
+            // Test find_segment with target beyond allocated segments
+            let large_cid = N_SEGMENT_CAPACITY as u64 * 10;
+            let seg2 = queue.find_segment(ptr::null_mut(), large_cid);
+            assert!(seg2.is_null());
+        }
+    }
+
+    #[test]
+    fn test_dqueue_run_gc_miri() {
+        let num_producers = 1;
+        let segment_pool_capacity = 3;
+
+        let shared_size = DQueue::<usize>::shared_size(num_producers, segment_pool_capacity);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let mem_ptr = memory.as_mut_ptr();
+
+        let queue =
+            unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
+
+        // Add items
+        for i in 0..20 {
+            queue.enqueue(0, i).unwrap();
+        }
+
+        unsafe {
+            queue.dump_local_buffer(0);
+        }
+
+        // Dequeue some to advance head
+        for _ in 0..10 {
+            queue.dequeue();
+        }
+
+        // Run garbage collection
+        unsafe {
+            queue.run_gc();
+        }
+
+        // Queue should still function
+        queue.enqueue(0, 999).unwrap();
+        unsafe {
+            queue.dump_local_buffer(0);
+        }
+        assert!(queue.dequeue().is_some());
+    }
+}
+
 mod miri_drop_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1846,5 +1976,123 @@ mod miri_edge_cases {
         queue.push(42).unwrap();
         assert_eq!(queue.pop().unwrap(), 42);
         assert!(queue.is_empty());
+    }
+}
+
+mod miri_jiffy_enhanced_tests {
+    use super::*;
+    use queues::mpsc::jiffy_queue::NodeState;
+    use std::ptr;
+
+    #[test]
+    fn test_jiffy_attempt_fold_buffer_miri() {
+        let buffer_capacity = 4;
+        let max_buffers = 3;
+
+        let shared_size = JiffyQueue::<usize>::shared_size(buffer_capacity, max_buffers);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let mem_ptr = memory.as_mut_ptr();
+
+        let queue = unsafe { JiffyQueue::init_in_shared(mem_ptr, buffer_capacity, max_buffers) };
+
+        // Push items to fill first buffer
+        for i in 0..buffer_capacity {
+            queue.push(i).unwrap();
+        }
+
+        // Push more to start second buffer
+        for i in buffer_capacity..buffer_capacity * 2 {
+            queue.push(i).unwrap();
+        }
+
+        // Pop items from the first buffer
+        for _ in 0..buffer_capacity / 2 {
+            queue.pop().unwrap();
+        }
+
+        // Push more items to trigger buffer handling
+        for i in buffer_capacity * 2..buffer_capacity * 3 {
+            queue.push(i).unwrap();
+        }
+
+        // Verify queue still works correctly
+        let mut count = 0;
+        while queue.pop().is_ok() {
+            count += 1;
+        }
+        assert!(count > 0);
+    }
+
+    #[test]
+    fn test_jiffy_drop_behavior_miri() {
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone, Debug)]
+        struct DropCounter {
+            id: usize,
+        }
+
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+
+        {
+            let shared_size = JiffyQueue::<DropCounter>::shared_size(4, 2);
+            let mut memory = AlignedMemory::new(shared_size, 64);
+            let mem_ptr = memory.as_mut_ptr();
+
+            let queue = unsafe { JiffyQueue::init_in_shared(mem_ptr, 4, 2) };
+
+            // Push items
+            for i in 0..6 {
+                queue.push(DropCounter { id: i }).unwrap();
+            }
+
+            // Pop some items
+            for _ in 0..3 {
+                drop(queue.pop().unwrap());
+            }
+
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 3);
+        }
+        // After queue is dropped, remaining items may not be dropped 
+        // due to shared memory lifecycle
+    }
+
+    #[test]
+    fn test_jiffy_buffer_pool_exhaustion_detailed_miri() {
+        let buffer_capacity = 2;
+        let max_buffers = 2;
+
+        let shared_size = JiffyQueue::<usize>::shared_size(buffer_capacity, max_buffers);
+        let mut memory = AlignedMemory::new(shared_size, 64);
+        let mem_ptr = memory.as_mut_ptr();
+
+        let queue = unsafe { JiffyQueue::init_in_shared(mem_ptr, buffer_capacity, max_buffers) };
+
+        // Fill up available buffers
+        let mut pushed = 0;
+        for i in 0..10 {
+            if queue.push(i).is_ok() {
+                pushed += 1;
+            } else {
+                break;
+            }
+        }
+
+        // Should have pushed at least buffer_capacity items
+        assert!(pushed >= buffer_capacity);
+
+        // Pop all items
+        for _ in 0..pushed {
+            queue.pop().unwrap();
+        }
+
+        // Should be able to push again after popping
+        assert!(queue.push(999).is_ok());
     }
 }

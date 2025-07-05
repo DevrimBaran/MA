@@ -16,8 +16,8 @@ const FIN_BIT: u64 = 1 << 63;
 const INC_BIT: u64 = 1 << 62;
 const COUNTER_MASK: u64 = (1 << 62) - 1;
 
-const IDX_BOTTOM: usize = 0x3FFFFFFE;
-const IDX_EMPTY: usize = 0x3FFFFFFD;
+pub const IDX_BOTTOM: usize = 0x3FFFFFFE;
+pub const IDX_EMPTY: usize = 0x3FFFFFFD;
 
 // Maximum bounded attempts for wait-freedom
 const MAX_BOUNDED_ATTEMPTS: usize = 10000;
@@ -32,7 +32,7 @@ pub struct Entry {
 }
 
 impl Entry {
-    const fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             cycle: 0,
             is_safe: true,
@@ -56,7 +56,7 @@ impl EntryPair {
         }
     }
 
-    fn pack_entry(e: Entry) -> u64 {
+    pub fn pack_entry(e: Entry) -> u64 {
         let mut packed = 0u64;
         packed |= (e.cycle as u64) << 32;
         packed |= (e.is_safe as u64) << 31;
@@ -91,15 +91,15 @@ impl<T> DataEntry<T> {
 }
 
 #[repr(C)]
-struct Phase2Rec {
-    seq1: AtomicU32,
-    local: AtomicU64,
-    cnt: AtomicU64,
-    seq2: AtomicU32,
+pub struct Phase2Rec {
+    pub seq1: AtomicU32,
+    pub local: AtomicU64,
+    pub cnt: AtomicU64,
+    pub seq2: AtomicU32,
 }
 
 impl Phase2Rec {
-    const fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             seq1: AtomicU32::new(1),
             local: AtomicU64::new(0),
@@ -155,15 +155,15 @@ pub struct GlobalPair {
 
 #[repr(C)]
 pub struct InnerWCQ {
-    threshold: AtomicI32,
+    pub threshold: AtomicI32,
     pub tail: GlobalPair,
     pub head: GlobalPair,
-    ring_size: usize,
+    pub ring_size: usize,
     pub capacity: usize,
 }
 
 impl InnerWCQ {
-    const fn new(ring_size: usize) -> Self {
+    pub const fn new(ring_size: usize) -> Self {
         let capacity = ring_size * 2;
         Self {
             threshold: AtomicI32::new(-1),
@@ -247,7 +247,7 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         records.add(tid % self.num_threads)
     }
 
-    fn cycle(val: u64, ring_size: usize) -> u32 {
+    pub fn cycle(val: u64, ring_size: usize) -> u32 {
         (val / ring_size as u64) as u32
     }
 

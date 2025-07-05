@@ -17,7 +17,7 @@ BENCHMARK_FUNCTION_IDS = [
 
 OUTPUT_PLOT_FILE = "best_algorithms_in_spsc_performance.png"
 PLOT_TITLE = "Best Queue Algorithms Performance Comparison in SPSC Scenario"
-Y_AXIS_LABEL = "Execution Time per Iteration (µs)"
+Y_AXIS_LABEL = "Execution Time per Sample (µs)"
 
 
 def load_benchmark_data(base_path, benchmark_file_stem, function_id_folder_name):
@@ -150,7 +150,7 @@ def main():
     plt.text(
         0.5,
         0.01,
-        "Test: 1 Producer, 1 Consumer, 10K iterations",
+        "Test: 1 Producer, 1 Consumer, 10K Items",
         ha="center",
         transform=plt.gcf().transFigure,
         fontsize=10,

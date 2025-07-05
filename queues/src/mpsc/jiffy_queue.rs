@@ -8,16 +8,16 @@ use crate::MpscQueue;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(usize)]
-enum NodeState {
+pub enum NodeState {
     Empty = 0,
     Set = 1,
     Handled = 2,
 }
 
 #[repr(C)]
-struct Node<T> {
+pub struct Node<T> {
     data: MaybeUninit<T>,
-    is_set: AtomicUsize,
+    pub is_set: AtomicUsize,
 }
 
 impl<T> Node<T> {
@@ -29,10 +29,10 @@ impl<T> Node<T> {
 
 #[repr(C)]
 pub struct BufferList<T> {
-    curr_buffer: *mut Node<T>,
-    capacity: usize,
+    pub curr_buffer: *mut Node<T>,
+    pub capacity: usize,
     next: AtomicPtr<BufferList<T>>,
-    prev: *mut BufferList<T>,
+    pub prev: *mut BufferList<T>,
     consumer_head_idx: AtomicUsize,
     pub position_in_queue: u64,
     pub is_array_reclaimed: AtomicBool,
@@ -508,7 +508,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
 
                 let node_ptr = unsafe { tail_bl_ref.curr_buffer.add(internal_idx) };
                 unsafe {
-                    ptr::write(&mut (*node_ptr).data, MaybeUninit::new(data));
+                    ptr::addr_of_mut!((*node_ptr).data).write(MaybeUninit::new(data));
                     (*node_ptr)
                         .is_set
                         .store(NodeState::Set as usize, Ordering::Release);

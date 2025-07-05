@@ -303,6 +303,113 @@ mpmc_miri_test_queue!(
     YangCrummeyQueue::<usize>::shared_size
 );
 
+mod miri_test_ymc_enhanced {
+    use super::*;
+    use queues::{EnqReq, DeqReq, BOTTOM, TOP};
+
+    #[test]
+    fn test_ymc_is_empty_and_is_full_miri() {
+        unsafe {
+            let num_threads = 2;
+            let size = YangCrummeyQueue::<usize>::shared_size(num_threads);
+            let mem = allocate_shared_memory(size);
+            let queue = YangCrummeyQueue::<usize>::init_in_shared(mem, num_threads);
+
+            // Test empty queue
+            assert!(queue.is_empty());
+            assert!(!queue.is_full());
+
+            // Add single item
+            queue.push(1, 0).unwrap();
+            assert!(!queue.is_empty());
+            assert!(!queue.is_full());
+
+            // Remove item
+            queue.pop(0).unwrap();
+            assert!(queue.is_empty());
+            assert!(!queue.is_full());
+
+            deallocate_shared_memory(mem, size);
+        }
+    }
+
+    #[test]
+    fn test_enq_req_methods_miri() {
+        let req = EnqReq::new();
+        assert_eq!(req.val.load(Ordering::Relaxed), BOTTOM);
+        
+        // Test get_state and set_state
+        let (pending, id) = req.get_state();
+        assert!(!pending);
+        assert_eq!(id, 0);
+
+        req.set_state(true, 42);
+        let (pending, id) = req.get_state();
+        assert!(pending);
+        assert_eq!(id, 42);
+    }
+
+    #[test]
+    fn test_deq_req_methods_miri() {
+        let req = DeqReq::new();
+        assert_eq!(req.id.load(Ordering::Relaxed), 0);
+        
+        // Test get_state and set_state
+        let (pending, idx) = req.get_state();
+        assert!(!pending);
+        assert_eq!(idx, 0);
+
+        req.set_state(true, 42);
+        let (pending, idx) = req.get_state();
+        assert!(pending);
+        assert_eq!(idx, 42);
+
+        // Test try_announce
+        assert!(req.try_announce(42, 100));
+        let (pending, idx) = req.get_state();
+        assert!(pending);
+        assert_eq!(idx, 100);
+
+        // Test try_complete
+        assert!(req.try_complete(100));
+        let (pending, idx) = req.get_state();
+        assert!(!pending);
+        assert_eq!(idx, 100);
+    }
+
+    #[test]
+    fn test_ymc_basic_operations_miri() {
+        unsafe {
+            let num_threads = 2;
+            let size = YangCrummeyQueue::<usize>::shared_size(num_threads);
+            let mem = allocate_shared_memory(size);
+            let queue = YangCrummeyQueue::<usize>::init_in_shared(mem, num_threads);
+
+            // Add and remove items
+            for i in 0..10 {
+                queue.push(i, 0).unwrap();
+            }
+
+            for i in 0..10 {
+                let val = queue.pop(0).unwrap();
+                assert_eq!(val, i);
+            }
+
+            assert!(queue.is_empty());
+
+            deallocate_shared_memory(mem, size);
+        }
+    }
+
+    #[test]
+    fn test_ymc_constants_miri() {
+        // Test that special constants are distinct
+        assert_ne!(BOTTOM, TOP);
+        assert_eq!(BOTTOM, usize::MAX);
+        assert_eq!(TOP, usize::MAX - 1);
+    }
+}
+
 mpmc_miri_test_queue!(
     miri_test_turn_queue,
     TurnQueue<usize>,
@@ -317,6 +424,162 @@ mpmc_miri_test_queue!(
     FeldmanDechevWFQueue::<usize>::shared_size
 );
 
+mod miri_test_feldman_dechev_enhanced {
+    use super::*;
+    use queues::{Node, ValueType, EnqueueOp, DequeueOp};
+    use std::cell::UnsafeCell;
+
+    #[test]
+    fn test_active_operations_miri() {
+        unsafe {
+            let num_threads = 2;
+            let size = FeldmanDechevWFQueue::<usize>::shared_size(num_threads);
+            let mem = allocate_shared_memory(size);
+            let queue = FeldmanDechevWFQueue::<usize>::init_in_shared(mem, num_threads);
+
+            // Check initial state
+            let (active_enq, active_deq) = queue.active_operations();
+            assert_eq!(active_enq, 0);
+            assert_eq!(active_deq, 0);
+
+            // Add some items
+            for i in 0..10 {
+                queue.push(i, 0).unwrap();
+            }
+
+            // Remove some items
+            for _ in 0..5 {
+                queue.pop(0).unwrap();
+            }
+
+            // Check operations are still zero (no slow path triggered)
+            let (active_enq, active_deq) = queue.active_operations();
+            assert_eq!(active_enq, 0);
+            assert_eq!(active_deq, 0);
+
+            deallocate_shared_memory(mem, size);
+        }
+    }
+
+    #[test]
+    fn test_is_empty_and_is_full_miri() {
+        unsafe {
+            let num_threads = 2;
+            let size = FeldmanDechevWFQueue::<usize>::shared_size(num_threads);
+            let mem = allocate_shared_memory(size);
+            let queue = FeldmanDechevWFQueue::<usize>::init_in_shared(mem, num_threads);
+
+            // Test empty queue
+            assert!(queue.is_empty());
+            assert!(!queue.is_full());
+
+            // Add single item
+            queue.push(1, 0).unwrap();
+            assert!(!queue.is_empty());
+            assert!(!queue.is_full());
+
+            // Remove item
+            queue.pop(0).unwrap();
+            assert!(queue.is_empty());
+            assert!(!queue.is_full());
+
+            deallocate_shared_memory(mem, size);
+        }
+    }
+
+    #[test]
+    fn test_node_methods_miri() {
+        // Test Node creation and methods
+        let empty_node = Node::new_empty(100);
+        assert!(empty_node.is_empty());
+        assert!(!empty_node.is_value());
+        assert!(!empty_node.is_delay_marked());
+        assert_eq!(empty_node.get_seqid(), 100);
+        assert!(empty_node.get_value_ptr().is_null());
+
+        // Test delay marking
+        let mut delay_node = empty_node;
+        delay_node.set_delay_mark();
+        assert!(delay_node.is_delay_marked());
+        assert!(delay_node.is_empty());
+
+        // Test value node
+        unsafe {
+            let value_type = Box::new(ValueType {
+                seqid: 200,
+                value: UnsafeCell::new(Some(42)),
+            });
+            let value_ptr = Box::into_raw(value_type);
+            
+            let value_node = Node::new_value(value_ptr, 200);
+            assert!(!value_node.is_empty());
+            assert!(value_node.is_value());
+            assert!(!value_node.is_delay_marked());
+            assert_eq!(value_node.get_seqid(), 200);
+            assert_eq!(value_node.get_value_ptr(), value_ptr);
+            
+            // Clean up
+            let _ = Box::from_raw(value_ptr);
+        }
+    }
+
+    #[test]
+    fn test_operation_record_methods_miri() {
+        unsafe {
+            // Test EnqueueOp methods
+            let enq_op = std::alloc::alloc(std::alloc::Layout::new::<EnqueueOp>()) as *mut EnqueueOp;
+            std::ptr::write(enq_op, EnqueueOp::new(42, 0));
+            
+            assert!(!(*enq_op).is_complete());
+            (*enq_op).complete();
+            assert!((*enq_op).is_complete());
+            
+            std::alloc::dealloc(enq_op as *mut u8, std::alloc::Layout::new::<EnqueueOp>());
+
+            // Test DequeueOp methods
+            let deq_op = std::alloc::alloc(std::alloc::Layout::new::<DequeueOp>()) as *mut DequeueOp;
+            std::ptr::write(deq_op, DequeueOp::new(0));
+            
+            assert!(!(*deq_op).is_complete());
+            assert_eq!((*deq_op).get_result(), 0);
+            
+            (*deq_op).set_result(123);
+            assert_eq!((*deq_op).get_result(), 123);
+            
+            (*deq_op).complete();
+            assert!((*deq_op).is_complete());
+            
+            std::alloc::dealloc(deq_op as *mut u8, std::alloc::Layout::new::<DequeueOp>());
+        }
+    }
+
+    #[test]
+    fn test_alternating_operations_miri() {
+        unsafe {
+            let num_threads = 2;
+            let size = FeldmanDechevWFQueue::<usize>::shared_size(num_threads);
+            let mem = allocate_shared_memory(size);
+            let queue = FeldmanDechevWFQueue::<usize>::init_in_shared(mem, num_threads);
+
+            // Alternate push and pop operations
+            for i in 0..20 {
+                if i % 2 == 0 {
+                    queue.push(i, 0).unwrap();
+                } else if !queue.is_empty() {
+                    queue.pop(0).unwrap();
+                }
+            }
+
+            // Drain remaining
+            while !queue.is_empty() {
+                queue.pop(0).unwrap();
+            }
+
+            deallocate_shared_memory(mem, size);
+        }
+    }
+}
+
 mpmc_miri_test_queue!(
     miri_test_kogan_petrank,
     KPQueue<usize>,
@@ -330,6 +593,124 @@ mpmc_miri_test_queue!(
     WCQueue::<usize>::init_in_shared,
     WCQueue::<usize>::shared_size
 );
+
+mod miri_test_wcq_enhanced {
+    use super::*;
+    use queues::{Phase2Rec, InnerWCQ, Entry, EntryPair, IDX_EMPTY};
+
+    #[test]
+    fn test_wcq_is_empty_and_is_full_miri() {
+        unsafe {
+            let num_threads = 2;
+            let size = WCQueue::<usize>::shared_size(num_threads);
+            let mem = allocate_shared_memory(size);
+            let queue = WCQueue::<usize>::init_in_shared(mem, num_threads);
+
+            // Test empty queue
+            assert!(queue.is_empty());
+            assert!(!queue.is_full());
+
+            // Add single item
+            queue.push(1, 0).unwrap();
+            assert!(!queue.is_empty());
+            assert!(!queue.is_full());
+
+            // Remove item
+            queue.pop(0).unwrap();
+            assert!(queue.is_empty());
+            assert!(!queue.is_full());
+
+            deallocate_shared_memory(mem, size);
+        }
+    }
+
+    #[test]
+    fn test_phase2rec_new_miri() {
+        let phase2 = Phase2Rec::new();
+        assert_eq!(phase2.seq1.load(Ordering::Relaxed), 1);
+        assert_eq!(phase2.local.load(Ordering::Relaxed), 0);
+        assert_eq!(phase2.cnt.load(Ordering::Relaxed), 0);
+        assert_eq!(phase2.seq2.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_inner_wcq_new_miri() {
+        let ring_size = 1024;
+        let wcq = InnerWCQ::new(ring_size);
+        assert_eq!(wcq.ring_size, ring_size);
+        assert_eq!(wcq.capacity, ring_size * 2);
+        assert_eq!(wcq.threshold.load(Ordering::Relaxed), -1);
+        assert_eq!(wcq.tail.cnt.load(Ordering::Relaxed), (ring_size * 2) as u64);
+        assert_eq!(wcq.head.cnt.load(Ordering::Relaxed), (ring_size * 2) as u64);
+    }
+
+    #[test]
+    fn test_entry_and_entrypair_packing_miri() {
+        // Test Entry creation and packing/unpacking
+        let entry = Entry {
+            cycle: 42,
+            is_safe: true,
+            enq: false,
+            index: 12345,
+        };
+
+        let packed = EntryPair::pack_entry(entry);
+        let unpacked = EntryPair::unpack_entry(packed);
+
+        assert_eq!(unpacked.cycle, entry.cycle);
+        assert_eq!(unpacked.is_safe, entry.is_safe);
+        assert_eq!(unpacked.enq, entry.enq);
+        assert_eq!(unpacked.index, entry.index);
+
+        // Test special index values
+        let empty_entry = Entry::new();
+        assert_eq!(empty_entry.index, IDX_EMPTY);
+        assert!(empty_entry.is_safe);
+        assert!(empty_entry.enq);
+    }
+
+    #[test]
+    fn test_wcq_basic_operations_miri() {
+        unsafe {
+            let num_threads = 2;
+            let size = WCQueue::<usize>::shared_size(num_threads);
+            let mem = allocate_shared_memory(size);
+            let queue = WCQueue::<usize>::init_in_shared(mem, num_threads);
+
+            // Add and remove items
+            for i in 0..10 {
+                queue.push(i, 0).unwrap();
+            }
+
+            for i in 0..10 {
+                let val = queue.pop(0).unwrap();
+                assert_eq!(val, i);
+            }
+
+            assert!(queue.is_empty());
+
+            deallocate_shared_memory(mem, size);
+        }
+    }
+
+    #[test]
+    fn test_wcq_cache_remap_miri() {
+        // Test the cache_remap function
+        assert_eq!(WCQueue::<usize>::cache_remap(0, 1024), 0);
+        assert_eq!(WCQueue::<usize>::cache_remap(1024, 1024), 0);
+        assert_eq!(WCQueue::<usize>::cache_remap(1025, 1024), 1);
+        assert_eq!(WCQueue::<usize>::cache_remap(2048, 1024), 0);
+    }
+
+    #[test]
+    fn test_wcq_cycle_calculation_miri() {
+        // Test cycle calculation
+        assert_eq!(WCQueue::<usize>::cycle(0, 1024), 0);
+        assert_eq!(WCQueue::<usize>::cycle(1023, 1024), 0);
+        assert_eq!(WCQueue::<usize>::cycle(1024, 1024), 1);
+        assert_eq!(WCQueue::<usize>::cycle(2048, 1024), 2);
+    }
+}
 
 mod miri_test_wfqueue {
     use std::time::Duration;

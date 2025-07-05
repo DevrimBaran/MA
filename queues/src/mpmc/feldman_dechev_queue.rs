@@ -18,40 +18,40 @@ const OPS_PER_THREAD: usize = 500; // Increased from 100
 
 // Node types stored in the ring buffer
 #[derive(Clone, Copy)]
-struct Node {
+pub struct Node {
     value: u64, // Stores either EmptyType with seqid or pointer to ValueType
 }
 
 impl Node {
-    fn new_empty(seqid: u64) -> Self {
+    pub fn new_empty(seqid: u64) -> Self {
         Self {
             value: (seqid << 2) | EMPTY_TYPE_MASK,
         }
     }
 
-    fn new_value(ptr: *mut ValueType<usize>, _seqid: u64) -> Self {
+    pub fn new_value(ptr: *mut ValueType<usize>, _seqid: u64) -> Self {
         Self {
             value: ptr as u64, // ValueType pointers have LSB = 0
         }
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         (self.value & EMPTY_TYPE_MASK) != 0
     }
 
-    fn is_value(&self) -> bool {
+    pub fn is_value(&self) -> bool {
         !self.is_empty() && (self.value & DELAY_MARK_MASK) == 0
     }
 
-    fn is_delay_marked(&self) -> bool {
+    pub fn is_delay_marked(&self) -> bool {
         (self.value & DELAY_MARK_MASK) != 0
     }
 
-    fn set_delay_mark(&mut self) {
+    pub fn set_delay_mark(&mut self) {
         self.value |= DELAY_MARK_MASK;
     }
 
-    fn get_seqid(&self) -> u64 {
+    pub fn get_seqid(&self) -> u64 {
         if self.is_empty() {
             self.value >> 2
         } else {
@@ -67,7 +67,7 @@ impl Node {
         }
     }
 
-    fn get_value_ptr(&self) -> *mut ValueType<usize> {
+    pub fn get_value_ptr(&self) -> *mut ValueType<usize> {
         if self.is_empty() {
             ptr::null_mut()
         } else {
@@ -78,29 +78,29 @@ impl Node {
 
 // ValueType stores the actual enqueued data
 #[repr(C)]
-struct ValueType<T> {
-    seqid: u64,
-    value: UnsafeCell<Option<T>>,
+pub struct ValueType<T> {
+    pub seqid: u64,
+    pub value: UnsafeCell<Option<T>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum OpType {
+pub enum OpType {
     Enqueue,
     Dequeue,
 }
 
 // Operation record for enqueue
 #[repr(C)]
-struct EnqueueOp {
-    op_type: OpType,
-    value: AtomicUsize,
-    seqid: AtomicU64,
-    complete: AtomicBool,
-    thread_id: usize, // Track which thread owns this op
+pub struct EnqueueOp {
+    pub op_type: OpType,
+    pub value: AtomicUsize,
+    pub seqid: AtomicU64,
+    pub complete: AtomicBool,
+    pub thread_id: usize, // Track which thread owns this op
 }
 
 impl EnqueueOp {
-    fn new(value: usize, thread_id: usize) -> Self {
+    pub fn new(value: usize, thread_id: usize) -> Self {
         Self {
             op_type: OpType::Enqueue,
             value: AtomicUsize::new(value),
@@ -110,27 +110,27 @@ impl EnqueueOp {
         }
     }
 
-    fn is_complete(&self) -> bool {
+    pub fn is_complete(&self) -> bool {
         self.complete.load(Ordering::Acquire)
     }
 
-    fn complete(&self) {
+    pub fn complete(&self) {
         self.complete.store(true, Ordering::Release);
     }
 }
 
 // Operation record for dequeue
 #[repr(C)]
-struct DequeueOp {
-    op_type: OpType,
-    result: AtomicUsize,
-    seqid: AtomicU64,
-    complete: AtomicBool,
-    thread_id: usize, // Track which thread owns this op
+pub struct DequeueOp {
+    pub op_type: OpType,
+    pub result: AtomicUsize,
+    pub seqid: AtomicU64,
+    pub complete: AtomicBool,
+    pub thread_id: usize, // Track which thread owns this op
 }
 
 impl DequeueOp {
-    fn new(thread_id: usize) -> Self {
+    pub fn new(thread_id: usize) -> Self {
         Self {
             op_type: OpType::Dequeue,
             result: AtomicUsize::new(0),
@@ -140,19 +140,19 @@ impl DequeueOp {
         }
     }
 
-    fn is_complete(&self) -> bool {
+    pub fn is_complete(&self) -> bool {
         self.complete.load(Ordering::Acquire)
     }
 
-    fn complete(&self) {
+    pub fn complete(&self) {
         self.complete.store(true, Ordering::Release);
     }
 
-    fn set_result(&self, value: usize) {
+    pub fn set_result(&self, value: usize) {
         self.result.store(value, Ordering::Release);
     }
 
-    fn get_result(&self) -> usize {
+    pub fn get_result(&self) -> usize {
         self.result.load(Ordering::Acquire)
     }
 }

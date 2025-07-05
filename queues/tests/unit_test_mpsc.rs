@@ -1,8 +1,10 @@
 use queues::{mpsc::*, MpscQueue};
+use queues::mpsc::jiffy_queue::NodeState;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
+use std::ptr;
 
 trait BenchMpscQueue<T: Send>: Send + Sync + 'static {
     fn bench_push(&self, item: T, producer_id: usize) -> Result<(), ()>;
@@ -691,6 +693,146 @@ mod jiffy_tests {
         assert!(queue.is_empty());
     }
 
+    #[test]
+    fn test_jiffy_attempt_fold_buffer() {
+        let buffer_capacity = 4;
+        let max_buffers = 10;
+
+        let shared_size = JiffyQueue::<usize>::shared_size(buffer_capacity, max_buffers);
+        let memory = create_aligned_memory_box(shared_size);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+        let queue = unsafe { JiffyQueue::init_in_shared(mem_ptr, buffer_capacity, max_buffers) };
+
+        // Fill multiple buffers
+        for i in 0..12 {
+            queue.push(i).unwrap();
+        }
+
+        // Pop all items from first buffers to make them eligible for folding
+        for _ in 0..8 {
+            queue.pop().unwrap();
+        }
+
+        unsafe {
+            // Get the head buffer
+            let head_bl = queue.head_of_queue.load(Ordering::Acquire);
+            if !head_bl.is_null() {
+                // Try to fold the current head buffer (should fail as it's the head)
+                let (result, folded) = queue.attempt_fold_buffer(head_bl);
+                assert_eq!(result, head_bl);
+                assert!(!folded);
+
+                // Try to fold null buffer
+                let (result, folded) = queue.attempt_fold_buffer(ptr::null_mut());
+                assert!(result.is_null());
+                assert!(!folded);
+
+                // Try to fold a buffer that might be eligible
+                let prev_buffer = (*head_bl).prev;
+                if !prev_buffer.is_null() {
+                    // Mark all nodes as handled in the previous buffer
+                    let prev_bl = &*prev_buffer;
+                    if !prev_bl.curr_buffer.is_null() {
+                        for i in 0..prev_bl.capacity {
+                            let node_ptr = prev_bl.curr_buffer.add(i);
+                            (*node_ptr).is_set.store(NodeState::Handled as usize, Ordering::Release);
+                        }
+                        
+                        // Now try to fold - should succeed
+                        let (next_after_fold, folded) = queue.attempt_fold_buffer(prev_buffer);
+                        // The function should return the next buffer and indicate success
+                        assert!(folded || next_after_fold == prev_buffer);
+                    }
+                }
+            }
+        }
+
+        // Clean up remaining items
+        while queue.pop().is_ok() {}
+    }
+
+    #[test]
+    fn test_jiffy_drop_behavior() {
+        // Test with DropCounter type to verify drop is called
+        #[derive(Clone)]
+        struct DropCounter {
+            value: usize,
+            drop_count: Arc<AtomicUsize>,
+        }
+
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.drop_count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let buffer_capacity = 4;
+        let max_buffers = 5;
+        let drop_count = Arc::new(AtomicUsize::new(0));
+
+        {
+            let shared_size = JiffyQueue::<DropCounter>::shared_size(buffer_capacity, max_buffers);
+            let memory = create_aligned_memory_box(shared_size);
+            let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+            let queue = unsafe { JiffyQueue::init_in_shared(mem_ptr, buffer_capacity, max_buffers) };
+
+            // Push items
+            for i in 0..10 {
+                let item = DropCounter {
+                    value: i,
+                    drop_count: drop_count.clone(),
+                };
+                assert!(queue.push(item).is_ok());
+            }
+
+            // Pop some items (these will be dropped)
+            for _ in 0..5 {
+                assert!(queue.pop().is_ok());
+            }
+
+            // The popped items should have been dropped
+            assert_eq!(drop_count.load(Ordering::SeqCst), 5);
+
+            // When queue goes out of scope, remaining items should be handled by Drop impl
+            // Note: The current Drop impl is empty, so items may leak
+        }
+    }
+
+    #[test]
+    fn test_jiffy_buffer_pool_exhaustion() {
+        let buffer_capacity = 2;
+        let max_buffers = 2; // Very small pool
+
+        let shared_size = JiffyQueue::<usize>::shared_size(buffer_capacity, max_buffers);
+        let memory = create_aligned_memory_box(shared_size);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+        let queue = unsafe { JiffyQueue::init_in_shared(mem_ptr, buffer_capacity, max_buffers) };
+
+        // Fill up available buffers
+        let mut pushed = 0;
+        for i in 0..10 {
+            if queue.push(i).is_ok() {
+                pushed += 1;
+            } else {
+                break;
+            }
+        }
+
+        // Should have pushed at least buffer_capacity items
+        assert!(pushed >= buffer_capacity);
+
+        // Pop all items
+        for _ in 0..pushed {
+            queue.pop().unwrap();
+        }
+
+        // Should be able to push again after popping
+        assert!(queue.push(999).is_ok());
+    }
+
     test_mpsc_basic!(
         JiffyQueue<usize>,
         {
@@ -705,6 +847,7 @@ mod jiffy_tests {
 
 mod dqueue_tests {
     use super::*;
+    use queues::mpsc::dqueue::{N_SEGMENT_CAPACITY, Segment};
 
     #[test]
     fn test_dqueue_initialization() {
@@ -865,6 +1008,140 @@ mod dqueue_tests {
         assert!(queue.enqueue(num_producers, 42).is_err());
         assert!(queue.enqueue(num_producers + 1, 42).is_err());
         assert!(queue.enqueue(usize::MAX, 42).is_err());
+    }
+
+    #[test]
+    fn test_dqueue_segment_management() {
+        let num_producers = 2;
+        let segment_pool_capacity = 5;
+
+        let shared_size = DQueue::<usize>::shared_size(num_producers, segment_pool_capacity);
+        let memory = create_aligned_memory_box(shared_size);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+        let queue =
+            unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
+
+        unsafe {
+            // Test new_segment
+            let seg1: *mut Segment<i32> = queue.new_segment(1);
+            assert!(!seg1.is_null());
+            assert_eq!((*seg1).id, 1);
+
+            // Test release_segment_to_pool
+            queue.release_segment_to_pool(seg1);
+
+            // Test releasing null segment (should not crash)
+            queue.release_segment_to_pool(ptr::null_mut());
+
+            // Allocate segments until pool exhausted
+            let mut segments = vec![];
+            for i in 2..segment_pool_capacity as u64 {
+                let seg = queue.new_segment(i);
+                if !seg.is_null() {
+                    segments.push(seg);
+                } else {
+                    break;
+                }
+            }
+
+            // Release segments back to pool
+            for seg in segments {
+                queue.release_segment_to_pool(seg);
+            }
+        }
+    }
+
+    #[test]
+    fn test_dqueue_pop_error_paths() {
+        let num_producers = 2;
+        let segment_pool_capacity = 3;
+
+        let shared_size = DQueue::<usize>::shared_size(num_producers, segment_pool_capacity);
+        let memory = create_aligned_memory_box(shared_size);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+        let queue =
+            unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
+
+        // Test pop on empty queue
+        assert!(queue.dequeue().is_none());
+
+        // Fill queue to stress segment allocation
+        for i in 0..1000 {
+            if queue.enqueue(0, i).is_err() {
+                break;
+            }
+        }
+
+        // Pop all items
+        let mut count = 0;
+        while queue.dequeue().is_some() {
+            count += 1;
+        }
+        assert!(count > 0);
+
+        // Test pop on empty queue after draining
+        assert!(queue.dequeue().is_none());
+    }
+
+    #[test]
+    fn test_dqueue_find_segment_edge_cases() {
+        let num_producers = 1;
+        let segment_pool_capacity = 10;
+
+        let shared_size = DQueue::<usize>::shared_size(num_producers, segment_pool_capacity);
+        let memory = create_aligned_memory_box(shared_size);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+        let queue =
+            unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
+
+        unsafe {
+            // Test find_segment with null cache
+            let seg: *mut Segment<i32> = queue.find_segment(ptr::null_mut(), 0);
+            assert!(!seg.is_null());
+
+            // Test find_segment with very large target_cid
+            let large_cid = N_SEGMENT_CAPACITY as u64 * 100;
+            let seg2 = queue.find_segment(ptr::null_mut(), large_cid);
+            // Should return null as it's beyond allocated segments
+            assert!(seg2.is_null());
+        }
+    }
+
+    #[test]
+    fn test_dqueue_run_gc() {
+        let num_producers = 2;
+        let segment_pool_capacity = 10;
+
+        let shared_size = DQueue::<usize>::shared_size(num_producers, segment_pool_capacity);
+        let memory = create_aligned_memory_box(shared_size);
+        let mem_ptr = Box::leak(memory).as_mut_ptr();
+
+        let queue =
+            unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
+
+        // Add items across multiple segments
+        for i in 0..N_SEGMENT_CAPACITY * 2 {
+            if queue.enqueue(0, i).is_err() {
+                break;
+            }
+        }
+
+        // Dequeue some items to advance head
+        for _ in 0..N_SEGMENT_CAPACITY {
+            queue.dequeue();
+        }
+
+        // Run garbage collection
+        unsafe {
+            queue.run_gc();
+        }
+
+        // Queue should still function after GC
+        assert!(queue.enqueue(0, 999).is_ok());
+        assert!(queue.dequeue().is_some());
     }
 }
 

@@ -18,7 +18,7 @@ pub const N_SEGMENT_CAPACITY: usize = 262144;
 
 #[repr(C, align(64))]
 pub struct Segment<T> {
-    id: u64,
+    pub id: u64,
     cells: *mut UnsafeCell<MaybeUninit<Option<T>>>,
     next: AtomicPtr<Segment<T>>,
     next_free: AtomicPtr<Segment<T>>,
@@ -244,7 +244,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         seg_meta_ptr
     }
 
-    unsafe fn release_segment_to_pool(&self, seg_to_free: *mut Segment<T>) {
+    pub unsafe fn release_segment_to_pool(&self, seg_to_free: *mut Segment<T>) {
         if seg_to_free.is_null() {
             return;
         }
@@ -263,7 +263,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         }
     }
 
-    unsafe fn new_segment(&self, id: u64) -> *mut Segment<T> {
+    pub unsafe fn new_segment(&self, id: u64) -> *mut Segment<T> {
         self.alloc_segment_from_pool_raw(id, false)
     }
 

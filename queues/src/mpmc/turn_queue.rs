@@ -39,7 +39,7 @@ impl<T> Node<T> {
     }
 }
 
-// Hazard pointer implementation for wait-free memory reclamation
+// Hazard pointer implementation for memory reclamation
 #[repr(C)]
 struct HazardPointers<T> {
     hp_list: *mut AtomicPtr<Node<T>>,

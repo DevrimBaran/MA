@@ -107,7 +107,7 @@ impl<T: Send + 'static> DrescherQueue<T> {
         }
     }
 
-    // ENQUEUE operation from Figure 4(b) - completely faithful to paper
+    // enqueue operation from Figure 4(b)
     pub fn push(&self, item_val: T) -> Result<(), T> {
         unsafe {
             let new_node_ptr = match self.alloc_node() {
@@ -128,7 +128,7 @@ impl<T: Send + 'static> DrescherQueue<T> {
         }
     }
 
-    // DEQUEUE operation from Figure 4(c) - following paper's logic precisely
+    // dequeue operation from Figure 4(c)
     pub fn pop(&self) -> Option<T> {
         unsafe {
             // Paper: item ← head
@@ -176,7 +176,7 @@ impl<T: Send + 'static> DrescherQueue<T> {
         }
     }
 
-    // EMPTY operation from Figure 4(d)
+    // empty operation from Figure 4(d)
     pub fn is_empty(&self) -> bool {
         unsafe {
             let head_ptr = self.head.load(Ordering::Acquire);

@@ -50,7 +50,6 @@ unsafe fn unmap_shared(ptr: *mut u8, len: usize) {
     }
 }
 
-// Implementations for existing queues remain here
 impl<T: Send + 'static + std::fmt::Debug> BenchMpscQueue<T> for DrescherQueue<T> {
     fn bench_push(&self, item: T, _producer_id: usize) -> Result<(), ()> {
         MpscQueue::push(self, item).map_err(|_| ())
@@ -217,7 +216,6 @@ where
                 producer_pids.push(child);
             }
             Err(e) => {
-                // Clean up shared memory before panicking
                 unsafe {
                     if !q_shm_ptr.is_null() {
                         unmap_shared(q_shm_ptr, q_shm_size);
@@ -240,10 +238,9 @@ where
     if total_items_to_produce > 0 {
         let mut pop_attempts_outer = 0;
         loop {
-            // Main consumption loop
             if q.bench_pop().is_ok() {
                 consumed_count += 1;
-                pop_attempts_outer = 0; // Reset attempts on successful pop
+                pop_attempts_outer = 0;
             } else {
                 pop_attempts_outer += 1;
                 if pop_attempts_outer > MAX_BENCH_SPIN_RETRY_ATTEMPTS
@@ -254,13 +251,12 @@ where
                         "Consumer exceeded max spin retry attempts for pop (producers not done)"
                     );
                 }
-                // Pop returned None or Error
+
                 let producers_done =
                     done_sync.producers_done_count.load(Ordering::Acquire) == num_producers as u32;
                 if producers_done {
-                    // Producers are done, try a final drain aggressively
                     let mut final_drain_attempts = 0;
-                    const MAX_FINAL_DRAIN_ATTEMPTS: usize = 1_000; // Can be tuned
+                    const MAX_FINAL_DRAIN_ATTEMPTS: usize = 1_000;
 
                     while consumed_count < total_items_to_produce
                         && final_drain_attempts < MAX_FINAL_DRAIN_ATTEMPTS
@@ -272,11 +268,10 @@ where
                             }
                         } else {
                             final_drain_attempts += 1;
-                            std::thread::yield_now(); // Give queue time if it was a near-miss
+                            std::thread::yield_now();
                         }
                     }
-                    // After aggressive drain attempts, if not all items consumed,
-                    // try one last pop. If it fails and queue is empty, then break.
+
                     if consumed_count < total_items_to_produce {
                         if q.bench_pop().is_err() && q.bench_is_empty() {
                             break;
@@ -318,7 +313,6 @@ where
     duration
 }
 
-// Benchmark Functions
 fn bench_drescher_mpsc(c: &mut Criterion) {
     let mut group = c.benchmark_group("DrescherMPSC");
     for &num_prods_current_run in PRODUCER_COUNTS_TO_TEST.iter().filter(|&&p| p > 0) {
@@ -330,7 +324,7 @@ fn bench_drescher_mpsc(c: &mut Criterion) {
                 b.iter_custom(|_iters| {
                     fork_and_run_mpsc::<DrescherQueue<usize>, _>(
                         || {
-                            let node_cap = total_items_run * 2; // Extra nodes for producers
+                            let node_cap = total_items_run * 2;
                             let bytes = DrescherQueue::<usize>::shared_size(node_cap);
                             let shm_ptr = unsafe { map_shared(bytes) };
                             let q = unsafe { DrescherQueue::init_in_shared(shm_ptr, node_cap) };
@@ -351,7 +345,7 @@ fn bench_jayanti_petrovic_mpsc(c: &mut Criterion) {
     for &num_prods_current_run in PRODUCER_COUNTS_TO_TEST.iter().filter(|&&p| p > 0) {
         let items_per_prod = ITEMS_PER_PRODUCER_TARGET;
         let total_items_run = num_prods_current_run * items_per_prod;
-        let node_pool_capacity = total_items_run + num_prods_current_run * 2; // Adjusted pool capacity
+        let node_pool_capacity = total_items_run + num_prods_current_run * 2;
         group.bench_function(
             format!("{}Prod_{}ItemsPer", num_prods_current_run, items_per_prod),
             |b: &mut Bencher| {

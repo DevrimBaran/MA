@@ -16,3 +16,5 @@ queues/web_scraper/path/
 queues/extract_coverage.py
 queues/extract_uncovered.py
 queues/analyze_coverage.sh
+queues/analyze_detailed_coverage.py
+queues/extract_wcq_uncovered.py

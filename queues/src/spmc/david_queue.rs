@@ -57,8 +57,8 @@ pub struct DavidQueue<T: Send + Clone + 'static> {
     // Shared state
     row: AtomicUsize,          // ROW register
     min_row: AtomicUsize,      // Minimum row that might have items
-    head_array_offset: usize,  // Offset to HEAD array
-    items_array_offset: usize, // Offset to ITEMS array
+    head_array_offset: usize,  // Offset to head array
+    items_array_offset: usize, // Offset to items array
 
     // Queue configuration
     num_consumers: usize,
@@ -157,7 +157,7 @@ impl<T: Send + Clone + 'static> DavidQueue<T> {
         ptr::read(ptr)
     }
 
-    // Enqueue operation - EXACTLY as in the paper
+    // Enqueue operation
     pub fn enqueue(&self, state: &mut EnqueuerState, item: T) -> Result<(), ()> {
         unsafe {
             // Check bounds
@@ -195,7 +195,7 @@ impl<T: Send + Clone + 'static> DavidQueue<T> {
         }
     }
 
-    // Dequeue operation - Paper's algorithm with recovery mechanism
+    // Dequeue operation - Paper's algorithm with recovery mechanism (was necessary because somehow papers synchro steps were not enough)
     pub fn dequeue(&self, _consumer_id: usize) -> Result<T, ()> {
         unsafe {
             // First try the paper's exact algorithm
@@ -272,12 +272,12 @@ impl<T: Send + Clone + 'static> DavidQueue<T> {
         let num_rows = 1500; // 1500 * 2048 = 3,072,000 cells (3x overhead)
         let item_pool_size = 1_500_000; // Pool for 1.5M items
 
-        // HEAD array
+        // head array
         let head_array_offset = queue_aligned;
         let head_array_size = num_rows * mem::size_of::<FetchIncrement>();
         let head_array_aligned = (head_array_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
-        // ITEMS array
+        // items array
         let items_array_offset = head_array_offset + head_array_aligned;
         let items_array_size = num_rows * items_per_row * mem::size_of::<SwapCell>();
         let items_array_aligned = (items_array_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
@@ -347,7 +347,6 @@ impl<T: Send + Clone + 'static> DavidQueue<T> {
 
         let total = queue_aligned + head_array_aligned + items_array_aligned + item_pool_bytes;
 
-        // About 200MB for the queue structure
         (total + 4095) & !4095
     }
 
@@ -355,9 +354,9 @@ impl<T: Send + Clone + 'static> DavidQueue<T> {
         let queue_size = mem::size_of::<Self>();
         let queue_aligned = (queue_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
-        let items_per_row = 16_384; // Larger row size for efficiency
-        let num_rows = 10000; // Increased for 15M items
-        let item_pool_size = 50_000_000; // 16M pool for 15M items with safety margin
+        let items_per_row = 16_384;
+        let num_rows = 10000;
+        let item_pool_size = 50_000_000;
 
         let head_array_size = num_rows * mem::size_of::<FetchIncrement>();
         let head_array_aligned = (head_array_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
@@ -382,18 +381,18 @@ impl<T: Send + Clone + 'static> DavidQueue<T> {
         let queue_size = mem::size_of::<Self>();
         let queue_aligned = (queue_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
-        // Configuration - sized for 15M items with safety margin
-        let items_per_row = 16_384; // Larger row size for efficiency
-        let num_rows = 10000; // Increased for 15M items
-        let item_pool_size = 50_000_000; // Pool for 16M items (15M + margin)
+        // Configuration
+        let items_per_row = 16_384;
+        let num_rows = 10000;
+        let item_pool_size = 50_000_000;
         let num_consumers = 1; // SPSC has 1 consumer
 
-        // HEAD array
+        // head array
         let head_array_offset = queue_aligned;
         let head_array_size = num_rows * mem::size_of::<FetchIncrement>();
         let head_array_aligned = (head_array_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
-        // ITEMS array
+        // items array
         let items_array_offset = head_array_offset + head_array_aligned;
         let items_array_size = num_rows * items_per_row * mem::size_of::<SwapCell>();
         let items_array_aligned = (items_array_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
@@ -426,13 +425,13 @@ impl<T: Send + Clone + 'static> DavidQueue<T> {
 
         let queue = &mut *queue_ptr;
 
-        // Initialize HEAD array
+        // Initialize head array
         let heads_ptr = mem.add(head_array_offset) as *mut FetchIncrement;
         for i in 0..num_rows {
             ptr::write(heads_ptr.add(i), FetchIncrement::new());
         }
 
-        // Initialize ITEMS array
+        // Initialize items array
         let items_ptr = mem.add(items_array_offset) as *mut SwapCell;
         for i in 0..(num_rows * items_per_row) {
             ptr::write(items_ptr.add(i), SwapCell::new());
@@ -446,7 +445,7 @@ impl<T: Send + Clone + 'static> DavidQueue<T> {
     }
 
     pub fn is_empty(&self) -> bool {
-        false // Can't reliably determine this in the paper's algorithm
+        false
     }
 }
 

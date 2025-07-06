@@ -120,7 +120,6 @@ impl<T: Send + 'static> DynListQueue<T> {
     }
 
     fn alloc_node(&self, v: T) -> Option<*mut Node<T>> {
-        // Only use cache, no heap allocation
         if let Ok(node_ptr) = self.node_cache.pop() {
             let node = node_ptr.0;
             unsafe {

@@ -69,8 +69,6 @@ impl<T> Clone for OpDesc<T> {
 // Atomic wrapper for OpDesc to ensure proper memory operations
 #[repr(C, align(64))]
 struct AtomicOpDesc<T> {
-    // We'll use a 256-bit atomic operation simulated with a mutex-like approach
-    // In practice, this would use a 128-bit CAS if available
     data: AtomicUsize, // Points to OpDesc
     version: AtomicUsize,
     _phantom: std::marker::PhantomData<T>,

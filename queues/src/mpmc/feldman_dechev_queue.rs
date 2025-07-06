@@ -11,10 +11,8 @@ const MAX_FAILS: usize = 1000;
 const EMPTY_TYPE_MASK: u64 = 1; // LSB = 1 for EmptyType
 const DELAY_MARK_MASK: u64 = 2; // Second LSB = 1 for delay marked
 const CHECK_DELAY: usize = 8; // Check for announcements every 8 operations
-
-// Increased pool sizes for better scalability
-const ITEMS_PER_THREAD: usize = 200_000; // Increased from 100_000
-const OPS_PER_THREAD: usize = 500; // Increased from 100
+const ITEMS_PER_THREAD: usize = 200_000;
+const OPS_PER_THREAD: usize = 500;
 
 // Node types stored in the ring buffer
 #[derive(Clone, Copy)]
@@ -241,7 +239,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         }
     }
 
-    // Help another thread's operation
+    // Help another processes operation
     unsafe fn help_operation(&self, op_ptr: *mut (), helper_thread_id: usize) {
         // First, determine what type of operation this is
         let op_type_ptr = op_ptr as *const OpType;
@@ -647,7 +645,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         }
     }
 
-    // Wait-free slow path for enqueue
+    // slow path for enqueue
     unsafe fn enqueue_slow_path(&self, thread_id: usize, value: usize) -> Result<(), ()> {
         // Track active operations
         self.active_enq_ops.fetch_add(1, Ordering::AcqRel);
@@ -697,7 +695,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         }
     }
 
-    // Wait-free slow path for dequeue
+    // slow path for dequeue
     unsafe fn dequeue_slow_path(&self, thread_id: usize) -> Result<T, ()> {
         // Track active operations
         self.active_deq_ops.fetch_add(1, Ordering::AcqRel);

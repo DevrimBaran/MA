@@ -1,4 +1,5 @@
 //paper in /paper/spsc/lamport.pdf and Cache‐aware design of general‐purpose Single‐Producer Single‐Consumer queues.pdf
+//implementation of lamport queue more close to lamport queue from Cache‐aware design of general‐purpose Single‐Producer Single‐Consumer queues.pdf
 use crate::SpscQueue;
 use std::{
     cell::UnsafeCell,

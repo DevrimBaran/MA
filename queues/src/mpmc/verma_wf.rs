@@ -126,7 +126,7 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
         index + 1
     }
 
-    // Helper thread main loop - MUST be called from a dedicated process/thread
+    // Helper process main loop - MUST be called from a dedicated process/thread
     pub unsafe fn run_helper(&self) {
         let mut current_index = 0;
         self.helper_running.store(true, Ordering::Release);
@@ -180,7 +180,7 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
                 }
             }
 
-            // Move to next thread in round-robin fashion
+            // Move to next process in round-robin fashion
             current_index = (current_index + 1) % self.num_threads;
 
             // Small yield to prevent busy spinning

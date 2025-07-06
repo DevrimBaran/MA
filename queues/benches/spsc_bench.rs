@@ -9,14 +9,12 @@ use nix::{
 use std::ptr;
 use std::time::Duration;
 
-// Import all necessary queue types and the main SpscQueue trait
 use queues::{
     BQueue, BiffqQueue, BlqQueue, DynListQueue, FfqQueue, IffqQueue, LamportQueue, LlqQueue,
     MultiPushQueue, SesdJpSpscBenchWrapper, SpscQueue, UnboundedQueue,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 
-// Add constants for LLQ and BLQ
 use queues::spsc::blq::K_CACHE_LINE_SLOTS as BLQ_K_SLOTS;
 use queues::spsc::llq::K_CACHE_LINE_SLOTS as LLQ_K_SLOTS;
 
@@ -25,14 +23,11 @@ const RING_CAP: usize = 524_288;
 const ITERS: usize = 35_000_000;
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 1_000_000_000;
 
-// Helper trait for benchmarking for SpscQueue error types
-// from what fork_and_run expects (Result<(), ()> and Result<T, ()>).
 trait BenchSpscQueue<T: Send>: Send + Sync + 'static {
     fn bench_push(&self, item: T) -> Result<(), ()>;
     fn bench_pop(&self) -> Result<T, ()>;
 }
 
-// mmap / munmap helpers
 unsafe fn map_shared(bytes: usize) -> *mut u8 {
     let ptr = libc::mmap(
         std::ptr::null_mut(),
@@ -200,8 +195,7 @@ fn bench_mp(c: &mut Criterion) {
 fn bench_dspsc(c: &mut Criterion) {
     c.bench_function("dSPSC", |b| {
         b.iter_custom(|_iters| {
-            // For dSPSC: need ITERS + 1 nodes for the benchmark
-            let nodes_needed = ITERS + 1; // +1 for dummy node
+            let nodes_needed = ITERS + 1;
             let bytes = DynListQueue::<usize>::shared_size(RING_CAP, nodes_needed);
             let shm_ptr = unsafe { map_shared(bytes) };
             let q = unsafe { DynListQueue::init_in_shared(shm_ptr, RING_CAP, nodes_needed) };
@@ -219,9 +213,7 @@ fn bench_dspsc(c: &mut Criterion) {
 fn bench_unbounded(c: &mut Criterion) {
     c.bench_function("uSPSC", |b| {
         b.iter_custom(|_iters| {
-            // For uSPSC: calculate how many segments we need
-            // Each segment holds RING_CAP items
-            let segments_needed = (ITERS + RING_CAP - 1) / RING_CAP + 2; // +2 for safety
+            let segments_needed = (ITERS + RING_CAP - 1) / RING_CAP + 2;
 
             let size = UnboundedQueue::<usize>::shared_size(RING_CAP, segments_needed);
             let shm_ptr = unsafe { map_shared(size) };
@@ -241,7 +233,7 @@ fn bench_iffq(c: &mut Criterion) {
     c.bench_function("Iffq", |b| {
         b.iter_custom(|_iters| {
             assert!(RING_CAP.is_power_of_two());
-            // H_PARTITION_SIZE is 32 in iffq.rs
+
             assert_eq!(
                 RING_CAP % 32,
                 0,
@@ -270,7 +262,7 @@ fn bench_biffq(c: &mut Criterion) {
     c.bench_function("Biffq", |b| {
         b.iter_custom(|_iters| {
             assert!(RING_CAP.is_power_of_two());
-            // H_PARTITION_SIZE is 32 in biffq.rs
+
             assert_eq!(
                 RING_CAP % 32,
                 0,
@@ -298,7 +290,6 @@ fn bench_biffq(c: &mut Criterion) {
 fn bench_ffq(c: &mut Criterion) {
     c.bench_function("FFq", |b| {
         b.iter_custom(|_iters| {
-            // FFQ does not have H_PARTITION_SIZE constraints, only power of two for capacity.
             assert!(RING_CAP.is_power_of_two() && RING_CAP > 0);
 
             let bytes = FfqQueue::<usize>::shared_size(RING_CAP);
@@ -318,7 +309,6 @@ fn bench_ffq(c: &mut Criterion) {
 fn bench_llq(c: &mut Criterion) {
     c.bench_function("Llq", |b| {
         b.iter_custom(|_iters| {
-            // Ensure capacity is valid for LLQ
             let current_ring_cap = if RING_CAP <= LLQ_K_SLOTS {
                 let min_valid_cap = (LLQ_K_SLOTS + 1).next_power_of_two();
                 if min_valid_cap < 16 {
@@ -350,7 +340,6 @@ fn bench_llq(c: &mut Criterion) {
 fn bench_blq(c: &mut Criterion) {
     c.bench_function("Blq", |b| {
         b.iter_custom(|_iters| {
-            // Ensure capacity is valid for BLQ
             let current_ring_cap = if RING_CAP <= BLQ_K_SLOTS {
                 let mut min_valid_cap = (BLQ_K_SLOTS + 1).next_power_of_two();
                 if min_valid_cap <= BLQ_K_SLOTS {
@@ -388,7 +377,7 @@ fn bench_blq(c: &mut Criterion) {
 fn bench_sesd_jp(c: &mut Criterion) {
     c.bench_function("SesdJpSPSC", |b| {
         b.iter_custom(|_iters| {
-            let pool_capacity = ITERS + 1000; // Extra buffer for safety
+            let pool_capacity = ITERS + 1000;
 
             let bytes = SesdJpSpscBenchWrapper::<usize>::shared_size(pool_capacity);
             let shm_ptr = unsafe { map_shared(bytes) };
@@ -430,14 +419,12 @@ where
     let sync_atomic_flag = unsafe { &*(sync_shm as *const AtomicU32) };
     sync_atomic_flag.store(0, Ordering::Relaxed);
 
-    // Determine queue type more safely
     let queue_type_name = std::any::type_name::<Q>();
     let needs_special_sync =
         queue_type_name.contains("DynListQueue") || queue_type_name.contains("UnboundedQueue");
 
     match unsafe { fork() }.expect("fork failed") {
         ForkResult::Child => {
-            // Producer
             sync_atomic_flag.store(1, Ordering::Release);
             while sync_atomic_flag.load(Ordering::Acquire) < 2 {
                 std::hint::spin_loop();
@@ -453,22 +440,18 @@ where
                     std::hint::spin_loop();
                 }
 
-                // For dSPSC/uSPSC, add extra synchronization every N items
                 if needs_special_sync && i > 0 && i % 1000 == 0 {
-                    // Force memory synchronization
                     std::sync::atomic::fence(Ordering::SeqCst);
-                    // Small delay to allow consumer to catch up
+
                     for _ in 0..10 {
                         std::hint::spin_loop();
                     }
                 }
             }
 
-            // Handle special flush requirements for queues with local buffers
             if let Some(mp_queue) =
                 (q as &dyn std::any::Any).downcast_ref::<MultiPushQueue<usize>>()
             {
-                // Flush MultiPushQueue's local buffer
                 for _attempt in 0..1000 {
                     if mp_queue.local_count.load(Ordering::Relaxed) == 0 {
                         break;
@@ -489,7 +472,6 @@ where
             } else if let Some(biffq_queue) =
                 (q as &dyn std::any::Any).downcast_ref::<BiffqQueue<usize>>()
             {
-                // Flush BiffqQueue's local buffer
                 for _attempt in 0..1000 {
                     if biffq_queue.flush_producer_buffer().is_ok() {
                         break;
@@ -498,10 +480,9 @@ where
                 }
             }
 
-            // Final synchronization for dSPSC/uSPSC
             if needs_special_sync {
                 std::sync::atomic::fence(Ordering::SeqCst);
-                // Wait a bit to ensure all writes are visible
+
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
 
@@ -509,14 +490,12 @@ where
             unsafe { libc::_exit(0) };
         }
         ForkResult::Parent { child } => {
-            // Consumer
             while sync_atomic_flag.load(Ordering::Acquire) < 1 {
                 std::hint::spin_loop();
             }
 
             sync_atomic_flag.store(2, Ordering::Release);
 
-            // Wait for producer to acknowledge consumer is ready
             while sync_atomic_flag.load(Ordering::Acquire) < 2 {
                 std::hint::spin_loop();
             }
@@ -527,7 +506,6 @@ where
             let mut consecutive_failures = 0;
 
             while consumed_count < ITERS {
-                // Check if producer is done
                 let producer_done = sync_atomic_flag.load(Ordering::Acquire) == 3;
 
                 if let Ok(_item) = q.bench_pop() {
@@ -538,17 +516,13 @@ where
                     pop_spin_attempts += 1;
                     consecutive_failures += 1;
 
-                    // For dSPSC/uSPSC, add aggressive synchronization when stuck
                     if needs_special_sync && consecutive_failures > 100 {
                         std::sync::atomic::fence(Ordering::SeqCst);
                         std::thread::yield_now();
                         consecutive_failures = 0;
                     }
 
-                    // If producer is done and we've had many consecutive failures,
-                    // try a few more times with delays
                     if producer_done && consecutive_failures > 1000 {
-                        // Final attempt with aggressive synchronization
                         for _ in 0..100 {
                             std::sync::atomic::fence(Ordering::SeqCst);
                             std::thread::sleep(std::time::Duration::from_micros(10));
@@ -559,7 +533,6 @@ where
                             }
                         }
 
-                        // If still failing, we're done
                         if consumed_count < ITERS {
                             break;
                         }
@@ -577,7 +550,6 @@ where
 
             let duration = start_time.elapsed();
 
-            // Wait for child to properly exit
             while sync_atomic_flag.load(Ordering::Acquire) != 3 {
                 std::hint::spin_loop();
             }
@@ -600,7 +572,6 @@ where
     }
 }
 
-// Criterion setup with same parameters as your old benchmark
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(2))

@@ -184,7 +184,7 @@ impl MpmcStartupSync {
 struct MpmcDoneSync {
     producers_done: AtomicU32,
     consumers_done: AtomicU32,
-    total_consumed: AtomicUsize, // Add this to track total consumed items
+    total_consumed: AtomicUsize,
 }
 
 impl MpmcDoneSync {
@@ -239,34 +239,27 @@ where
     let mut consumer_pids = Vec::with_capacity(num_consumers);
     let mut helper_pid = None;
 
-    // Detect queue types
     let queue_type_name = std::any::type_name::<Q>();
     let is_wcq = queue_type_name.contains("WCQueue");
 
-    // Fork helper process if needed - counts as a participant in startup sync
     if needs_helper && !is_wcq {
-        // WCQ doesn't need external helper
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
-                // Helper process - pin to last core
                 #[cfg(target_os = "linux")]
                 unsafe {
                     use libc::{cpu_set_t, sched_setaffinity, CPU_SET, CPU_ZERO};
                     let mut set = std::mem::zeroed::<cpu_set_t>();
                     CPU_ZERO(&mut set);
-                    CPU_SET(num_producers + num_consumers, &mut set); // Use core after all workers
+                    CPU_SET(num_producers + num_consumers, &mut set);
                     sched_setaffinity(0, std::mem::size_of::<cpu_set_t>(), &set);
                 }
 
-                // Signal helper is ready
                 startup_sync.producers_ready.fetch_add(1, Ordering::AcqRel);
 
-                // Wait for go signal like other processes
                 while !startup_sync.go_signal.load(Ordering::Acquire) {
                     std::hint::spin_loop();
                 }
 
-                // Run helper loop
                 unsafe {
                     let wf_queue = &*(q as *const _ as *const WFQueue<usize>);
                     wf_queue.run_helper();
@@ -290,7 +283,6 @@ where
         }
     }
 
-    // Fork producers
     for producer_id in 0..num_producers {
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
@@ -304,7 +296,6 @@ where
                 for i in 0..items_per_process {
                     let item_value = producer_id * items_per_process + i;
 
-                    // WCQ uses producer_id directly, others might need adjustment
                     let thread_id = producer_id;
 
                     while q.bench_push(item_value, thread_id).is_err() {
@@ -338,7 +329,6 @@ where
         }
     }
 
-    // Fork consumers - with queue-specific handling
     for consumer_id in 0..num_consumers {
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
@@ -357,7 +347,6 @@ where
                 };
                 let my_target = target_items + extra_items;
 
-                // WCQ-specific consumer handling
                 if is_wcq {
                     let mut consecutive_empty = 0;
                     let mut total_attempts = 0;
@@ -371,7 +360,6 @@ where
 
                         total_attempts += 1;
 
-                        // WCQ expects consumer thread_id from num_producers to num_producers + num_consumers - 1
                         let thread_id = num_producers + consumer_id;
 
                         match q.bench_pop(thread_id) {
@@ -408,7 +396,6 @@ where
                                     }
                                 }
 
-                                // Adaptive backoff
                                 if consecutive_empty < 100 {
                                     std::hint::spin_loop();
                                 } else if consecutive_empty < 1000 {
@@ -426,7 +413,6 @@ where
                         }
                     }
                 } else {
-                    // Standard consumer logic for other queues
                     let mut consecutive_empty_checks = 0;
                     const MAX_CONSECUTIVE_EMPTY_CHECKS: usize = 40000;
 
@@ -437,14 +423,11 @@ where
                                 consecutive_empty_checks = 0;
                             }
                             Err(_) => {
-                                // Only count it as truly empty if all producers are done
-                                // AND we've waited a reasonable time for propagation
                                 if done_sync.producers_done.load(Ordering::Acquire)
                                     == num_producers as u32
                                 {
                                     consecutive_empty_checks += 1;
 
-                                    // Give more time for propagation
                                     if consecutive_empty_checks < 100 {
                                         std::thread::sleep(std::time::Duration::from_micros(1));
                                     } else if consecutive_empty_checks
@@ -453,7 +436,7 @@ where
                                         break;
                                     }
                                 }
-                                // Don't yield immediately - spin a bit first
+
                                 for _ in 0..100 {
                                     std::hint::spin_loop();
                                 }
@@ -462,7 +445,6 @@ where
                     }
                 }
 
-                // Add this consumer's count to the total
                 done_sync
                     .total_consumed
                     .fetch_add(consumed_count, Ordering::AcqRel);
@@ -486,9 +468,8 @@ where
         }
     }
 
-    // Wait for all workers AND helper to be ready
     let expected_producers = if needs_helper && !is_wcq {
-        num_producers as u32 + 1 // +1 for helper counted as producer
+        num_producers as u32 + 1
     } else {
         num_producers as u32
     };
@@ -499,23 +480,19 @@ where
         std::hint::spin_loop();
     }
 
-    // START TIMING HERE - all processes are ready
     let start_time = std::time::Instant::now();
     startup_sync.go_signal.store(true, Ordering::Release);
 
-    // Wait for producers
     for pid in producer_pids {
         waitpid(pid, None).expect("waitpid for producer failed");
     }
 
-    // Wait for consumers
     for pid in consumer_pids {
         waitpid(pid, None).expect("waitpid for consumer failed");
     }
 
     let duration = start_time.elapsed();
 
-    // Wait for helper if it exists
     if let Some(helper_pid) = helper_pid {
         unsafe {
             let wf_queue = &*(q as *const _ as *const WFQueue<usize>);
@@ -524,7 +501,6 @@ where
         waitpid(helper_pid, None).expect("waitpid for helper failed");
     }
 
-    // Get the total consumed count
     let total_consumed = done_sync.total_consumed.load(Ordering::Acquire);
 
     if total_consumed != total_items {
@@ -549,7 +525,6 @@ where
     duration
 }
 
-// Add benchmark function
 fn bench_wf_queue(c: &mut Criterion) {
     let mut group = c.benchmark_group("VermaMPMC");
 
@@ -571,7 +546,7 @@ fn bench_wf_queue(c: &mut Criterion) {
                         num_prods,
                         num_cons,
                         items_per_process,
-                        true, // needs_helper = true
+                        true,
                     )
                 })
             },
@@ -581,7 +556,6 @@ fn bench_wf_queue(c: &mut Criterion) {
     group.finish();
 }
 
-// Update the other benchmarks to use the new function
 fn bench_yang_crummey(c: &mut Criterion) {
     let mut group = c.benchmark_group("YangCrummeyMPMC");
 
@@ -605,7 +579,7 @@ fn bench_yang_crummey(c: &mut Criterion) {
                         num_prods,
                         num_cons,
                         items_per_process,
-                        false, // needs_helper = false
+                        false,
                     )
                 })
             },
@@ -667,7 +641,7 @@ fn bench_turn_queue(c: &mut Criterion) {
                         num_prods,
                         num_cons,
                         items_per_process,
-                        false, // needs_helper = false
+                        false,
                     )
                 })
             },
@@ -700,7 +674,7 @@ fn bench_feldman_dechev_wf_queue(c: &mut Criterion) {
                         num_prods,
                         num_cons,
                         items_per_process,
-                        false, // needs_helper = false (progress assurance is internal)
+                        false,
                     )
                 })
             },
@@ -731,7 +705,7 @@ fn bench_kogan_petrank_queue(c: &mut Criterion) {
                         num_prods,
                         num_cons,
                         items_per_process,
-                        false, // needs_helper = false (internal helping mechanism)
+                        false,
                     )
                 })
             },

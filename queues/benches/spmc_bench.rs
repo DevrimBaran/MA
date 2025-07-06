@@ -11,7 +11,7 @@ use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 const PERFORMANCE_TEST: bool = false;
-const ITEMS_PER_PRODUCER_TARGET: usize = 5_000; // Reduced for testing
+const ITEMS_PER_PRODUCER_TARGET: usize = 5_000;
 const CONSUMER_COUNTS_TO_TEST: &[usize] = &[1, 2, 4, 8, 14];
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 100_000_000;
 
@@ -43,7 +43,6 @@ unsafe fn unmap_shared(ptr: *mut u8, len: usize) {
     }
 }
 
-// Wrapper to handle DavidQueue's special enqueuer state requirement
 struct DavidQueueWrapper<T: Send + Clone + 'static> {
     queue: &'static DavidQueue<T>,
     enqueuer_state: *mut EnqueuerState,
@@ -153,27 +152,23 @@ where
 
     let mut consumer_pids = Vec::with_capacity(num_consumers);
 
-    // Fork single producer
     let producer_pid = match unsafe { fork() } {
         Ok(ForkResult::Child) => {
-            // Producer process
             #[cfg(target_os = "linux")]
             unsafe {
                 use libc::{cpu_set_t, sched_setaffinity, CPU_SET, CPU_ZERO};
                 let mut set = std::mem::zeroed::<cpu_set_t>();
                 CPU_ZERO(&mut set);
-                CPU_SET(0, &mut set); // Pin producer to core 0
+                CPU_SET(0, &mut set);
                 sched_setaffinity(0, std::mem::size_of::<cpu_set_t>(), &set);
             }
 
             startup_sync.producer_ready.store(true, Ordering::Release);
 
-            // Wait for go signal
             while !startup_sync.go_signal.load(Ordering::Acquire) {
                 std::hint::spin_loop();
             }
 
-            // Produce items
             let mut push_attempts = 0;
             let mut push_failures = 0;
             for i in 0..items_to_produce {
@@ -202,7 +197,6 @@ where
                 eprintln!("Producer: Failed to push {} items", push_failures);
             }
 
-            // Store total produced count for consumers to check
             done_sync
                 .total_produced
                 .store(items_to_produce, Ordering::Release);
@@ -222,28 +216,24 @@ where
         }
     };
 
-    // Fork consumers
     for consumer_id in 0..num_consumers {
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
-                // Consumer process
                 #[cfg(target_os = "linux")]
                 unsafe {
                     use libc::{cpu_set_t, sched_setaffinity, CPU_SET, CPU_ZERO};
                     let mut set = std::mem::zeroed::<cpu_set_t>();
                     CPU_ZERO(&mut set);
-                    CPU_SET(consumer_id + 1, &mut set); // Pin consumers to cores 1+
+                    CPU_SET(consumer_id + 1, &mut set);
                     sched_setaffinity(0, std::mem::size_of::<cpu_set_t>(), &set);
                 }
 
                 startup_sync.consumers_ready.fetch_add(1, Ordering::AcqRel);
 
-                // Wait for go signal
                 while !startup_sync.go_signal.load(Ordering::Acquire) {
                     std::hint::spin_loop();
                 }
 
-                // Consume items
                 let mut consumed_count = 0;
                 let target_items = items_to_produce / num_consumers;
                 let extra_items = if consumer_id < (items_to_produce % num_consumers) {
@@ -265,15 +255,11 @@ where
                         Err(_) => {
                             consecutive_empty += 1;
 
-                            // Check if producer is done
                             if done_sync.producer_done.load(Ordering::Acquire) {
                                 if consecutive_empty > MAX_CONSECUTIVE_EMPTY {
-                                    // Producer is done and we've had many empty attempts
-                                    // Do one final aggressive check
                                     fence(Ordering::SeqCst);
                                     std::thread::sleep(std::time::Duration::from_millis(1));
 
-                                    // Try a few more times with full synchronization
                                     let mut final_found = 0;
                                     for _ in 0..100 {
                                         match q.bench_pop(consumer_id) {
@@ -283,7 +269,6 @@ where
                                             }
                                             Err(_) => {
                                                 if final_found > 0 {
-                                                    // Found some, might be more
                                                     final_found = 0;
                                                 } else {
                                                     break;
@@ -299,7 +284,6 @@ where
                                 }
                             }
 
-                            // Adaptive backoff
                             if consecutive_empty < 100 {
                                 std::hint::spin_loop();
                             } else if consecutive_empty < 1000 {
@@ -311,7 +295,6 @@ where
                     }
                 }
 
-                // Add to total consumed
                 done_sync
                     .total_consumed
                     .fetch_add(consumed_count, Ordering::AcqRel);
@@ -335,32 +318,26 @@ where
         }
     }
 
-    // Wait for all workers to be ready
     while !startup_sync.producer_ready.load(Ordering::Acquire)
         || startup_sync.consumers_ready.load(Ordering::Acquire) < num_consumers as u32
     {
         std::hint::spin_loop();
     }
 
-    // START TIMING HERE
     let start_time = std::time::Instant::now();
     startup_sync.go_signal.store(true, Ordering::Release);
 
-    // Wait for producer
     waitpid(producer_pid, None).expect("waitpid for producer failed");
 
-    // Wait for consumers
     for pid in consumer_pids {
         waitpid(pid, None).expect("waitpid for consumer failed");
     }
 
     let duration = start_time.elapsed();
 
-    // Check results with tolerance for timing
     let total_consumed = done_sync.total_consumed.load(Ordering::Acquire);
 
     if total_consumed != items_to_produce {
-        // Wait a bit more for stragglers
         std::thread::sleep(Duration::from_millis(10));
         let final_consumed = done_sync.total_consumed.load(Ordering::Acquire);
 
@@ -398,7 +375,6 @@ fn bench_david_spmc(c: &mut Criterion) {
                         let bytes = DavidQueue::<usize>::shared_size(num_consumers);
                         let shm_ptr = unsafe { map_shared(bytes) };
 
-                        // Allocate space for enqueuer state
                         let state_size = std::mem::size_of::<EnqueuerState>();
                         let state_ptr = unsafe { map_shared(state_size) };
                         let enqueuer_state = state_ptr as *mut EnqueuerState;

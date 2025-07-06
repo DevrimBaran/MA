@@ -255,10 +255,6 @@ def download_and_parse_pdf(url):
     Download a PDF from URL, concatenate all pages, and extract an Abstract section.
     If no explicit Abstract header is found, return the first 500 chars of the full text.
     """
-    """
-    Download a PDF from URL, concatenate all pages, and extract an Abstract section.
-    If no explicit Abstract header is found, return the first 500 chars of the full text.
-    """
     try:
         resp = requests.get(url, stream=True, timeout=60, verify=False)
         resp.raise_for_status()
@@ -379,7 +375,7 @@ def download_and_parse_pdf(url):
                     break
             return re.sub(r"\s+", " ", text)
 
-        # Fallback: no Abstract header -> return entire text, stripped of newlines
+        # Fallback: no Abstract header, return entire text, stripped of newlines
         return full_text.replace("\r", " ").replace("\n", " ").strip()
 
     except Exception as e:

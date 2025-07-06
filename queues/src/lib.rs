@@ -26,9 +26,11 @@ pub use mpmc::TurnQueue;
 pub use mpmc::WCQueue;
 pub use mpmc::WFQueue;
 pub use mpmc::YangCrummeyQueue;
-pub use mpmc::feldman_dechev_queue::{Node, ValueType, EnqueueOp, DequeueOp};
-pub use mpmc::wcq_queue::{Phase2Rec, InnerWCQ, Entry, EntryPair, GlobalPair, IDX_EMPTY};
-pub use mpmc::ymc_queue::{EnqReq, DeqReq, BOTTOM, TOP};
+
+// following imports for testing purposes
+pub use mpmc::feldman_dechev_queue::{DequeueOp, EnqueueOp, Node, ValueType};
+pub use mpmc::wcq_queue::{Entry, EntryPair, GlobalPair, InnerWCQ, Phase2Rec, IDX_EMPTY};
+pub use mpmc::ymc_queue::{DeqReq, EnqReq, BOTTOM, TOP};
 
 pub use spmc::DavidQueue;
 pub use spmc::EnqueuerState;

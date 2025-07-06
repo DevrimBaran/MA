@@ -41,7 +41,6 @@ impl<T: Send + 'static> BufferPool<T> {
             return Some(buf_ptr);
         }
 
-        // In shared memory version, all buffers pre-allocated
         None
     }
 

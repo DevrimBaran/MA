@@ -65,7 +65,6 @@ impl<T: Send + 'static> FfqQueue<T> {
         // Zero out everything first
         ptr::write_bytes(mem, 0, Self::shared_size(capacity));
 
-        // Memory barrier
         std::sync::atomic::fence(Ordering::SeqCst);
 
         let queue_ptr = mem as *mut Self;
@@ -77,7 +76,6 @@ impl<T: Send + 'static> FfqQueue<T> {
             ptr::write(slot_ptr, Slot::new());
         }
 
-        // Another barrier
         std::sync::atomic::fence(Ordering::SeqCst);
 
         // Now initialize the queue structure
@@ -124,7 +122,7 @@ impl<T: Send + 'static> SpscQueue<T> for FfqQueue<T> {
         let head = self.head.load(Ordering::Relaxed);
         let slot = self.get_slot(head);
 
-        // Check if slot is empty (following FastForward paper logic)
+        // Check if slot is empty
         if slot.flag.load(Ordering::Acquire) {
             return Err(FfqPushError(item));
         }

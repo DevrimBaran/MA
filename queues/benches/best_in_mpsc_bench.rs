@@ -10,7 +10,6 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
-// Import the best-performing queue types for MPSC scenario
 use queues::{DQueue, MpscQueue, YangCrummeyQueue};
 
 const PERFORMANCE_TEST: bool = false;
@@ -18,7 +17,6 @@ const ITEMS_PER_PRODUCER_TARGET: usize = 10_000;
 const PRODUCER_COUNTS_TO_TEST: &[usize] = &[1, 2, 4, 8, 14];
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 100_000_000;
 
-// Wrapper for YangCrummeyQueue to track the number of producers
 struct YmcMpscWrapper<T: Send + Clone + 'static> {
     queue: &'static YangCrummeyQueue<T>,
     num_producers: usize,
@@ -27,7 +25,6 @@ struct YmcMpscWrapper<T: Send + Clone + 'static> {
 unsafe impl<T: Send + Clone> Send for YmcMpscWrapper<T> {}
 unsafe impl<T: Send + Clone> Sync for YmcMpscWrapper<T> {}
 
-// Helper trait for benchmarking different queue types in MPSC scenario
 trait BenchMpscQueue<T: Send>: Send + Sync + 'static {
     fn bench_push(&self, item: T, producer_id: usize) -> Result<(), ()>;
     fn bench_pop(&self) -> Result<T, ()>;
@@ -35,7 +32,6 @@ trait BenchMpscQueue<T: Send>: Send + Sync + 'static {
     fn bench_is_full(&self) -> bool;
 }
 
-// mmap / munmap helpers
 unsafe fn map_shared(bytes: usize) -> *mut u8 {
     let ptr = libc::mmap(
         ptr::null_mut(),
@@ -57,7 +53,6 @@ unsafe fn unmap_shared(ptr: *mut u8, len: usize) {
     }
 }
 
-// DQueue (MPSC) - native MPSC implementation
 impl<T: Send + Clone + 'static> BenchMpscQueue<T> for DQueue<T> {
     fn bench_push(&self, item: T, producer_id: usize) -> Result<(), ()> {
         self.enqueue(producer_id, item)
@@ -73,20 +68,18 @@ impl<T: Send + Clone + 'static> BenchMpscQueue<T> for DQueue<T> {
     }
 }
 
-// YmcMpscWrapper - YangCrummeyQueue (MPMC) testing in MPSC scenario
 impl<T: Send + Clone + 'static> BenchMpscQueue<T> for YmcMpscWrapper<T> {
     fn bench_push(&self, item: T, producer_id: usize) -> Result<(), ()> {
         self.queue.enqueue(producer_id, item)
     }
     fn bench_pop(&self) -> Result<T, ()> {
-        // Consumer uses the thread ID after all producers
         self.queue.dequeue(self.num_producers)
     }
     fn bench_is_empty(&self) -> bool {
         self.queue.is_empty()
     }
     fn bench_is_full(&self) -> bool {
-        false // YMC doesn't have a full check
+        false
     }
 }
 
@@ -198,7 +191,6 @@ where
         }
     }
 
-    // Consumer process (parent)
     while startup_sync.producers_ready_count.load(Ordering::Acquire) < num_producers as u32 {
         std::hint::spin_loop();
     }
@@ -260,9 +252,8 @@ fn bench_dqueue_native(c: &mut Criterion) {
         c.bench_function(&bench_name, |b| {
             b.iter_custom(|_iters| {
                 let queue_init = |num_prods: usize| {
-                    // Calculate segment pool capacity based on expected number of items
                     let total_items = num_prods * ITEMS_PER_PRODUCER_TARGET;
-                    let segment_pool_capacity = (total_items / 262144) + 10; // N_SEGMENT_CAPACITY is 262144
+                    let segment_pool_capacity = (total_items / 262144) + 10;
                     let bytes = DQueue::<usize>::shared_size(num_prods, segment_pool_capacity);
                     let shm_ptr = unsafe { map_shared(bytes) };
                     let q = unsafe {
@@ -284,8 +275,6 @@ fn bench_ymc_as_mpsc(c: &mut Criterion) {
         c.bench_function(&bench_name, |b| {
             b.iter_custom(|_iters| {
                 let queue_init = |num_prods: usize| {
-                    // YMC needs to know total number of threads
-                    // num_producers + 1 consumer
                     let num_threads = num_prods + 1;
                     let bytes = YangCrummeyQueue::<usize>::shared_size(num_threads);
                     let shm_ptr = unsafe { map_shared(bytes) };
@@ -309,7 +298,6 @@ fn bench_ymc_as_mpsc(c: &mut Criterion) {
     }
 }
 
-// Criterion setup
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(2))

@@ -338,7 +338,6 @@ test_queue!(FfqQueue<usize>, MIRI_MEDIUM_CAPACITY, ffq_tests);
 test_queue!(BlqQueue<usize>, MIRI_MEDIUM_CAPACITY, blq_tests);
 test_queue!(IffqQueue<usize>, MIRI_MEDIUM_CAPACITY, iffq_tests);
 
-// LlqQueue needs special handling due to different method name
 mod llq_tests {
     use super::*;
 
@@ -1556,7 +1555,6 @@ mod shared_memory_tests {
         test_multipush_shared
     );
 
-    // LlqQueue needs special handling due to different method name
     #[test]
     fn test_llq_shared() {
         let shared_size = LlqQueue::<usize>::llq_shared_size(MIRI_MEDIUM_CAPACITY);
@@ -1730,12 +1728,10 @@ mod drop_semantics_tests {
             queue.push(format!("item_{}", i)).unwrap();
         }
 
-        // Pop all items to ensure they're properly dropped
         for _ in 0..10 {
             let _ = queue.pop().unwrap();
         }
 
-        // Ensure queue is empty before memory is freed
         assert!(queue.empty());
     }
 
@@ -1943,10 +1939,9 @@ mod error_handling_tests {
     #[test]
     #[should_panic]
     fn test_lamport_invalid_capacity() {
-        let shared_size = 1024; // Use a valid size for allocation
+        let shared_size = 1024;
         let mut memory = AlignedMemory::new(shared_size, 64);
         let _ = unsafe { LamportQueue::<usize>::init_in_shared(memory.as_mut_ptr(), 15) };
-        // 15 is not power of two
     }
 
     #[test]
@@ -1981,7 +1976,6 @@ mod error_handling_tests {
             Ok(_) => panic!("Push should have failed on full queue"),
         }
 
-        // Clean up the item that was successfully pushed
         let _ = queue.pop().unwrap();
         assert!(queue.empty());
     }

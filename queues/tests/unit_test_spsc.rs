@@ -309,7 +309,6 @@ test_queue!(FfqQueue<usize>, MEDIUM_CAPACITY, ffq_tests);
 test_queue!(BlqQueue<usize>, MEDIUM_CAPACITY, blq_tests);
 test_queue!(IffqQueue<usize>, MEDIUM_CAPACITY, iffq_tests);
 
-// LlqQueue needs special handling due to different method name
 mod llq_tests {
     use super::*;
 
@@ -1477,7 +1476,6 @@ mod shared_memory_tests {
         test_multipush_shared
     );
 
-    // LlqQueue needs special handling due to different method name
     #[test]
     fn test_llq_shared() {
         let shared_size = LlqQueue::<usize>::llq_shared_size(MEDIUM_CAPACITY);
@@ -1815,10 +1813,10 @@ mod error_handling_tests {
     #[test]
     #[should_panic]
     fn test_lamport_invalid_capacity() {
-        let shared_size = 1024; // Use a valid size for allocation
+        let shared_size = 1024;
         let memory = create_aligned_memory_box(shared_size, 64);
         let mem_ptr = Box::leak(memory).as_mut_ptr();
-        let _ = unsafe { LamportQueue::<usize>::init_in_shared(mem_ptr, 15) }; // 15 is not power of two
+        let _ = unsafe { LamportQueue::<usize>::init_in_shared(mem_ptr, 15) };
     }
 
     #[test]

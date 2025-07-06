@@ -1,9 +1,9 @@
 #![cfg(miri)]
 
+use queues::mpsc::dqueue::{Segment, N_SEGMENT_CAPACITY};
 use queues::{mpsc::*, MpscQueue};
-use queues::mpsc::dqueue::{N_SEGMENT_CAPACITY, Segment};
-use std::sync::{Arc, Barrier};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
 use std::thread;
 
 const MIRI_PRODUCERS: usize = 2;
@@ -250,7 +250,6 @@ mod miri_drescher_tests {
 
         let queue = unsafe { DrescherQueue::init_in_shared(mem_ptr, 100) };
 
-        // Just push 5 elements total
         for i in 0..5 {
             queue.bench_push(i, 0).unwrap();
         }
@@ -1360,15 +1359,12 @@ mod miri_dqueue_enhanced_tests {
             unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
 
         unsafe {
-            // Test new_segment
             let seg1: *mut Segment<i32> = queue.new_segment(1);
             assert!(!seg1.is_null());
             assert_eq!((*seg1).id, 1);
 
-            // Test release_segment_to_pool
             queue.release_segment_to_pool(seg1);
 
-            // Test releasing null segment (should not crash)
             queue.release_segment_to_pool(ptr::null_mut());
         }
     }
@@ -1385,10 +1381,8 @@ mod miri_dqueue_enhanced_tests {
         let queue =
             unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
 
-        // Test pop on empty queue
         assert!(queue.dequeue().is_none());
 
-        // Add and remove items
         for i in 0..10 {
             queue.enqueue(0, i).unwrap();
         }
@@ -1403,7 +1397,6 @@ mod miri_dqueue_enhanced_tests {
         }
         assert_eq!(count, 10);
 
-        // Test pop on empty queue after draining
         assert!(queue.dequeue().is_none());
     }
 
@@ -1420,11 +1413,9 @@ mod miri_dqueue_enhanced_tests {
             unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
 
         unsafe {
-            // Test find_segment with null cache
             let seg: *mut Segment<i32> = queue.find_segment(ptr::null_mut(), 0);
             assert!(!seg.is_null());
 
-            // Test find_segment with target beyond allocated segments
             let large_cid = N_SEGMENT_CAPACITY as u64 * 10;
             let seg2 = queue.find_segment(ptr::null_mut(), large_cid);
             assert!(seg2.is_null());
@@ -1443,7 +1434,6 @@ mod miri_dqueue_enhanced_tests {
         let queue =
             unsafe { DQueue::init_in_shared(mem_ptr, num_producers, segment_pool_capacity) };
 
-        // Add items
         for i in 0..20 {
             queue.enqueue(0, i).unwrap();
         }
@@ -1452,17 +1442,14 @@ mod miri_dqueue_enhanced_tests {
             queue.dump_local_buffer(0);
         }
 
-        // Dequeue some to advance head
         for _ in 0..10 {
             queue.dequeue();
         }
 
-        // Run garbage collection
         unsafe {
             queue.run_gc();
         }
 
-        // Queue should still function
         queue.enqueue(0, 999).unwrap();
         unsafe {
             queue.dump_local_buffer(0);
@@ -1948,7 +1935,6 @@ mod miri_integration_tests {
 
         let queue = unsafe { DrescherQueue::init_in_shared(mem_ptr, 50) };
 
-        // Reduce from 3 cycles to 2, and from 10 items to 5 items per cycle
         for cycle in 0..2 {
             for i in 0..5 {
                 queue.push(cycle * 100 + i).unwrap();
@@ -1995,27 +1981,22 @@ mod miri_jiffy_enhanced_tests {
 
         let queue = unsafe { JiffyQueue::init_in_shared(mem_ptr, buffer_capacity, max_buffers) };
 
-        // Push items to fill first buffer
         for i in 0..buffer_capacity {
             queue.push(i).unwrap();
         }
 
-        // Push more to start second buffer
         for i in buffer_capacity..buffer_capacity * 2 {
             queue.push(i).unwrap();
         }
 
-        // Pop items from the first buffer
         for _ in 0..buffer_capacity / 2 {
             queue.pop().unwrap();
         }
 
-        // Push more items to trigger buffer handling
         for i in buffer_capacity * 2..buffer_capacity * 3 {
             queue.push(i).unwrap();
         }
 
-        // Verify queue still works correctly
         let mut count = 0;
         while queue.pop().is_ok() {
             count += 1;
@@ -2047,20 +2028,16 @@ mod miri_jiffy_enhanced_tests {
 
             let queue = unsafe { JiffyQueue::init_in_shared(mem_ptr, 4, 2) };
 
-            // Push items
             for i in 0..6 {
                 queue.push(DropCounter { id: i }).unwrap();
             }
 
-            // Pop some items
             for _ in 0..3 {
                 drop(queue.pop().unwrap());
             }
 
             assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 3);
         }
-        // After queue is dropped, remaining items may not be dropped 
-        // due to shared memory lifecycle
     }
 
     #[test]
@@ -2074,7 +2051,6 @@ mod miri_jiffy_enhanced_tests {
 
         let queue = unsafe { JiffyQueue::init_in_shared(mem_ptr, buffer_capacity, max_buffers) };
 
-        // Fill up available buffers
         let mut pushed = 0;
         for i in 0..10 {
             if queue.push(i).is_ok() {
@@ -2084,15 +2060,12 @@ mod miri_jiffy_enhanced_tests {
             }
         }
 
-        // Should have pushed at least buffer_capacity items
         assert!(pushed >= buffer_capacity);
 
-        // Pop all items
         for _ in 0..pushed {
             queue.pop().unwrap();
         }
 
-        // Should be able to push again after popping
         assert!(queue.push(999).is_ok());
     }
 }

@@ -1,13 +1,13 @@
 use queues::{
-    FeldmanDechevWFQueue, KPQueue, MpmcQueue, TurnQueue, WCQueue, WFQueue, YangCrummeyQueue,
-    Node, ValueType, EnqueueOp, DequeueOp, Phase2Rec, InnerWCQ, Entry, EntryPair, IDX_EMPTY,
-    EnqReq, DeqReq, BOTTOM, TOP,
+    DeqReq, DequeueOp, EnqReq, EnqueueOp, Entry, EntryPair, FeldmanDechevWFQueue, InnerWCQ,
+    KPQueue, MpmcQueue, Node, Phase2Rec, TurnQueue, ValueType, WCQueue, WFQueue, YangCrummeyQueue,
+    BOTTOM, IDX_EMPTY, TOP,
 };
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use std::cell::UnsafeCell;
 
 unsafe fn allocate_shared_memory(size: usize) -> *mut u8 {
     use std::alloc::{alloc_zeroed, Layout};
@@ -311,16 +311,13 @@ mod test_ymc_enhanced {
             let mem = allocate_shared_memory(size);
             let queue = YangCrummeyQueue::<usize>::init_in_shared(mem, num_threads);
 
-            // Test empty queue
             assert!(queue.is_empty());
             assert!(!queue.is_full());
 
-            // Add single item
             queue.push(1, 0).unwrap();
             assert!(!queue.is_empty());
-            assert!(!queue.is_full()); // YMC is always not full
+            assert!(!queue.is_full());
 
-            // Remove item
             queue.pop(0).unwrap();
             assert!(queue.is_empty());
             assert!(!queue.is_full());
@@ -333,8 +330,7 @@ mod test_ymc_enhanced {
     fn test_enq_req_methods() {
         let req = EnqReq::new();
         assert_eq!(req.val.load(Ordering::Relaxed), BOTTOM);
-        
-        // Test get_state and set_state
+
         let (pending, id) = req.get_state();
         assert!(!pending);
         assert_eq!(id, 0);
@@ -344,13 +340,11 @@ mod test_ymc_enhanced {
         assert!(pending);
         assert_eq!(id, 42);
 
-        // Test try_claim
         assert!(req.try_claim(42, 100));
         let (pending, id) = req.get_state();
         assert!(!pending);
         assert_eq!(id, 100);
 
-        // Failed claim
         assert!(!req.try_claim(42, 200));
     }
 
@@ -358,8 +352,7 @@ mod test_ymc_enhanced {
     fn test_deq_req_methods() {
         let req = DeqReq::new();
         assert_eq!(req.id.load(Ordering::Relaxed), 0);
-        
-        // Test get_state and set_state
+
         let (pending, idx) = req.get_state();
         assert!(!pending);
         assert_eq!(idx, 0);
@@ -369,13 +362,11 @@ mod test_ymc_enhanced {
         assert!(pending);
         assert_eq!(idx, 42);
 
-        // Test try_announce
         assert!(req.try_announce(42, 100));
         let (pending, idx) = req.get_state();
         assert!(pending);
         assert_eq!(idx, 100);
 
-        // Test try_complete
         assert!(req.try_complete(100));
         let (pending, idx) = req.get_state();
         assert!(!pending);
@@ -389,10 +380,9 @@ mod test_ymc_enhanced {
             let mem = allocate_shared_memory(size);
             let queue = YangCrummeyQueue::<usize>::init_in_shared_spsc(mem);
 
-            // Test basic operations
             queue.push(42, 0).unwrap();
             assert!(!queue.is_empty());
-            
+
             let val = queue.pop(1).unwrap();
             assert_eq!(val, 42);
             assert!(queue.is_empty());
@@ -414,16 +404,14 @@ mod test_ymc_enhanced {
             let success_count = Arc::new(AtomicUsize::new(0));
             let mut handles = vec![];
 
-            // Create contention to potentially trigger slow paths
             for tid in 0..num_threads {
                 let barrier_clone = barrier.clone();
                 let success_clone = success_count.clone();
                 let handle = thread::spawn(move || {
                     let q = unsafe { &*(queue_ptr as *const YangCrummeyQueue<usize>) };
-                    
+
                     barrier_clone.wait();
-                    
-                    // Rapid-fire operations to create contention and trigger slow paths
+
                     for i in 0..2000 {
                         if i % 2 == 0 {
                             if q.push(tid * 10000 + i, tid).is_ok() {
@@ -445,7 +433,6 @@ mod test_ymc_enhanced {
 
             assert!(success_count.load(Ordering::Relaxed) > 0);
 
-            // Drain remaining items
             while !queue.is_empty() {
                 let _ = queue.pop(0);
             }
@@ -456,29 +443,24 @@ mod test_ymc_enhanced {
 
     #[test]
     fn test_ymc_constants() {
-        // Test that special constants are distinct
         assert_ne!(BOTTOM, TOP);
         assert_eq!(BOTTOM, usize::MAX);
         assert_eq!(TOP, usize::MAX - 1);
-        
-        // Ensure they're not valid data values
+
         assert!(BOTTOM > 1_000_000_000);
         assert!(TOP > 1_000_000_000);
     }
 
     #[test]
     fn test_ymc_state_packing() {
-        // Test the bit packing used in state fields
         let max_id: u64 = 0x7FFFFFFFFFFFFFFF;
-        
-        // Test EnqReq state packing
+
         let req = EnqReq::new();
         req.set_state(true, max_id);
         let (pending, id) = req.get_state();
         assert!(pending);
         assert_eq!(id, max_id);
-        
-        // Test with pending = false
+
         req.set_state(false, max_id);
         let (pending, id) = req.get_state();
         assert!(!pending);
@@ -505,21 +487,17 @@ mod test_wcq_enhanced {
             let mem = allocate_shared_memory(size);
             let queue = WCQueue::<usize>::init_in_shared(mem, num_threads);
 
-            // Test empty queue
             assert!(queue.is_empty());
             assert!(!queue.is_full());
 
-            // Add single item
             queue.push(1, 0).unwrap();
             assert!(!queue.is_empty());
             assert!(!queue.is_full());
 
-            // Remove item
             queue.pop(0).unwrap();
             assert!(queue.is_empty());
             assert!(!queue.is_full());
 
-            // Try to fill queue
             let mut pushed = 0;
             for i in 0..100000 {
                 if queue.push(i, 0).is_ok() {
@@ -530,8 +508,7 @@ mod test_wcq_enhanced {
             }
 
             assert!(pushed > 0);
-            
-            // Check if queue reports as full when it cannot accept more items
+
             if queue.push(999999, 0).is_err() {
                 assert!(queue.is_full());
             }
@@ -562,7 +539,6 @@ mod test_wcq_enhanced {
 
     #[test]
     fn test_entry_and_entrypair_packing() {
-        // Test Entry creation and packing/unpacking
         let entry = Entry {
             cycle: 42,
             is_safe: true,
@@ -578,7 +554,6 @@ mod test_wcq_enhanced {
         assert_eq!(unpacked.enq, entry.enq);
         assert_eq!(unpacked.index, entry.index);
 
-        // Test special index values
         let empty_entry = Entry::new();
         assert_eq!(empty_entry.index, IDX_EMPTY);
         assert!(empty_entry.is_safe);
@@ -594,7 +569,6 @@ mod test_wcq_enhanced {
             let queue = WCQueue::<usize>::init_in_shared(mem, num_threads);
             let queue_ptr = queue as *const _ as usize;
 
-            // Fill the queue to near capacity to increase chance of slow path
             let mut count = 0;
             for i in 0..65000 {
                 if queue.push(i, 0).is_ok() {
@@ -608,16 +582,14 @@ mod test_wcq_enhanced {
             let barrier = Arc::new(std::sync::Barrier::new(num_threads));
             let mut handles = vec![];
 
-            // Create high contention to potentially trigger slow paths
             for tid in 0..num_threads {
                 let barrier_clone = barrier.clone();
                 let success_clone = success_count.clone();
                 let handle = thread::spawn(move || {
                     let q = unsafe { &*(queue_ptr as *const WCQueue<usize>) };
-                    
+
                     barrier_clone.wait();
-                    
-                    // Rapid operations to create contention
+
                     for i in 0..1000 {
                         if i % 2 == 0 {
                             if q.push(tid * 1000 + i, tid).is_ok() {
@@ -659,19 +631,25 @@ mod test_wcq_enhanced {
                 let barrier_clone = barrier.clone();
                 let handle = thread::spawn(move || {
                     let q = unsafe { &*(queue_ptr as *const WCQueue<usize>) };
-                    
+
                     barrier_clone.wait();
-                    
-                    // Mix of operations to trigger helping
+
                     for i in 0..500 {
                         match i % 4 {
-                            0 => { let _ = q.push(tid * 1000 + i, tid); }
-                            1 => { let _ = q.pop(tid); }
-                            2 => { let _ = q.is_empty(); }
-                            _ => { let _ = q.is_full(); }
+                            0 => {
+                                let _ = q.push(tid * 1000 + i, tid);
+                            }
+                            1 => {
+                                let _ = q.pop(tid);
+                            }
+                            2 => {
+                                let _ = q.is_empty();
+                            }
+                            _ => {
+                                let _ = q.is_full();
+                            }
                         }
-                        
-                        // Small delay to allow helping to occur
+
                         if i % 10 == 0 {
                             thread::yield_now();
                         }
@@ -684,7 +662,6 @@ mod test_wcq_enhanced {
                 handle.join().unwrap();
             }
 
-            // Drain queue
             while !queue.is_empty() {
                 let _ = queue.pop(0);
             }
@@ -695,7 +672,6 @@ mod test_wcq_enhanced {
 
     #[test]
     fn test_wcq_cache_remap() {
-        // Test the cache_remap function
         assert_eq!(WCQueue::<usize>::cache_remap(0, 1024), 0);
         assert_eq!(WCQueue::<usize>::cache_remap(1024, 1024), 0);
         assert_eq!(WCQueue::<usize>::cache_remap(1025, 1024), 1);
@@ -704,7 +680,6 @@ mod test_wcq_enhanced {
 
     #[test]
     fn test_wcq_cycle_calculation() {
-        // Test cycle calculation
         assert_eq!(WCQueue::<usize>::cycle(0, 1024), 0);
         assert_eq!(WCQueue::<usize>::cycle(1023, 1024), 0);
         assert_eq!(WCQueue::<usize>::cycle(1024, 1024), 1);
@@ -1068,12 +1043,10 @@ mod test_feldman_dechev_enhanced {
             let mem = allocate_shared_memory(size);
             let queue = FeldmanDechevWFQueue::<usize>::init_in_shared(mem, num_threads);
 
-            // Check initial state
             let (active_enq, active_deq) = queue.active_operations();
             assert_eq!(active_enq, 0);
             assert_eq!(active_deq, 0);
 
-            // Fill queue to trigger slow path operations
             let mut pushed = 0;
             for i in 0..200000 {
                 if queue.push(i, 0).is_err() {
@@ -1082,7 +1055,6 @@ mod test_feldman_dechev_enhanced {
                 pushed += 1;
             }
 
-            // Check active operations during concurrent access
             let queue_ptr = queue as *const _ as usize;
             let barrier = Arc::new(std::sync::Barrier::new(2));
             let barrier_clone = barrier.clone();
@@ -1090,8 +1062,7 @@ mod test_feldman_dechev_enhanced {
             let handle = thread::spawn(move || {
                 let q = unsafe { &*(queue_ptr as *const FeldmanDechevWFQueue<usize>) };
                 barrier_clone.wait();
-                
-                // Try to push when queue might be full - may trigger slow path
+
                 for _ in 0..1000 {
                     let _ = q.push(999999, 1);
                 }
@@ -1099,10 +1070,9 @@ mod test_feldman_dechev_enhanced {
 
             barrier.wait();
             thread::sleep(std::time::Duration::from_millis(10));
-            
-            // Check if any operations are active
+
             let (active_enq, active_deq) = queue.active_operations();
-            // May or may not have active operations depending on timing
+
             assert!(active_enq <= 1);
             assert!(active_deq == 0);
 
@@ -1120,21 +1090,17 @@ mod test_feldman_dechev_enhanced {
             let mem = allocate_shared_memory(size);
             let queue = FeldmanDechevWFQueue::<usize>::init_in_shared(mem, num_threads);
 
-            // Test empty queue
             assert!(queue.is_empty());
             assert!(!queue.is_full());
 
-            // Add single item
             queue.push(1, 0).unwrap();
             assert!(!queue.is_empty());
             assert!(!queue.is_full());
 
-            // Remove item
             queue.pop(0).unwrap();
             assert!(queue.is_empty());
             assert!(!queue.is_full());
 
-            // Fill queue
             let mut count = 0;
             for i in 0..200000 {
                 if queue.push(i, 0).is_err() {
@@ -1143,16 +1109,13 @@ mod test_feldman_dechev_enhanced {
                 count += 1;
             }
 
-            // Should have pushed many items
             assert!(count > 10000);
             assert!(!queue.is_empty());
-            
-            // Check if full (may or may not be completely full)
+
             let is_full_result = queue.is_full();
             let push_result = queue.push(999999, 0);
-            
+
             if is_full_result {
-                // If reports full, push should fail
                 assert!(push_result.is_err());
             }
 
@@ -1169,7 +1132,6 @@ mod test_feldman_dechev_enhanced {
             let queue = FeldmanDechevWFQueue::<usize>::init_in_shared(mem, num_threads);
             let queue_ptr = queue as *const _ as usize;
 
-            // Create high contention scenario to trigger delay marking
             let barrier = Arc::new(std::sync::Barrier::new(num_threads));
             let mut handles = vec![];
 
@@ -1177,10 +1139,9 @@ mod test_feldman_dechev_enhanced {
                 let barrier_clone = barrier.clone();
                 let handle = thread::spawn(move || {
                     let q = unsafe { &*(queue_ptr as *const FeldmanDechevWFQueue<usize>) };
-                    
+
                     barrier_clone.wait();
-                    
-                    // Rapid fire operations to create contention
+
                     for i in 0..10000 {
                         if i % 3 == 0 {
                             let _ = q.push(tid * 10000 + i, tid);
@@ -1196,7 +1157,6 @@ mod test_feldman_dechev_enhanced {
                 handle.join().unwrap();
             }
 
-            // Drain remaining items
             while !queue.is_empty() {
                 let _ = queue.pop(0);
             }
@@ -1208,36 +1168,35 @@ mod test_feldman_dechev_enhanced {
     #[test]
     fn test_operation_record_methods() {
         unsafe {
-            // Test EnqueueOp methods
-            let enq_op = std::alloc::alloc(std::alloc::Layout::new::<EnqueueOp>()) as *mut EnqueueOp;
+            let enq_op =
+                std::alloc::alloc(std::alloc::Layout::new::<EnqueueOp>()) as *mut EnqueueOp;
             std::ptr::write(enq_op, EnqueueOp::new(42, 0));
-            
+
             assert!(!(*enq_op).is_complete());
             (*enq_op).complete();
             assert!((*enq_op).is_complete());
-            
+
             std::alloc::dealloc(enq_op as *mut u8, std::alloc::Layout::new::<EnqueueOp>());
 
-            // Test DequeueOp methods
-            let deq_op = std::alloc::alloc(std::alloc::Layout::new::<DequeueOp>()) as *mut DequeueOp;
+            let deq_op =
+                std::alloc::alloc(std::alloc::Layout::new::<DequeueOp>()) as *mut DequeueOp;
             std::ptr::write(deq_op, DequeueOp::new(0));
-            
+
             assert!(!(*deq_op).is_complete());
             assert_eq!((*deq_op).get_result(), 0);
-            
+
             (*deq_op).set_result(123);
             assert_eq!((*deq_op).get_result(), 123);
-            
+
             (*deq_op).complete();
             assert!((*deq_op).is_complete());
-            
+
             std::alloc::dealloc(deq_op as *mut u8, std::alloc::Layout::new::<DequeueOp>());
         }
     }
 
     #[test]
     fn test_node_methods() {
-        // Test Node creation and methods
         let empty_node = Node::new_empty(100);
         assert!(empty_node.is_empty());
         assert!(!empty_node.is_value());
@@ -1245,28 +1204,25 @@ mod test_feldman_dechev_enhanced {
         assert_eq!(empty_node.get_seqid(), 100);
         assert!(empty_node.get_value_ptr().is_null());
 
-        // Test delay marking
         let mut delay_node = empty_node;
         delay_node.set_delay_mark();
         assert!(delay_node.is_delay_marked());
         assert!(delay_node.is_empty());
 
-        // Test value node
         unsafe {
             let value_type = Box::new(ValueType {
                 seqid: 200,
                 value: UnsafeCell::new(Some(42)),
             });
             let value_ptr = Box::into_raw(value_type);
-            
+
             let value_node = Node::new_value(value_ptr, 200);
             assert!(!value_node.is_empty());
             assert!(value_node.is_value());
             assert!(!value_node.is_delay_marked());
             assert_eq!(value_node.get_seqid(), 200);
             assert_eq!(value_node.get_value_ptr(), value_ptr);
-            
-            // Clean up
+
             let _ = Box::from_raw(value_ptr);
         }
     }

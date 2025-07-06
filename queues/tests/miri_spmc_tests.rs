@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-// Helper function to allocate aligned shared memory
 unsafe fn allocate_shared_memory(size: usize) -> *mut u8 {
     use std::alloc::{alloc_zeroed, Layout};
     let layout = Layout::from_size_align(size, 4096).unwrap();
@@ -16,7 +15,6 @@ unsafe fn allocate_shared_memory(size: usize) -> *mut u8 {
     ptr
 }
 
-// Helper function to deallocate shared memory
 unsafe fn deallocate_shared_memory(ptr: *mut u8, size: usize) {
     use std::alloc::{dealloc, Layout};
     let layout = Layout::from_size_align(size, 4096).unwrap();
@@ -33,13 +31,11 @@ fn test_spmc_basic_operations() {
         let mut enqueuer_state = EnqueuerState::new();
         let queue = DavidQueue::init_in_shared(mem, num_consumers, &mut enqueuer_state);
 
-        // Test is_empty on new queue (always returns false for David queue)
         assert!(
             !queue.is_empty(),
             "David queue always returns false for is_empty"
         );
 
-        // Test enqueue
         assert!(
             queue.enqueue(&mut enqueuer_state, 1).is_ok(),
             "Enqueue should succeed"
@@ -49,7 +45,6 @@ fn test_spmc_basic_operations() {
             "Enqueue should succeed"
         );
 
-        // Test dequeue
         match queue.dequeue(0) {
             Ok(val) => assert_eq!(val, 1, "First dequeued value should be 1"),
             Err(_) => panic!("Dequeue should succeed"),
@@ -60,7 +55,6 @@ fn test_spmc_basic_operations() {
             Err(_) => panic!("Dequeue should succeed"),
         }
 
-        // Test dequeue from empty queue
         assert!(
             queue.dequeue(0).is_err(),
             "Dequeue from empty queue should fail"
@@ -80,7 +74,6 @@ fn test_spmc_small_sequence() {
         let mut enqueuer_state = EnqueuerState::new();
         let queue = DavidQueue::init_in_shared(mem, num_consumers, &mut enqueuer_state);
 
-        // Enqueue a few items
         for i in 0..5 {
             assert!(
                 queue.enqueue(&mut enqueuer_state, i).is_ok(),
@@ -89,7 +82,6 @@ fn test_spmc_small_sequence() {
             );
         }
 
-        // Dequeue all items using different consumers
         for i in 0..5 {
             match queue.dequeue(i % num_consumers) {
                 Ok(val) => assert_eq!(val, i, "Dequeued value should be {}", i),
@@ -113,7 +105,6 @@ fn test_spmc_multiple_operations() {
         let mut enqueuer_state = EnqueuerState::new();
         let queue = DavidQueue::init_in_shared(mem, num_consumers, &mut enqueuer_state);
 
-        // Enqueue multiple items (keeping it at 10 like other tests)
         for i in 0..10 {
             assert!(
                 queue.enqueue(&mut enqueuer_state, i).is_ok(),
@@ -122,7 +113,6 @@ fn test_spmc_multiple_operations() {
             );
         }
 
-        // Dequeue all items alternating between consumers
         for i in 0..10 {
             match queue.dequeue(i % num_consumers) {
                 Ok(val) => assert_eq!(val, i, "Dequeued value should be {}", i),
@@ -146,7 +136,6 @@ fn test_spmc_consumer_id_bounds() {
         let mut enqueuer_state = EnqueuerState::new();
         let queue = DavidQueue::init_in_shared(mem, num_consumers, &mut enqueuer_state);
 
-        // Test with valid consumer IDs first
         assert!(
             queue.enqueue(&mut enqueuer_state, 42).is_ok(),
             "Enqueue should work"
@@ -156,13 +145,11 @@ fn test_spmc_consumer_id_bounds() {
             "Enqueue should work"
         );
 
-        // Test dequeue with valid IDs
         match queue.dequeue(0) {
             Ok(val) => assert!(val == 42 || val == 43, "Should dequeue valid value"),
             Err(_) => panic!("Dequeue with valid consumer ID should work"),
         }
 
-        // Test with invalid consumer ID (should still work due to recovery mechanism)
         let _ = queue.dequeue(num_consumers);
         let _ = queue.dequeue(num_consumers + 1);
 
@@ -180,10 +167,8 @@ fn test_spmc_is_full_basic() {
         let mut enqueuer_state = EnqueuerState::new();
         let queue = DavidQueue::init_in_shared(mem, num_consumers, &mut enqueuer_state);
 
-        // New queue should not be full
         assert!(!queue.is_full(), "New queue should not be full");
 
-        // Push one item and check again
         let _ = queue.enqueue(&mut enqueuer_state, 1);
         assert!(!queue.is_full(), "Queue with one item should not be full");
 
@@ -203,12 +188,10 @@ fn test_spmc_simple_concurrent() {
         let queue_ptr = queue as *const _ as usize;
         let enqueuer_state_ptr = &mut enqueuer_state as *mut EnqueuerState as usize;
 
-        // Very small numbers for Miri
         let items_to_produce = 3;
         let consumed = Arc::new(AtomicUsize::new(0));
         let mut handles = vec![];
 
-        // One producer thread
         let handle = thread::spawn(move || {
             let q = &*(queue_ptr as *const DavidQueue<usize>);
             let state = &mut *(enqueuer_state_ptr as *mut EnqueuerState);
@@ -223,7 +206,6 @@ fn test_spmc_simple_concurrent() {
         });
         handles.push(handle);
 
-        // Two consumer threads
         for consumer_id in 0..num_consumers {
             let c = Arc::clone(&consumed);
             let handle = thread::spawn(move || {
@@ -241,7 +223,6 @@ fn test_spmc_simple_concurrent() {
             handles.push(handle);
         }
 
-        // Wait for threads
         for handle in handles {
             handle.join().unwrap();
         }
@@ -279,7 +260,6 @@ fn test_spmc_concurrent_multiple_consumers() {
         );
         let mut handles = vec![];
 
-        // Producer thread
         let handle = thread::spawn(move || {
             let q = unsafe { &*(queue_ptr as *const DavidQueue<usize>) };
             let state = unsafe { &mut *(enqueuer_state_ptr as *mut EnqueuerState) };
@@ -294,7 +274,6 @@ fn test_spmc_concurrent_multiple_consumers() {
         });
         handles.push(handle);
 
-        // Consumer threads
         for consumer_id in 0..num_consumers {
             let counts = Arc::clone(&consumed_per_consumer);
             let handle = thread::spawn(move || {
@@ -314,12 +293,10 @@ fn test_spmc_concurrent_multiple_consumers() {
             handles.push(handle);
         }
 
-        // Wait for all threads
         for handle in handles {
             handle.join().unwrap();
         }
 
-        // Verify total consumption
         let total_consumed: usize = consumed_per_consumer
             .iter()
             .map(|c| c.load(Ordering::Relaxed))
@@ -331,7 +308,6 @@ fn test_spmc_concurrent_multiple_consumers() {
     }
 }
 
-// Test specific to David queue's recovery mechanism
 #[test]
 fn test_spmc_recovery_mechanism() {
     unsafe {
@@ -342,20 +318,16 @@ fn test_spmc_recovery_mechanism() {
         let mut enqueuer_state = EnqueuerState::new();
         let queue = DavidQueue::init_in_shared(mem, num_consumers, &mut enqueuer_state);
 
-        // Enqueue items in multiple rows
         for i in 0..5 {
             assert!(queue.enqueue(&mut enqueuer_state, i).is_ok());
         }
 
-        // Force advancement to next row by filling current row
-        // This tests the row transition logic
         while enqueuer_state.enq_row == 0 {
             if queue.enqueue(&mut enqueuer_state, 999).is_err() {
                 break;
             }
         }
 
-        // Now dequeue - should still get items from previous rows
         let mut found = Vec::new();
         for _ in 0..10 {
             if let Ok(val) = queue.dequeue(0) {
@@ -365,7 +337,6 @@ fn test_spmc_recovery_mechanism() {
             }
         }
 
-        // Should have found at least some of the original items
         assert!(!found.is_empty(), "Should recover items from previous rows");
 
         deallocate_shared_memory(mem, size);
@@ -381,7 +352,6 @@ fn test_spmc_spsc_variant() {
         let mut enqueuer_state = EnqueuerState::new();
         let queue = DavidQueue::init_in_shared_spsc(mem, &mut enqueuer_state);
 
-        // Test basic SPSC operations
         assert!(queue.enqueue(&mut enqueuer_state, 42).is_ok());
         assert!(queue.enqueue(&mut enqueuer_state, 43).is_ok());
 
@@ -403,9 +373,7 @@ fn test_spmc_stress_small() {
         let mut enqueuer_state = EnqueuerState::new();
         let queue = DavidQueue::init_in_shared(mem, num_consumers, &mut enqueuer_state);
 
-        // Small stress test suitable for Miri
         for cycle in 0..3 {
-            // Enqueue batch
             for i in 0..5 {
                 assert!(
                     queue.enqueue(&mut enqueuer_state, cycle * 100 + i).is_ok(),
@@ -413,14 +381,12 @@ fn test_spmc_stress_small() {
                 );
             }
 
-            // Dequeue batch
             for i in 0..5 {
                 let consumer_id = i % num_consumers;
                 assert!(queue.dequeue(consumer_id).is_ok(), "Dequeue should succeed");
             }
         }
 
-        // Queue should be empty
         assert!(queue.dequeue(0).is_err());
 
         deallocate_shared_memory(mem, size);
@@ -437,15 +403,12 @@ fn test_spmc_edge_cases() {
         let mut enqueuer_state = EnqueuerState::new();
         let queue = DavidQueue::init_in_shared(mem, num_consumers, &mut enqueuer_state);
 
-        // Test empty dequeue
         assert!(queue.dequeue(0).is_err());
 
-        // Test single item
         assert!(queue.enqueue(&mut enqueuer_state, 1).is_ok());
         assert_eq!(queue.dequeue(0).unwrap(), 1);
         assert!(queue.dequeue(0).is_err());
 
-        // Test alternating enqueue/dequeue
         for i in 0..5 {
             assert!(queue.enqueue(&mut enqueuer_state, i).is_ok());
             assert_eq!(queue.dequeue(0).unwrap(), i);

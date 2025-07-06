@@ -2243,3 +2243,464 @@ fn test_comprehensive_drop_semantics() {
         assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 5);
     }
 }
+
+#[cfg(unix)]
+mod ipc_tests {
+    use super::*;
+    use nix::{
+        libc,
+        sys::wait::waitpid,
+        unistd::{fork, ForkResult},
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    unsafe fn map_shared(bytes: usize) -> *mut u8 {
+        let page_size = 4096;
+        let aligned_size = (bytes + page_size - 1) & !(page_size - 1);
+
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            aligned_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if ptr == libc::MAP_FAILED {
+            panic!("mmap failed: {}", std::io::Error::last_os_error());
+        }
+
+        std::ptr::write_bytes(ptr as *mut u8, 0, aligned_size);
+
+        ptr.cast()
+    }
+
+    unsafe fn unmap_shared(ptr: *mut u8, len: usize) {
+        let page_size = 4096;
+        let aligned_size = (len + page_size - 1) & !(page_size - 1);
+
+        if libc::munmap(ptr.cast(), aligned_size) == -1 {
+            panic!("munmap failed: {}", std::io::Error::last_os_error());
+        }
+    }
+
+    // Helper struct for IPC synchronization with proper alignment
+    #[repr(C)]
+    struct IpcSync {
+        producer_ready: AtomicBool,
+        _pad1: [u8; 7], // Padding to ensure consumer_ready is aligned
+        consumer_ready: AtomicBool,
+        _pad2: [u8; 7], // Padding to ensure items_consumed is 8-byte aligned
+        items_consumed: AtomicUsize,
+    }
+
+    impl IpcSync {
+        unsafe fn from_ptr(ptr: *mut u8) -> &'static Self {
+            &*(ptr as *const Self)
+        }
+    }
+
+    #[test]
+    fn test_drescher_ipc() {
+        let expected_nodes = 10000;
+        let shared_size = DrescherQueue::<usize>::shared_size(expected_nodes);
+        let sync_size = std::mem::size_of::<IpcSync>();
+        let sync_size = (sync_size + 63) & !63;
+        let total_size = shared_size + sync_size;
+
+        let shm_ptr = unsafe { map_shared(total_size) };
+
+        let sync = unsafe { IpcSync::from_ptr(shm_ptr) };
+        sync.producer_ready.store(false, Ordering::SeqCst);
+        sync.consumer_ready.store(false, Ordering::SeqCst);
+        sync.items_consumed.store(0, Ordering::SeqCst);
+
+        let queue_ptr = unsafe { shm_ptr.add(sync_size) };
+        let queue = unsafe { DrescherQueue::init_in_shared(queue_ptr, expected_nodes) };
+
+        const NUM_ITEMS: usize = 5000;
+
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                sync.producer_ready.store(true, Ordering::Release);
+                while !sync.consumer_ready.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+
+                for i in 0..NUM_ITEMS {
+                    let mut retries = 0;
+                    loop {
+                        match queue.push(i) {
+                            Ok(_) => break,
+                            Err(_) => {
+                                retries += 1;
+                                if retries > 10000 {
+                                    eprintln!("Producer: Excessive retries at item {}", i);
+                                }
+                                std::thread::yield_now();
+                            }
+                        }
+                    }
+                }
+
+                unsafe { libc::_exit(0) };
+            }
+            Ok(ForkResult::Parent { child }) => {
+                while !sync.producer_ready.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                sync.consumer_ready.store(true, Ordering::Release);
+
+                let mut received = Vec::new();
+                let mut empty_count = 0;
+
+                while received.len() < NUM_ITEMS {
+                    match queue.pop() {
+                        Some(item) => {
+                            received.push(item);
+                            empty_count = 0;
+                        }
+                        None => {
+                            empty_count += 1;
+                            if empty_count > 1000000 {
+                                break;
+                            }
+                            std::thread::yield_now();
+                        }
+                    }
+                }
+
+                sync.items_consumed.store(received.len(), Ordering::SeqCst);
+
+                waitpid(child, None).expect("waitpid failed");
+
+                let consumed = sync.items_consumed.load(Ordering::SeqCst);
+                assert_eq!(
+                    consumed, NUM_ITEMS,
+                    "Not all items were consumed in IPC test"
+                );
+
+                for (i, &item) in received.iter().enumerate() {
+                    assert_eq!(item, i, "Items received out of order");
+                }
+
+                unsafe {
+                    unmap_shared(shm_ptr, total_size);
+                }
+            }
+            Err(e) => {
+                unsafe {
+                    unmap_shared(shm_ptr, total_size);
+                }
+                panic!("Fork failed: {}", e);
+            }
+        }
+    }
+
+    #[test]
+    fn test_jiffy_ipc() {
+        let buffer_capacity = 256;
+        let max_buffers = 50;
+        let shared_size = JiffyQueue::<usize>::shared_size(buffer_capacity, max_buffers);
+        let sync_size = std::mem::size_of::<IpcSync>();
+        let sync_size = (sync_size + 63) & !63;
+        let total_size = shared_size + sync_size;
+
+        let shm_ptr = unsafe { map_shared(total_size) };
+
+        let sync = unsafe { IpcSync::from_ptr(shm_ptr) };
+        sync.producer_ready.store(false, Ordering::SeqCst);
+        sync.consumer_ready.store(false, Ordering::SeqCst);
+        sync.items_consumed.store(0, Ordering::SeqCst);
+
+        let queue_ptr = unsafe { shm_ptr.add(sync_size) };
+        let queue = unsafe { JiffyQueue::init_in_shared(queue_ptr, buffer_capacity, max_buffers) };
+
+        const NUM_ITEMS: usize = 5000;
+
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                sync.producer_ready.store(true, Ordering::Release);
+                while !sync.consumer_ready.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+
+                for i in 0..NUM_ITEMS {
+                    let mut retries = 0;
+                    loop {
+                        match queue.push(i) {
+                            Ok(_) => break,
+                            Err(_) => {
+                                retries += 1;
+                                if retries > 10000 {
+                                    eprintln!("Producer: Excessive retries at item {}", i);
+                                    break;
+                                }
+                                std::thread::yield_now();
+                            }
+                        }
+                    }
+                }
+
+                unsafe { libc::_exit(0) };
+            }
+            Ok(ForkResult::Parent { child }) => {
+                while !sync.producer_ready.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                sync.consumer_ready.store(true, Ordering::Release);
+
+                let mut received = Vec::new();
+                let mut empty_count = 0;
+
+                while received.len() < NUM_ITEMS {
+                    match queue.pop() {
+                        Ok(item) => {
+                            received.push(item);
+                            empty_count = 0;
+                        }
+                        Err(_) => {
+                            empty_count += 1;
+                            if empty_count > 1000000 {
+                                break;
+                            }
+                            std::thread::yield_now();
+                        }
+                    }
+                }
+
+                sync.items_consumed.store(received.len(), Ordering::SeqCst);
+
+                waitpid(child, None).expect("waitpid failed");
+
+                let consumed = sync.items_consumed.load(Ordering::SeqCst);
+                assert_eq!(
+                    consumed, NUM_ITEMS,
+                    "Not all items were consumed in IPC test"
+                );
+
+                for (i, &item) in received.iter().enumerate() {
+                    assert_eq!(item, i, "Items received out of order");
+                }
+
+                unsafe {
+                    unmap_shared(shm_ptr, total_size);
+                }
+            }
+            Err(e) => {
+                unsafe {
+                    unmap_shared(shm_ptr, total_size);
+                }
+                panic!("Fork failed: {}", e);
+            }
+        }
+    }
+
+    #[test]
+    fn test_jayanti_petrovic_ipc() {
+        let num_producers = 2;
+        let node_pool_capacity = 10000;
+        let shared_size =
+            JayantiPetrovicMpscQueue::<usize>::shared_size(num_producers, node_pool_capacity);
+        let sync_size = std::mem::size_of::<IpcSync>();
+        let sync_size = (sync_size + 63) & !63;
+        let total_size = shared_size + sync_size;
+
+        let shm_ptr = unsafe { map_shared(total_size) };
+
+        let sync = unsafe { IpcSync::from_ptr(shm_ptr) };
+        sync.producer_ready.store(false, Ordering::SeqCst);
+        sync.consumer_ready.store(false, Ordering::SeqCst);
+        sync.items_consumed.store(0, Ordering::SeqCst);
+
+        let queue_ptr = unsafe { shm_ptr.add(sync_size) };
+        let queue = unsafe {
+            JayantiPetrovicMpscQueue::init_in_shared(queue_ptr, num_producers, node_pool_capacity)
+        };
+
+        const NUM_ITEMS: usize = 1000;
+
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                sync.producer_ready.store(true, Ordering::Release);
+                while !sync.consumer_ready.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+
+                for i in 0..NUM_ITEMS {
+                    let producer_id = i % num_producers;
+                    let mut retries = 0;
+                    loop {
+                        match queue.enqueue(producer_id, i) {
+                            Ok(_) => break,
+                            Err(_) => {
+                                retries += 1;
+                                if retries > 10000 {
+                                    eprintln!("Producer: Excessive retries at item {}", i);
+                                }
+                                std::thread::yield_now();
+                            }
+                        }
+                    }
+                }
+
+                unsafe { libc::_exit(0) };
+            }
+            Ok(ForkResult::Parent { child }) => {
+                while !sync.producer_ready.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                sync.consumer_ready.store(true, Ordering::Release);
+
+                let mut received = Vec::new();
+                let mut empty_count = 0;
+
+                while received.len() < NUM_ITEMS {
+                    match queue.dequeue() {
+                        Some(item) => {
+                            received.push(item);
+                            empty_count = 0;
+                        }
+                        None => {
+                            empty_count += 1;
+                            if empty_count > 1000000 {
+                                break;
+                            }
+                            std::thread::yield_now();
+                        }
+                    }
+                }
+
+                sync.items_consumed.store(received.len(), Ordering::SeqCst);
+
+                waitpid(child, None).expect("waitpid failed");
+
+                let consumed = sync.items_consumed.load(Ordering::SeqCst);
+                assert_eq!(
+                    consumed, NUM_ITEMS,
+                    "Not all items were consumed in IPC test"
+                );
+
+                received.sort();
+                for (i, &item) in received.iter().enumerate() {
+                    assert_eq!(item, i, "Missing or duplicate items");
+                }
+
+                unsafe {
+                    unmap_shared(shm_ptr, total_size);
+                }
+            }
+            Err(e) => {
+                unsafe {
+                    unmap_shared(shm_ptr, total_size);
+                }
+                panic!("Fork failed: {}", e);
+            }
+        }
+    }
+
+    #[test]
+    fn test_dqueue_ipc() {
+        let num_producers = 2;
+        let segment_pool_capacity = 20;
+        let shared_size = DQueue::<usize>::shared_size(num_producers, segment_pool_capacity);
+        let sync_size = std::mem::size_of::<IpcSync>();
+        let sync_size = (sync_size + 63) & !63;
+        let total_size = shared_size + sync_size;
+
+        let shm_ptr = unsafe { map_shared(total_size) };
+
+        let sync = unsafe { IpcSync::from_ptr(shm_ptr) };
+        sync.producer_ready.store(false, Ordering::SeqCst);
+        sync.consumer_ready.store(false, Ordering::SeqCst);
+        sync.items_consumed.store(0, Ordering::SeqCst);
+
+        let queue_ptr = unsafe { shm_ptr.add(sync_size) };
+        let queue =
+            unsafe { DQueue::init_in_shared(queue_ptr, num_producers, segment_pool_capacity) };
+
+        const NUM_ITEMS: usize = 1000;
+
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                sync.producer_ready.store(true, Ordering::Release);
+                while !sync.consumer_ready.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+
+                for i in 0..NUM_ITEMS {
+                    let producer_id = i % num_producers;
+                    queue.enqueue(producer_id, i).unwrap();
+                }
+
+                // Dump all local buffers
+                for pid in 0..num_producers {
+                    unsafe {
+                        queue.dump_local_buffer(pid);
+                    }
+                }
+
+                unsafe { libc::_exit(0) };
+            }
+            Ok(ForkResult::Parent { child }) => {
+                while !sync.producer_ready.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                sync.consumer_ready.store(true, Ordering::Release);
+
+                // Give child time to dump buffers
+                std::thread::sleep(std::time::Duration::from_millis(100));
+
+                let mut received = Vec::new();
+                let mut empty_count = 0;
+
+                while received.len() < NUM_ITEMS {
+                    match queue.dequeue() {
+                        Some(item) => {
+                            received.push(item);
+                            empty_count = 0;
+                        }
+                        None => {
+                            empty_count += 1;
+                            if empty_count > 100 {
+                                // Help enqueue
+                                unsafe {
+                                    queue.help_enqueue();
+                                }
+                            }
+                            if empty_count > 1000000 {
+                                break;
+                            }
+                            std::thread::yield_now();
+                        }
+                    }
+                }
+
+                sync.items_consumed.store(received.len(), Ordering::SeqCst);
+
+                waitpid(child, None).expect("waitpid failed");
+
+                let consumed = sync.items_consumed.load(Ordering::SeqCst);
+                assert_eq!(
+                    consumed, NUM_ITEMS,
+                    "Not all items were consumed in IPC test"
+                );
+
+                received.sort();
+                for (i, &item) in received.iter().enumerate() {
+                    assert_eq!(item, i, "Missing or duplicate items");
+                }
+
+                unsafe {
+                    unmap_shared(shm_ptr, total_size);
+                }
+            }
+            Err(e) => {
+                unsafe {
+                    unmap_shared(shm_ptr, total_size);
+                }
+                panic!("Fork failed: {}", e);
+            }
+        }
+    }
+}

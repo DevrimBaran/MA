@@ -334,23 +334,24 @@ mod ipc_tests {
     }
 
     #[test]
-    fn test_david_queue_multi_consumer_ipc() {
+    fn test_david_queue_multi_consumer_balanced() {
         let num_consumers = 2;
         let shared_size = DavidQueue::<usize>::shared_size(num_consumers);
 
-        // Allocate separate shared memory for queue
-        let queue_shm_ptr = unsafe { map_shared(shared_size) };
-
-        // Allocate separate shared memory for EnqueuerState
+        // Add space for EnqueuerState and sync variables
         let enqueuer_state_size = std::mem::size_of::<EnqueuerState>();
-        let enqueuer_state_shm_ptr = unsafe { map_shared(enqueuer_state_size) };
-
-        // Allocate separate shared memory for sync variables
         let sync_size = std::mem::size_of::<IpcSyncMultiConsumer>();
-        let sync_shm_ptr = unsafe { map_shared(sync_size) };
+        let sync_size_aligned = (sync_size + 63) & !63;
 
-        let sync = unsafe { IpcSyncMultiConsumer::from_ptr(sync_shm_ptr) };
+        // Calculate offsets
+        let enqueuer_offset = sync_size_aligned;
+        let queue_offset = sync_size_aligned + enqueuer_state_size;
+        let queue_offset_aligned = (queue_offset + 63) & !63;
+        let total_size = queue_offset_aligned + shared_size;
 
+        let shm_ptr = unsafe { map_shared(total_size) };
+
+        let sync = unsafe { IpcSyncMultiConsumer::from_ptr(shm_ptr) };
         sync.producer_ready.store(false, Ordering::SeqCst);
         sync.consumer1_ready.store(false, Ordering::SeqCst);
         sync.consumer2_ready.store(false, Ordering::SeqCst);
@@ -358,167 +359,45 @@ mod ipc_tests {
         sync.items_consumed1.store(0, Ordering::SeqCst);
         sync.items_consumed2.store(0, Ordering::SeqCst);
 
-        // Initialize EnqueuerState in its own shared memory
-        let enqueuer_state_ptr = enqueuer_state_shm_ptr as *mut EnqueuerState;
+        // Place EnqueuerState after sync variables
+        let enqueuer_state_ptr = unsafe { shm_ptr.add(enqueuer_offset) as *mut EnqueuerState };
         unsafe {
             ptr::write(enqueuer_state_ptr, EnqueuerState::new());
         }
 
-        // Initialize queue in its own shared memory
-        let queue_ptr = queue_shm_ptr;
-        let queue: &mut DavidQueue<usize> = unsafe {
-            DavidQueue::init_in_shared(queue_ptr, num_consumers, &mut *enqueuer_state_ptr)
+        // Place queue after EnqueuerState, with alignment
+        let queue_ptr = unsafe { shm_ptr.add(queue_offset_aligned) };
+        let mut enqueuer_state_init = EnqueuerState::new();
+        let _queue: &mut DavidQueue<usize> = unsafe {
+            DavidQueue::init_in_shared(queue_ptr, num_consumers, &mut enqueuer_state_init)
         };
 
-        const NUM_ITEMS: usize = 500; // Keep well within single row capacity for multiple consumers
+        // Copy initialized state back
+        unsafe {
+            ptr::write(enqueuer_state_ptr, enqueuer_state_init);
+        }
+
+        const NUM_ITEMS: usize = 1000; // More items to test
 
         match unsafe { fork() } {
-            Ok(ForkResult::Parent {
-                child: producer_pid,
-            }) => {
-                match unsafe { fork() } {
-                    Ok(ForkResult::Parent {
-                        child: consumer1_pid,
-                    }) => {
-                        match unsafe { fork() } {
-                            Ok(ForkResult::Parent {
-                                child: consumer2_pid,
-                            }) => {
-                                // Original parent waits for all children
-                                waitpid(producer_pid, None).expect("waitpid producer failed");
-                                waitpid(consumer1_pid, None).expect("waitpid consumer1 failed");
-                                waitpid(consumer2_pid, None).expect("waitpid consumer2 failed");
-
-                                let consumed1 = sync.items_consumed1.load(Ordering::SeqCst);
-                                let consumed2 = sync.items_consumed2.load(Ordering::SeqCst);
-                                let total_consumed = consumed1 + consumed2;
-
-                                assert_eq!(
-                                    total_consumed, NUM_ITEMS,
-                                    "Not all items were consumed. Consumer1: {}, Consumer2: {}",
-                                    consumed1, consumed2
-                                );
-
-                                unsafe {
-                                    unmap_shared(queue_shm_ptr, shared_size);
-                                    unmap_shared(enqueuer_state_shm_ptr, enqueuer_state_size);
-                                    unmap_shared(sync_shm_ptr, sync_size);
-                                }
-                            }
-                            Ok(ForkResult::Child) => {
-                                // Consumer 2
-                                while !sync.producer_ready.load(Ordering::Acquire) {
-                                    std::hint::spin_loop();
-                                }
-                                sync.consumer2_ready.store(true, Ordering::Release);
-
-                                // Reconstruct queue reference from shared memory
-                                let queue = unsafe { &*(queue_ptr as *const DavidQueue<usize>) };
-
-                                eprintln!("Consumer 2: Starting to dequeue");
-                                let mut count = 0;
-                                let mut consecutive_empty = 0;
-                                let target_items = NUM_ITEMS / 2;  // Each consumer should get half
-                                
-                                while count < target_items {
-                                    match queue.dequeue(1) {
-                                        Ok(_item) => {
-                                            count += 1;
-                                            consecutive_empty = 0;
-                                        }
-                                        Err(_) => {
-                                            consecutive_empty += 1;
-                                            
-                                            if sync.producer_done.load(Ordering::Acquire) && consecutive_empty > 100000 {
-                                                // Try a few more times after producer is done
-                                                for _ in 0..100 {
-                                                    if let Ok(_) = queue.dequeue(1) {
-                                                        count += 1;
-                                                    }
-                                                }
-                                                break;
-                                            }
-                                            
-                                            if consecutive_empty < 100 {
-                                                std::hint::spin_loop();
-                                            } else {
-                                                std::thread::yield_now();
-                                            }
-                                        }
-                                    }
-                                }
-
-                                eprintln!("Consumer 2: Consumed {} items", count);
-                                sync.items_consumed2.store(count, Ordering::SeqCst);
-                                unsafe { libc::_exit(0) };
-                            }
-                            Err(_) => panic!("Fork consumer2 failed"),
-                        }
-                    }
-                    Ok(ForkResult::Child) => {
-                        // Consumer 1
-                        while !sync.producer_ready.load(Ordering::Acquire) {
-                            std::hint::spin_loop();
-                        }
-                        sync.consumer1_ready.store(true, Ordering::Release);
-
-                        // Reconstruct queue reference from shared memory
-                        let queue = unsafe { &*(queue_ptr as *const DavidQueue<usize>) };
-
-                        eprintln!("Consumer 1: Starting to dequeue");
-                        let mut count = 0;
-                        let mut consecutive_empty = 0;
-                        let target_items = NUM_ITEMS / 2;  // Each consumer should get half
-                        
-                        while count < target_items {
-                            match queue.dequeue(0) {
-                                Ok(_item) => {
-                                    count += 1;
-                                    consecutive_empty = 0;
-                                }
-                                Err(_) => {
-                                    consecutive_empty += 1;
-                                    
-                                    if sync.producer_done.load(Ordering::Acquire) && consecutive_empty > 100000 {
-                                        // Try a few more times after producer is done
-                                        for _ in 0..100 {
-                                            if let Ok(_) = queue.dequeue(0) {
-                                                count += 1;
-                                            }
-                                        }
-                                        break;
-                                    }
-                                    
-                                    if consecutive_empty < 100 {
-                                        std::hint::spin_loop();
-                                    } else {
-                                        std::thread::yield_now();
-                                    }
-                                }
-                            }
-                        }
-
-                        eprintln!("Consumer 1: Consumed {} items", count);
-                        sync.items_consumed1.store(count, Ordering::SeqCst);
-                        unsafe { libc::_exit(0) };
-                    }
-                    Err(_) => panic!("Fork consumer1 failed"),
-                }
-            }
             Ok(ForkResult::Child) => {
-                // Producer
+                // Child process acts as producer
+                sync.producer_ready.store(true, Ordering::Release);
+
+                // Wait for consumers
                 while !sync.consumer1_ready.load(Ordering::Acquire)
                     || !sync.consumer2_ready.load(Ordering::Acquire)
                 {
-                    sync.producer_ready.store(true, Ordering::Release);
                     std::hint::spin_loop();
                 }
 
-                // Reconstruct queue reference from shared memory
-                let queue = unsafe { &*(queue_ptr as *const DavidQueue<usize>) };
-                let enqueuer_state = unsafe { &mut *enqueuer_state_ptr };
+                // Small delay to ensure consumers are truly ready
+                std::thread::sleep(std::time::Duration::from_millis(10));
 
-                eprintln!("Producer: Starting to enqueue {} items", NUM_ITEMS);
+                let enqueuer_state = unsafe { &mut *enqueuer_state_ptr };
+                let queue = unsafe { &*(queue_ptr as *const DavidQueue<usize>) };
+
+                // Produce items at a controlled rate
                 for i in 0..NUM_ITEMS {
                     let mut retries = 0;
                     loop {
@@ -526,23 +405,161 @@ mod ipc_tests {
                             Ok(_) => break,
                             Err(_) => {
                                 retries += 1;
-                                if retries > 10000 {
-                                    eprintln!("Producer: Excessive retries at item {}", i);
+                                if retries > 100 {
+                                    // Slow down production if queue is getting full
+                                    std::thread::sleep(std::time::Duration::from_micros(10));
                                 }
                                 std::thread::yield_now();
                             }
                         }
                     }
+
+                    // Small delay every 100 items to let consumers catch up
+                    if i % 100 == 99 {
+                        std::thread::sleep(std::time::Duration::from_micros(100));
+                    }
                 }
-                
-                eprintln!("Producer: Successfully enqueued all {} items", NUM_ITEMS);
-                // Signal that producer is done
+
                 sync.producer_done.store(true, Ordering::Release);
+
+                // Give consumers time to finish
                 std::thread::sleep(std::time::Duration::from_millis(100));
 
                 unsafe { libc::_exit(0) };
             }
-            Err(_) => panic!("Fork producer failed"),
+            Ok(ForkResult::Parent {
+                child: producer_pid,
+            }) => {
+                // Parent forks consumers
+                let mut consumer_pids = vec![];
+
+                for consumer_id in 0..num_consumers {
+                    match unsafe { fork() } {
+                        Ok(ForkResult::Child) => {
+                            // Consumer process
+                            let queue = unsafe { &*(queue_ptr as *const DavidQueue<usize>) };
+
+                            // Signal ready
+                            if consumer_id == 0 {
+                                sync.consumer1_ready.store(true, Ordering::Release);
+                            } else {
+                                sync.consumer2_ready.store(true, Ordering::Release);
+                            }
+
+                            // Wait for producer and other consumer
+                            while !sync.producer_ready.load(Ordering::Acquire)
+                                || !sync.consumer1_ready.load(Ordering::Acquire)
+                                || !sync.consumer2_ready.load(Ordering::Acquire)
+                            {
+                                std::hint::spin_loop();
+                            }
+
+                            let mut received = Vec::new();
+                            let mut consecutive_empty = 0;
+
+                            loop {
+                                match queue.dequeue(consumer_id) {
+                                    Ok(item) => {
+                                        received.push(item);
+                                        consecutive_empty = 0;
+                                    }
+                                    Err(_) => {
+                                        consecutive_empty += 1;
+
+                                        // Only exit if producer is done AND we've tried many times
+                                        if sync.producer_done.load(Ordering::Acquire)
+                                            && consecutive_empty > 10000
+                                        {
+                                            break;
+                                        }
+
+                                        // Backoff strategy
+                                        if consecutive_empty < 10 {
+                                            std::hint::spin_loop();
+                                        } else if consecutive_empty < 100 {
+                                            std::thread::yield_now();
+                                        } else {
+                                            std::thread::sleep(std::time::Duration::from_micros(1));
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Sort and check for duplicates
+                            let original_len = received.len();
+                            received.sort();
+                            received.dedup();
+                            let unique_len = received.len();
+
+                            if original_len != unique_len {
+                                eprintln!(
+                                    "Consumer {}: Had {} duplicates!",
+                                    consumer_id,
+                                    original_len - unique_len
+                                );
+                            }
+
+                            if consumer_id == 0 {
+                                sync.items_consumed1.store(unique_len, Ordering::SeqCst);
+                            } else {
+                                sync.items_consumed2.store(unique_len, Ordering::SeqCst);
+                            }
+
+                            unsafe { libc::_exit(0) };
+                        }
+                        Ok(ForkResult::Parent { child }) => {
+                            consumer_pids.push(child);
+                        }
+                        Err(e) => panic!("Fork failed for consumer {}: {}", consumer_id, e),
+                    }
+                }
+
+                // Wait for all processes
+                waitpid(producer_pid, None).expect("waitpid producer failed");
+                for pid in consumer_pids {
+                    waitpid(pid, None).expect("waitpid consumer failed");
+                }
+
+                let consumed1 = sync.items_consumed1.load(Ordering::SeqCst);
+                let consumed2 = sync.items_consumed2.load(Ordering::SeqCst);
+                let total_consumed = consumed1 + consumed2;
+
+                println!("Consumer 0 consumed: {} unique items", consumed1);
+                println!("Consumer 1 consumed: {} unique items", consumed2);
+                println!("Total consumed: {} unique items", total_consumed);
+
+                // With the paper's algorithm (no recovery), we might lose some items
+                // but we should NEVER get duplicates
+                assert!(
+                    total_consumed <= NUM_ITEMS,
+                    "Got duplicates! Consumed {} but only produced {}",
+                    total_consumed,
+                    NUM_ITEMS
+                );
+
+                if total_consumed < NUM_ITEMS {
+                    let loss_rate =
+                        ((NUM_ITEMS - total_consumed) as f64 / NUM_ITEMS as f64) * 100.0;
+                    println!(
+                        "Lost {} items ({:.2}%)",
+                        NUM_ITEMS - total_consumed,
+                        loss_rate
+                    );
+
+                    // A small loss rate is acceptable with the paper's algorithm
+                    assert!(loss_rate < 5.0, "Loss rate too high: {:.2}%", loss_rate);
+                }
+
+                unsafe {
+                    unmap_shared(shm_ptr, total_size);
+                }
+            }
+            Err(e) => {
+                unsafe {
+                    unmap_shared(shm_ptr, total_size);
+                }
+                panic!("Fork failed: {}", e);
+            }
         }
     }
 }

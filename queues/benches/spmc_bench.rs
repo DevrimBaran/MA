@@ -408,8 +408,8 @@ fn bench_david_spmc(c: &mut Criterion) {
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(2))
-        .measurement_time(Duration::from_secs(1000))
-        .sample_size(500)
+        .measurement_time(Duration::from_secs(15))
+        .sample_size(10)
 }
 
 criterion_group! {

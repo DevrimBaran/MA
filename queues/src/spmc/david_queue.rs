@@ -99,30 +99,15 @@ impl EnqueuerState {
 impl<T: Send + Clone + 'static> DavidQueue<T> {
     // Get pointer to HEAD[row]
     unsafe fn get_head(&self, row: usize) -> &FetchIncrement {
-        if row >= self.num_rows {
-            panic!("get_head: row {} >= num_rows {}", row, self.num_rows);
-        }
         let heads_ptr = self.base_ptr.add(self.head_array_offset) as *const FetchIncrement;
         &*heads_ptr.add(row)
     }
 
     // Get pointer to ITEMS[row, col]
     unsafe fn get_item(&self, row: usize, col: usize) -> &SwapCell {
-        if row >= self.num_rows {
-            panic!("get_item: row {} >= num_rows {}", row, self.num_rows);
-        }
-        if col >= self.items_per_row {
-            panic!(
-                "get_item: col {} >= items_per_row {}",
-                col, self.items_per_row
-            );
-        }
         let items_ptr = self.base_ptr.add(self.items_array_offset) as *const SwapCell;
         let index = row * self.items_per_row + col;
         let max_index = self.num_rows * self.items_per_row;
-        if index >= max_index {
-            panic!("get_item: index {} >= max_index {}", index, max_index);
-        }
         &*items_ptr.add(index)
     }
 
@@ -354,9 +339,9 @@ impl<T: Send + Clone + 'static> DavidQueue<T> {
         let queue_size = mem::size_of::<Self>();
         let queue_aligned = (queue_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
-        let items_per_row = 16_384;
+        let items_per_row = 8_192;
         let num_rows = 10000;
-        let item_pool_size = 50_000_000;
+        let item_pool_size = 15_000_000;
 
         let head_array_size = num_rows * mem::size_of::<FetchIncrement>();
         let head_array_aligned = (head_array_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
@@ -382,9 +367,9 @@ impl<T: Send + Clone + 'static> DavidQueue<T> {
         let queue_aligned = (queue_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
         // Configuration
-        let items_per_row = 16_384;
+        let items_per_row: usize = 8_192;
         let num_rows = 10000;
-        let item_pool_size = 50_000_000;
+        let item_pool_size = 15_000_000;
         let num_consumers = 1; // SPSC has 1 consumer
 
         // head array

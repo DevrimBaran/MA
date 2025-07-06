@@ -261,7 +261,7 @@ mod jayanti_petrovic_tests {
             JayantiPetrovicMpscQueue::init_in_shared(mem_ptr, num_producers, node_pool_capacity)
         };
 
-        assert!(queue.is_empty());
+        assert!(queue.dequeue().is_none(), "Newly initialized queue should not have any items");
     }
 
     #[test]

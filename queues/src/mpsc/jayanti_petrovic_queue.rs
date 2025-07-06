@@ -161,10 +161,67 @@ impl MinInfo {
     }
 }
 
+// Alternative: Use AtomicU64 with reduced precision
+// We'll use 32 bits for version, leaving 32 bits for timestamp and 16 bits for leaf_idx
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct CompactMinInfo {
+    version: u32,
+    ts_val: u16,      // Reduced from u32 to u16
+    ts_pid: u8,       // Reduced from u16 to u8
+    leaf_idx: u8,     // Reduced from u16 to u8
+}
+
+impl CompactMinInfo {
+    fn to_u64(self) -> u64 {
+        ((self.version as u64) << 32) |
+        ((self.ts_val as u64) << 16) |
+        ((self.ts_pid as u64) << 8) |
+        (self.leaf_idx as u64)
+    }
+
+    fn from_u64(val: u64) -> Self {
+        CompactMinInfo {
+            version: (val >> 32) as u32,
+            ts_val: ((val >> 16) & 0xFFFF) as u16,
+            ts_pid: ((val >> 8) & 0xFF) as u8,
+            leaf_idx: (val & 0xFF) as u8,
+        }
+    }
+
+    fn from_min_info(min_info: MinInfo, version: u32) -> Self {
+        CompactMinInfo {
+            version,
+            ts_val: (min_info.ts.val & 0xFFFF) as u16,  // Take lower 16 bits
+            ts_pid: (min_info.ts.pid & 0xFF) as u8,     // Max 255 producers
+            leaf_idx: (min_info.leaf_idx & 0xFF) as u8, // Max 255 producers
+        }
+    }
+
+    fn to_min_info(self) -> MinInfo {
+        MinInfo {
+            ts: Timestamp {
+                val: self.ts_val as u32,
+                pid: self.ts_pid as u16,
+            },
+            leaf_idx: self.leaf_idx as u16,
+        }
+    }
+
+    fn infinite() -> Self {
+        CompactMinInfo {
+            version: 0,
+            ts_val: u16::MAX,
+            ts_pid: u8::MAX,
+            leaf_idx: u8::MAX,
+        }
+    }
+}
+
 #[repr(C)]
 struct TreeNode {
-    // Store MinInfo as a single atomic u64
-    min_info: AtomicU64,
+    // Store CompactMinInfo as a single atomic u64
+    compact_min_info: AtomicU64,
 }
 
 impl TreeNode {
@@ -172,19 +229,32 @@ impl TreeNode {
         ptr::write(
             node_ptr,
             TreeNode {
-                min_info: AtomicU64::new(MinInfo::infinite().to_u64()),
+                compact_min_info: AtomicU64::new(CompactMinInfo::infinite().to_u64()),
             },
         );
     }
 
     #[inline]
-    unsafe fn read_min_info(&self) -> MinInfo {
-        MinInfo::from_u64(self.min_info.load(Ordering::Acquire))
+    unsafe fn read_compact_min_info(&self) -> CompactMinInfo {
+        CompactMinInfo::from_u64(self.compact_min_info.load(Ordering::Acquire))
     }
 
     #[inline]
-    pub unsafe fn update_min_info_value_in_slot(&self, new_value: MinInfo) {
-        self.min_info.store(new_value.to_u64(), Ordering::Release);
+    unsafe fn read_min_info(&self) -> MinInfo {
+        self.read_compact_min_info().to_min_info()
+    }
+
+    // This implements the LL/SC pattern using CAS
+    #[inline]
+    unsafe fn cas_min_info(&self, old_compact: CompactMinInfo, new_min_info: MinInfo) -> bool {
+        let new_compact = CompactMinInfo::from_min_info(new_min_info, old_compact.version + 1);
+        
+        self.compact_min_info.compare_exchange(
+            old_compact.to_u64(),
+            new_compact.to_u64(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ).is_ok()
     }
 }
 
@@ -370,8 +440,12 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
         )
     }
 
-    pub unsafe fn refresh(&self, u_idx: usize) {
+    // Implements the refresh() procedure from the paper using CAS
+    pub unsafe fn refresh(&self, u_idx: usize) -> bool {
         let u_node = self.get_tree_node(u_idx);
+        
+        // "LL" - load current value with version
+        let old_compact = u_node.read_compact_min_info();
 
         let (left_child_idx_opt, right_child_idx_opt) = self.get_children_indices(u_idx);
 
@@ -390,7 +464,8 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
             right_ts_info
         };
 
-        u_node.update_min_info_value_in_slot(new_min_info_val_for_u);
+        // "SC" - compare and swap with version increment
+        u_node.cas_min_info(old_compact, new_min_info_val_for_u)
     }
 
     unsafe fn propagate(&self, producer_id: usize, is_enqueuer: bool) {
@@ -408,12 +483,21 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
             None => MinInfo::infinite(),
         };
 
-        self.get_tree_node(current_tree_node_idx)
-            .update_min_info_value_in_slot(leaf_min_info_val);
+        // For leaf nodes, we can use a simple store since only one producer updates each leaf
+        let leaf_node = self.get_tree_node(current_tree_node_idx);
+        let current_compact = leaf_node.read_compact_min_info();
+        let new_compact = CompactMinInfo::from_min_info(leaf_min_info_val, current_compact.version + 1);
+        leaf_node.compact_min_info.store(new_compact.to_u64(), Ordering::Release);
 
+        // Propagate up the tree
         while let Some(parent_idx) = self.get_parent_idx(current_tree_node_idx) {
             current_tree_node_idx = parent_idx;
-            self.refresh(current_tree_node_idx);
+            
+            // Follow the paper's algorithm: if first refresh fails, do it again
+            if !self.refresh(current_tree_node_idx) {
+                self.refresh(current_tree_node_idx);
+            }
+            // Always do a second refresh as per the paper
             self.refresh(current_tree_node_idx);
         }
     }

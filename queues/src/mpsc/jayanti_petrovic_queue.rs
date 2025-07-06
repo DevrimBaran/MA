@@ -30,6 +30,9 @@ impl<T: Send + Clone + 'static> ShmBumpPool<T> {
             return;
         }
         let mut head = self.free_list_head.load(Ordering::Acquire);
+        let mut attempts = 0;
+        const MAX_ATTEMPTS: usize = 3; // Bounded attempts
+
         loop {
             (*node_ptr).next.store(head, Ordering::Relaxed);
             match self.free_list_head.compare_exchange_weak(
@@ -39,14 +42,25 @@ impl<T: Send + Clone + 'static> ShmBumpPool<T> {
                 Ordering::Acquire,
             ) {
                 Ok(_) => break,
-                Err(new_head) => head = new_head,
+                Err(new_head) => {
+                    head = new_head;
+                    attempts += 1;
+                    if attempts >= MAX_ATTEMPTS {
+                        // Give up - node will be lost but wait-freedom preserved
+                        break;
+                    }
+                }
             }
         }
     }
 
     unsafe fn alloc_sesd_node(&self) -> *mut SesdNode<(T, Timestamp)> {
+        // First try free list with bounded attempts
         let mut head = self.free_list_head.load(Ordering::Acquire);
-        while !head.is_null() {
+        let mut free_list_attempts = 0;
+        const MAX_FREE_LIST_ATTEMPTS: usize = 2;
+
+        while !head.is_null() && free_list_attempts < MAX_FREE_LIST_ATTEMPTS {
             let next_node_in_free_list = (*head).next.load(Ordering::Relaxed);
             match self.free_list_head.compare_exchange_weak(
                 head,
@@ -58,22 +72,26 @@ impl<T: Send + Clone + 'static> ShmBumpPool<T> {
                     SesdNode::init_dummy(popped_node);
                     return popped_node;
                 }
-                Err(new_head) => head = new_head,
+                Err(new_head) => {
+                    head = new_head;
+                    free_list_attempts += 1;
+                }
             }
         }
 
+        // Fall back to bump allocation with bounded attempts
         let align = mem::align_of::<SesdNode<(T, Timestamp)>>();
         let size = mem::size_of::<SesdNode<(T, Timestamp)>>();
+        let mut bump_attempts = 0;
+        const MAX_BUMP_ATTEMPTS: usize = 3;
 
         loop {
             let current_ptr_val = self.current.load(Ordering::Relaxed);
 
-            // Calculate alignment using pointer arithmetic
+            // Calculate alignment
             let current_addr = current_ptr_val as usize;
             let aligned_addr = (current_addr + align - 1) & !(align - 1);
             let padding = aligned_addr - current_addr;
-
-            // Use pointer arithmetic to preserve provenance
             let aligned_ptr = current_ptr_val.add(padding);
             let next_ptr = aligned_ptr.add(size);
 
@@ -92,7 +110,12 @@ impl<T: Send + Clone + 'static> ShmBumpPool<T> {
                     SesdNode::init_dummy(allocated_node_ptr);
                     return allocated_node_ptr;
                 }
-                Err(_) => {}
+                Err(_) => {
+                    bump_attempts += 1;
+                    if bump_attempts >= MAX_BUMP_ATTEMPTS {
+                        return ptr::null_mut();
+                    }
+                }
             }
         }
     }
@@ -161,23 +184,22 @@ impl MinInfo {
     }
 }
 
-// Alternative: Use AtomicU64 with reduced precision
 // We'll use 32 bits for version, leaving 32 bits for timestamp and 16 bits for leaf_idx
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct CompactMinInfo {
     version: u32,
-    ts_val: u16,      // Reduced from u32 to u16
-    ts_pid: u8,       // Reduced from u16 to u8
-    leaf_idx: u8,     // Reduced from u16 to u8
+    ts_val: u16,  // Reduced from u32 to u16
+    ts_pid: u8,   // Reduced from u16 to u8
+    leaf_idx: u8, // Reduced from u16 to u8
 }
 
 impl CompactMinInfo {
     fn to_u64(self) -> u64 {
-        ((self.version as u64) << 32) |
-        ((self.ts_val as u64) << 16) |
-        ((self.ts_pid as u64) << 8) |
-        (self.leaf_idx as u64)
+        ((self.version as u64) << 32)
+            | ((self.ts_val as u64) << 16)
+            | ((self.ts_pid as u64) << 8)
+            | (self.leaf_idx as u64)
     }
 
     fn from_u64(val: u64) -> Self {
@@ -192,8 +214,8 @@ impl CompactMinInfo {
     fn from_min_info(min_info: MinInfo, version: u32) -> Self {
         CompactMinInfo {
             version,
-            ts_val: (min_info.ts.val & 0xFFFF) as u16,  // Take lower 16 bits
-            ts_pid: (min_info.ts.pid & 0xFF) as u8,     // Max 255 producers
+            ts_val: (min_info.ts.val & 0xFFFF) as u16, // Take lower 16 bits
+            ts_pid: (min_info.ts.pid & 0xFF) as u8,    // Max 255 producers
             leaf_idx: (min_info.leaf_idx & 0xFF) as u8, // Max 255 producers
         }
     }
@@ -219,7 +241,7 @@ impl CompactMinInfo {
 }
 
 #[repr(C)]
-struct TreeNode {
+pub struct TreeNode {
     // Store CompactMinInfo as a single atomic u64
     compact_min_info: AtomicU64,
 }
@@ -244,17 +266,19 @@ impl TreeNode {
         self.read_compact_min_info().to_min_info()
     }
 
-    // This implements the LL/SC pattern using CAS
+    // This implements the LL/SC pattern using CAS with versioning
     #[inline]
     unsafe fn cas_min_info(&self, old_compact: CompactMinInfo, new_min_info: MinInfo) -> bool {
         let new_compact = CompactMinInfo::from_min_info(new_min_info, old_compact.version + 1);
-        
-        self.compact_min_info.compare_exchange(
-            old_compact.to_u64(),
-            new_compact.to_u64(),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ).is_ok()
+
+        self.compact_min_info
+            .compare_exchange(
+                old_compact.to_u64(),
+                new_compact.to_u64(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 }
 
@@ -440,11 +464,11 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
         )
     }
 
-    // Implements the refresh() procedure from the paper using CAS
+    // Implement refresh() procedure using CAS
     pub unsafe fn refresh(&self, u_idx: usize) -> bool {
         let u_node = self.get_tree_node(u_idx);
-        
-        // "LL" - load current value with version
+
+        // "LL", load current value with version
         let old_compact = u_node.read_compact_min_info();
 
         let (left_child_idx_opt, right_child_idx_opt) = self.get_children_indices(u_idx);
@@ -464,7 +488,7 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
             right_ts_info
         };
 
-        // "SC" - compare and swap with version increment
+        // "SC", compare and swap with version increment
         u_node.cas_min_info(old_compact, new_min_info_val_for_u)
     }
 
@@ -486,28 +510,27 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
         // For leaf nodes, we can use a simple store since only one producer updates each leaf
         let leaf_node = self.get_tree_node(current_tree_node_idx);
         let current_compact = leaf_node.read_compact_min_info();
-        let new_compact = CompactMinInfo::from_min_info(leaf_min_info_val, current_compact.version + 1);
-        leaf_node.compact_min_info.store(new_compact.to_u64(), Ordering::Release);
+        let new_compact =
+            CompactMinInfo::from_min_info(leaf_min_info_val, current_compact.version + 1);
+        leaf_node
+            .compact_min_info
+            .store(new_compact.to_u64(), Ordering::Release);
 
         // Propagate up the tree
         while let Some(parent_idx) = self.get_parent_idx(current_tree_node_idx) {
             current_tree_node_idx = parent_idx;
-            
-            // Follow the paper's algorithm: if first refresh fails, do it again
+
+            // if first refresh fails, do it again
             if !self.refresh(current_tree_node_idx) {
                 self.refresh(current_tree_node_idx);
             }
-            // Always do a second refresh as per the paper
+            // Always do a second refresh
             self.refresh(current_tree_node_idx);
         }
     }
 
     unsafe fn alloc_sesd_node_from_pool(&self) -> *mut SesdNode<(T, Timestamp)> {
-        let node_ptr = self.sesd_node_pool.alloc_sesd_node();
-        if node_ptr.is_null() {
-            panic!("JayantiPetrovicMpscQueue: SESD node pool exhausted!");
-        }
-        node_ptr
+        self.sesd_node_pool.alloc_sesd_node()
     }
 
     pub fn enqueue(&self, producer_id: usize, item: T) -> Result<(), ()> {

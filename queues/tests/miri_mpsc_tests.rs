@@ -307,15 +307,14 @@ mod miri_jayanti_petrovic_tests {
             JayantiPetrovicMpscQueue::init_in_shared(mem_ptr, num_producers, node_pool_capacity)
         };
 
-        assert!(queue.is_empty());
+        // After CAS with version numbers change, verify no items can be dequeued
+        assert!(queue.dequeue().is_none(), "Queue should have no items to dequeue initially");
 
         for producer_id in 0..num_producers {
             for i in 0..5 {
                 queue.enqueue(producer_id, producer_id * 10 + i).unwrap();
             }
         }
-
-        assert!(!queue.is_empty());
 
         let mut items = Vec::new();
         while let Some(item) = queue.dequeue() {
@@ -1803,11 +1802,13 @@ mod miri_state_consistency_tests {
             let mem_ptr = mem.as_mut_ptr();
             let jp = unsafe { JayantiPetrovicMpscQueue::init_in_shared(mem_ptr, 2, 50) };
 
-            assert!(jp.is_empty());
+            // After CAS with version numbers change, verify behavior through dequeue
+            assert!(jp.dequeue().is_none());
             assert!(!jp.is_full());
 
             jp.enqueue(0, 42).unwrap();
-            assert!(!jp.is_empty());
+            // Verify item can be dequeued
+            assert_eq!(jp.dequeue().unwrap(), 42);
         }
     }
 

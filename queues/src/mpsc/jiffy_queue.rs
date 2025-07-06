@@ -807,8 +807,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
             }
 
             let n_node_ptr = unsafe { current_bl.curr_buffer.add(n_idx_in_buffer) };
-            let n_node_ref = unsafe { &*n_node_ptr };
-            let n_state = n_node_ref.is_set.load(Ordering::Acquire);
+            let n_state = unsafe { (*n_node_ptr).is_set.load(Ordering::Acquire) };
 
             let n_global_loc = current_bl.position_in_queue * (self.buffer_capacity() as u64)
                 + (n_idx_in_buffer as u64);
@@ -822,18 +821,19 @@ impl<T: Send + 'static> JiffyQueue<T> {
             }
 
             if n_state == NodeState::Set as usize {
-                if n_node_ref
-                    .is_set
-                    .compare_exchange(
-                        NodeState::Set as usize,
-                        NodeState::Handled as usize,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
+                if unsafe {
+                    (*n_node_ptr)
+                        .is_set
+                        .compare_exchange(
+                            NodeState::Set as usize,
+                            NodeState::Handled as usize,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                } {
                     current_bl.consumer_head_idx.fetch_add(1, Ordering::Relaxed);
-                    let data = unsafe { ptr::read(&(*n_node_ref).data).assume_init() };
+                    let data = unsafe { ptr::read(&(*n_node_ptr).data).assume_init() };
                     return Some(data);
                 } else {
                     continue 'retry_dequeue;
@@ -926,18 +926,18 @@ impl<T: Send + 'static> JiffyQueue<T> {
                             }
                             let item_node_ptr_to_cas =
                                 unsafe { item_bl_ref.curr_buffer.add(final_temp_n_idx) };
-                            let item_node_ref_for_cas = unsafe { &*item_node_ptr_to_cas };
 
-                            if item_node_ref_for_cas
-                                .is_set
-                                .compare_exchange(
-                                    NodeState::Set as usize,
-                                    NodeState::Handled as usize,
-                                    Ordering::AcqRel,
-                                    Ordering::Relaxed,
-                                )
-                                .is_ok()
-                            {
+                            if unsafe {
+                                (*item_node_ptr_to_cas)
+                                    .is_set
+                                    .compare_exchange(
+                                        NodeState::Set as usize,
+                                        NodeState::Handled as usize,
+                                        Ordering::AcqRel,
+                                        Ordering::Relaxed,
+                                    )
+                                    .is_ok()
+                            } {
                                 if final_temp_n_bl_ptr == current_bl_ptr
                                     && final_temp_n_idx
                                         == current_bl.consumer_head_idx.load(Ordering::Relaxed)
@@ -945,7 +945,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                                     current_bl.consumer_head_idx.fetch_add(1, Ordering::Relaxed);
                                 }
                                 let data = unsafe {
-                                    ptr::read(&(*item_node_ref_for_cas).data).assume_init()
+                                    ptr::read(&(*item_node_ptr_to_cas).data).assume_init()
                                 };
                                 return Some(data);
                             } else {

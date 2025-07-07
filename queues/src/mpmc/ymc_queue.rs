@@ -400,7 +400,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
 
         let mut tmp_tail = (*handle).tail.load(Ordering::Acquire);
         let num_threads = self.num_threads;
-        let max_failures = (num_threads - 1) * (num_threads - 1);
+        let max_failures = (num_threads - 1) * (num_threads - 1); // This is (n-1)²
         let mut failures = 0;
 
         loop {
@@ -647,7 +647,7 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
 
         let num_threads = self.num_threads;
         let max_cells =
-            (num_threads - 1) * (num_threads - 1) * (num_threads - 1) * (num_threads - 1);
+            (num_threads - 1) * (num_threads - 1) * (num_threads - 1) * (num_threads - 1); // This is (n-1)⁴
         let mut cells_visited = 0;
 
         loop {

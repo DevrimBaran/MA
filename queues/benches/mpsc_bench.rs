@@ -17,7 +17,7 @@ use nix::{
 use queues::mpsc::dqueue::N_SEGMENT_CAPACITY;
 
 const PERFORMANCE_TEST: bool = false;
-const ITEMS_PER_PRODUCER_TARGET: usize = 2_000_000;
+const ITEMS_PER_PRODUCER_TARGET: usize = 500_000;
 const JIFFY_NODES_PER_BUFFER_BENCH: usize = 32_768;
 const PRODUCER_COUNTS_TO_TEST: &[usize] = &[1, 2, 4, 8, 14];
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 100_000_000;
@@ -465,8 +465,8 @@ fn bench_d_queue_mpsc(c: &mut Criterion) {
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(2))
-        .measurement_time(Duration::from_secs(10))
-        .sample_size(10)
+        .measurement_time(Duration::from_secs(2500))
+        .sample_size(500)
 }
 
 criterion_group! {

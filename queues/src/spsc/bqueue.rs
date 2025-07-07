@@ -15,9 +15,11 @@ pub struct BQueue<T: Send + 'static> {
     batch_head: UnsafeCell<usize>,
     tail: AtomicUsize,
     batch_tail: UnsafeCell<usize>,
+    batch_history: AtomicUsize,
 }
 
 const BATCH_SIZE: usize = 32; // Reduced from 256 for Miri tests
+const INCREMENT: usize = 8; // Cache line worth of increments
 
 unsafe impl<T: Send + 'static> Sync for BQueue<T> {}
 unsafe impl<T: Send + 'static> Send for BQueue<T> {}
@@ -55,9 +57,10 @@ impl<T: Send + 'static> BQueue<T> {
                 cap: capacity,
                 mask: capacity - 1,
                 head: AtomicUsize::new(0),
-                batch_head: UnsafeCell::new(0),
+                batch_head: UnsafeCell::new(0), // Start at 0, will be updated on first push
                 tail: AtomicUsize::new(0),
-                batch_tail: UnsafeCell::new(0),
+                batch_tail: UnsafeCell::new(0), // Start at 0, will be updated on first pop
+                batch_history: AtomicUsize::new(BATCH_SIZE),
             },
         );
 
@@ -79,17 +82,28 @@ impl<T: Send + 'static> BQueue<T> {
         let batch_head = unsafe { *self.batch_head.get() };
 
         if head == batch_head {
-            // Need to probe for more space
-            let probe_idx = self.mod_(head + BATCH_SIZE);
+            // Need to probe for a batch of empty slots
+            let mut slots_to_probe = BATCH_SIZE.min(self.cap - 1); // Never probe the entire queue
 
-            unsafe {
-                if (*self.valid.add(probe_idx)).load(Ordering::Acquire) {
+            // Probe for a batch of empty slots
+            loop {
+                if slots_to_probe == 0 {
                     return Err(item);
                 }
-            }
 
-            unsafe {
-                *self.batch_head.get() = probe_idx;
+                let probe_idx = self.mod_(head + slots_to_probe - 1);
+
+                unsafe {
+                    // Check if the last slot in the batch is empty
+                    if !(*self.valid.add(probe_idx)).load(Ordering::Acquire) {
+                        // Found empty slots, update batch_head
+                        *self.batch_head.get() = self.mod_(head + slots_to_probe);
+                        break;
+                    }
+                }
+
+                // If we can't find slots_to_probe empty slots, try smaller batches
+                slots_to_probe >>= 1;
             }
         }
 
@@ -107,23 +121,28 @@ impl<T: Send + 'static> BQueue<T> {
 
     pub fn pop(&self) -> Result<T, ()> {
         let tail = self.tail.load(Ordering::Relaxed);
+        let batch_tail = unsafe { *self.batch_tail.get() };
 
-        unsafe {
-            // Check if current tail position has valid data
-            if !(*self.valid.add(tail)).load(Ordering::Acquire) {
-                // If not, use backtracking to find available data
-                match self.backtrack_deq() {
-                    Some(new_batch_tail) => {
-                        *self.batch_tail.get() = new_batch_tail;
-                    }
-                    None => {
-                        return Err(());
-                    }
+        if tail == batch_tail {
+            // Need to find more filled slots using backtracking
+            match self.adaptive_backtrack_deq() {
+                Some(new_batch_tail) => unsafe {
+                    *self.batch_tail.get() = self.mod_(new_batch_tail + 1);
+                },
+                None => {
+                    return Err(());
                 }
             }
         }
 
-        // Read the value - the Acquire load above ensures we see the data write
+        unsafe {
+            // Check if current slot has data
+            if !(*self.valid.add(tail)).load(Ordering::Acquire) {
+                return Err(());
+            }
+        }
+
+        // Read the value
         let value = unsafe {
             let item = ptr::read(self.buf.add(tail));
             item.assume_init()
@@ -139,37 +158,44 @@ impl<T: Send + 'static> BQueue<T> {
         Ok(value)
     }
 
-    fn backtrack_deq(&self) -> Option<usize> {
+    fn adaptive_backtrack_deq(&self) -> Option<usize> {
         let tail = self.tail.load(Ordering::Relaxed);
 
-        let mut batch_size = BATCH_SIZE.min(self.cap);
+        // Start with the historical batch size
+        let mut batch_history = self.batch_history.load(Ordering::Relaxed);
 
-        let mut batch_tail;
+        // Increment batch_history if it's less than BATCH_SIZE
+        if batch_history < BATCH_SIZE {
+            batch_history = (batch_history + INCREMENT).min(BATCH_SIZE);
+            self.batch_history.store(batch_history, Ordering::Relaxed);
+        }
+
+        let mut batch_size = batch_history.min(self.cap - 1);
 
         loop {
             if batch_size == 0 {
+                // Check if there's at least one element at current tail
+                unsafe {
+                    if (*self.valid.add(tail)).load(Ordering::Acquire) {
+                        self.batch_history.store(1, Ordering::Relaxed);
+                        return Some(tail);
+                    }
+                }
                 return None;
             }
 
-            batch_tail = self.mod_(tail + batch_size - 1);
+            let batch_tail = self.mod_(tail + batch_size - 1);
 
             unsafe {
                 if (*self.valid.add(batch_tail)).load(Ordering::Acquire) {
+                    // Found filled slots, update batch_history
+                    self.batch_history.store(batch_size, Ordering::Relaxed);
                     return Some(batch_tail);
                 }
             }
 
-            if batch_size > 1 {
-                batch_size >>= 1;
-            } else {
-                unsafe {
-                    if (*self.valid.add(tail)).load(Ordering::Acquire) {
-                        return Some(tail);
-                    }
-                }
-
-                return None;
-            }
+            // Binary search for filled slots
+            batch_size >>= 1;
         }
     }
 
@@ -181,19 +207,37 @@ impl<T: Send + 'static> BQueue<T> {
             return true;
         }
 
-        let probe_idx = self.mod_(head + BATCH_SIZE);
-        unsafe { !(*self.valid.add(probe_idx)).load(Ordering::Acquire) }
+        let mut slots_to_probe = BATCH_SIZE.min(self.cap - 1);
+
+        loop {
+            if slots_to_probe == 0 {
+                return false;
+            }
+
+            let probe_idx = self.mod_(head + slots_to_probe - 1);
+
+            unsafe {
+                if !(*self.valid.add(probe_idx)).load(Ordering::Acquire) {
+                    return true;
+                }
+            }
+
+            slots_to_probe >>= 1;
+        }
     }
 
     pub fn empty(&self) -> bool {
         let tail = self.tail.load(Ordering::Relaxed);
+
+        // First check current position
         unsafe {
             if (*self.valid.add(tail)).load(Ordering::Acquire) {
                 return false;
             }
         }
 
-        self.backtrack_deq().is_none()
+        // Use adaptive backtracking to check if truly empty
+        self.adaptive_backtrack_deq().is_none()
     }
 }
 

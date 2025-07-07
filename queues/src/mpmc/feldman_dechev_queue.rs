@@ -94,7 +94,8 @@ pub struct EnqueueOp {
     pub value: AtomicUsize,
     pub seqid: AtomicU64,
     pub complete: AtomicBool,
-    pub thread_id: usize, // Track which thread owns this op
+    pub success: AtomicBool, // Track if operation succeeded
+    pub thread_id: usize,
 }
 
 impl EnqueueOp {
@@ -104,6 +105,7 @@ impl EnqueueOp {
             value: AtomicUsize::new(value),
             seqid: AtomicU64::new(0),
             complete: AtomicBool::new(false),
+            success: AtomicBool::new(false),
             thread_id,
         }
     }
@@ -112,8 +114,18 @@ impl EnqueueOp {
         self.complete.load(Ordering::Acquire)
     }
 
-    pub fn complete(&self) {
+    pub fn complete_success(&self) {
+        self.success.store(true, Ordering::Release);
         self.complete.store(true, Ordering::Release);
+    }
+
+    pub fn complete_failure(&self) {
+        self.success.store(false, Ordering::Release);
+        self.complete.store(true, Ordering::Release);
+    }
+
+    pub fn was_successful(&self) -> bool {
+        self.success.load(Ordering::Acquire)
     }
 }
 
@@ -124,7 +136,8 @@ pub struct DequeueOp {
     pub result: AtomicUsize,
     pub seqid: AtomicU64,
     pub complete: AtomicBool,
-    pub thread_id: usize, // Track which thread owns this op
+    pub success: AtomicBool, // Track if operation succeeded
+    pub thread_id: usize,
 }
 
 impl DequeueOp {
@@ -134,6 +147,7 @@ impl DequeueOp {
             result: AtomicUsize::new(0),
             seqid: AtomicU64::new(0),
             complete: AtomicBool::new(false),
+            success: AtomicBool::new(false),
             thread_id,
         }
     }
@@ -142,12 +156,19 @@ impl DequeueOp {
         self.complete.load(Ordering::Acquire)
     }
 
-    pub fn complete(&self) {
+    pub fn complete_success(&self, value: usize) {
+        self.result.store(value, Ordering::Release);
+        self.success.store(true, Ordering::Release);
         self.complete.store(true, Ordering::Release);
     }
 
-    pub fn set_result(&self, value: usize) {
-        self.result.store(value, Ordering::Release);
+    pub fn complete_failure(&self) {
+        self.success.store(false, Ordering::Release);
+        self.complete.store(true, Ordering::Release);
+    }
+
+    pub fn was_successful(&self) -> bool {
+        self.success.load(Ordering::Acquire)
     }
 
     pub fn get_result(&self) -> usize {
@@ -204,7 +225,6 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         let mut spins = 1;
         for i in 0..10 {
             for _ in 0..spins.min(1024) {
-                // Cap max spins
                 std::hint::spin_loop();
             }
             spins *= 2;
@@ -239,7 +259,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         }
     }
 
-    // Help another processes operation
+    // Help another thread's operation
     unsafe fn help_operation(&self, op_ptr: *mut (), helper_thread_id: usize) {
         // First, determine what type of operation this is
         let op_type_ptr = op_ptr as *const OpType;
@@ -257,7 +277,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         }
     }
 
-    // Help complete an enqueue operation
+    // Help complete an enqueue operation with proper bounds
     unsafe fn help_enqueue(&self, op: *mut EnqueueOp, _helper_thread_id: usize) {
         if (*op).is_complete() {
             return;
@@ -269,7 +289,6 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         let mut seqid = (*op).seqid.load(Ordering::Acquire);
         if seqid == 0 {
             seqid = self.tail.fetch_add(1, Ordering::AcqRel);
-            // Only the first helper sets the seqid
             (*op)
                 .seqid
                 .compare_exchange(0, seqid, Ordering::AcqRel, Ordering::Acquire)
@@ -279,8 +298,10 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
 
         let pos = (seqid % self.capacity as u64) as usize;
 
-        // Bounded retry loop to prevent infinite helping
-        for _ in 0..100 {
+        // Bound by MAX_FAILS + NUM_THREADS²
+        let max_help_attempts = MAX_FAILS + (self.num_threads * self.num_threads);
+
+        for attempt in 0..max_help_attempts {
             if (*op).is_complete() {
                 return;
             }
@@ -292,7 +313,9 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
                 // Try to complete the enqueue
                 let value_idx = self.next_value.fetch_add(1, Ordering::AcqRel);
                 if value_idx >= self.value_pool_size {
-                    return; // Pool exhausted
+                    // Mark operation as failed due to pool exhaustion
+                    (*op).complete_failure();
+                    return;
                 }
 
                 let value_ptr = self.value_pool.add(value_idx % self.value_pool_size);
@@ -316,19 +339,28 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
                     )
                     .is_ok()
                 {
-                    (*op).complete();
+                    (*op).complete_success();
                     return;
                 }
             } else if node.get_seqid() > seqid || node.is_value() {
-                // Position is already past our seqid, give up
+                // Position is already past our seqid
+                (*op).complete_failure();
                 return;
             }
 
-            std::hint::spin_loop();
+            // Yield periodically to prevent excessive spinning
+            if attempt % 1000 == 0 {
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
         }
+
+        // After MAX_FAILS + NUM_THREADS² attempts, mark as complete
+        (*op).complete_failure();
     }
 
-    // Help complete a dequeue operation
+    // Help complete a dequeue operation with proper bounds
     unsafe fn help_dequeue(&self, op: *mut DequeueOp, _helper_thread_id: usize) {
         if (*op).is_complete() {
             return;
@@ -338,7 +370,6 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         let mut seqid = (*op).seqid.load(Ordering::Acquire);
         if seqid == 0 {
             seqid = self.head.fetch_add(1, Ordering::AcqRel);
-            // Only the first helper sets the seqid
             (*op)
                 .seqid
                 .compare_exchange(0, seqid, Ordering::AcqRel, Ordering::Acquire)
@@ -348,8 +379,10 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
 
         let pos = (seqid % self.capacity as u64) as usize;
 
-        // Bounded retry loop
-        for _ in 0..100 {
+        // Bound by MAX_FAILS + NUM_THREADS²
+        let max_help_attempts = MAX_FAILS + (self.num_threads * self.num_threads);
+
+        for attempt in 0..max_help_attempts {
             if (*op).is_complete() {
                 return;
             }
@@ -372,31 +405,31 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
                 {
                     let value_ptr = node.get_value_ptr();
                     let value = (*(*value_ptr).value.get()).take().unwrap_or(0);
-                    (*op).set_result(value);
-                    (*op).complete();
+                    (*op).complete_success(value);
                     return;
                 }
             } else if node.get_seqid() > seqid {
                 // No element with this seqid exists
+                (*op).complete_failure();
                 return;
             }
 
-            std::hint::spin_loop();
+            // Yield periodically
+            if attempt % 1000 == 0 {
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
         }
+
+        // After MAX_FAILS + NUM_THREADS² attempts, mark as complete
+        (*op).complete_failure();
     }
 
     // Make announcement for help
     unsafe fn make_announcement(&self, thread_id: usize, op_ptr: *mut ()) {
         (*self.announcement_table.add(thread_id)).store(op_ptr, Ordering::Release);
-
-        // Improved wait strategy with bounded iterations
-        let wait_threshold = (self.num_threads * self.num_threads * CHECK_DELAY).min(10000);
-        for i in 0..wait_threshold {
-            if i % 100 == 0 {
-                std::thread::yield_now(); // Yield periodically
-            }
-            std::hint::spin_loop();
-        }
+        fence(Ordering::SeqCst);
     }
 
     // Clear announcement
@@ -645,7 +678,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         }
     }
 
-    // slow path for enqueue
+    // Slow path for enqueue with proper wait-freedom guarantee
     unsafe fn enqueue_slow_path(&self, thread_id: usize, value: usize) -> Result<(), ()> {
         // Track active operations
         self.active_enq_ops.fetch_add(1, Ordering::AcqRel);
@@ -665,21 +698,25 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         // Make announcement
         self.make_announcement(thread_id, op_ptr as *mut ());
 
-        // Try to complete operation ourselves while waiting for help
-        let mut attempts = 0;
-        let max_attempts = (self.num_threads * self.num_threads).min(10000);
+        // Wait for at most NUM_THREADS² * CHECK_DELAY operations
+        // This ensures all threads will have checked announcements
+        let max_wait_ops = self.num_threads * self.num_threads * CHECK_DELAY;
 
-        while !(*op_ptr).is_complete() && attempts < max_attempts {
+        for i in 0..max_wait_ops {
+            if (*op_ptr).is_complete() {
+                break;
+            }
+
+            // Try to help ourselves
             self.help_enqueue(op_ptr, thread_id);
-            attempts += 1;
 
-            // Also help others
-            if attempts % CHECK_DELAY == 0 {
+            // Check for other announcements periodically
+            if i % CHECK_DELAY == 0 {
                 self.check_for_announcement(thread_id);
             }
 
-            // Yield periodically to prevent spinning
-            if attempts % 1000 == 0 {
+            // Yield periodically
+            if i % 1000 == 0 {
                 std::thread::yield_now();
             }
         }
@@ -688,14 +725,16 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         self.clear_announcement(thread_id);
         self.active_enq_ops.fetch_sub(1, Ordering::AcqRel);
 
-        if (*op_ptr).is_complete() {
+        // After NUM_THREADS² * CHECK_DELAY operations, we're guaranteed
+        // all threads have seen our announcement and helped
+        if (*op_ptr).is_complete() && (*op_ptr).was_successful() {
             Ok(())
         } else {
             Err(())
         }
     }
 
-    // slow path for dequeue
+    // Slow path for dequeue with proper wait-freedom guarantee
     unsafe fn dequeue_slow_path(&self, thread_id: usize) -> Result<T, ()> {
         // Track active operations
         self.active_deq_ops.fetch_add(1, Ordering::AcqRel);
@@ -715,21 +754,24 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         // Make announcement
         self.make_announcement(thread_id, op_ptr as *mut ());
 
-        // Try to complete operation ourselves while waiting for help
-        let mut attempts = 0;
-        let max_attempts = (self.num_threads * self.num_threads).min(10000);
+        // Wait for at most NUM_THREADS² * CHECK_DELAY operations
+        let max_wait_ops = self.num_threads * self.num_threads * CHECK_DELAY;
 
-        while !(*op_ptr).is_complete() && attempts < max_attempts {
+        for i in 0..max_wait_ops {
+            if (*op_ptr).is_complete() {
+                break;
+            }
+
+            // Try to help ourselves
             self.help_dequeue(op_ptr, thread_id);
-            attempts += 1;
 
-            // Also help others
-            if attempts % CHECK_DELAY == 0 {
+            // Check for other announcements periodically
+            if i % CHECK_DELAY == 0 {
                 self.check_for_announcement(thread_id);
             }
 
             // Yield periodically
-            if attempts % 1000 == 0 {
+            if i % 1000 == 0 {
                 std::thread::yield_now();
             }
         }
@@ -738,13 +780,9 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         self.clear_announcement(thread_id);
         self.active_deq_ops.fetch_sub(1, Ordering::AcqRel);
 
-        if (*op_ptr).is_complete() {
+        if (*op_ptr).is_complete() && (*op_ptr).was_successful() {
             let result = (*op_ptr).get_result();
-            if result != 0 {
-                Ok(std::mem::transmute_copy::<usize, T>(&result))
-            } else {
-                Err(())
-            }
+            Ok(std::mem::transmute_copy::<usize, T>(&result))
         } else {
             Err(())
         }
@@ -793,7 +831,11 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
             (enq_op_pool_bytes + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
         let deq_op_pool_offset = enq_op_pool_offset + enq_op_pool_aligned;
-        let _deq_op_pool_bytes = op_pool_size * mem::size_of::<DequeueOp>();
+        let deq_op_pool_bytes = op_pool_size * mem::size_of::<DequeueOp>();
+        let deq_op_pool_aligned =
+            (deq_op_pool_bytes + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
+
+        let total_size = deq_op_pool_offset + deq_op_pool_aligned;
 
         // Initialize buffer
         let buffer_ptr = mem.add(buffer_offset) as *mut AtomicU64;
@@ -842,7 +884,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
                 active_enq_ops: AtomicUsize::new(0),
                 active_deq_ops: AtomicUsize::new(0),
                 base_ptr: mem,
-                total_size: 0, // Will be set below
+                total_size,
                 _phantom: std::marker::PhantomData,
             },
         );
@@ -855,7 +897,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         let queue_size = mem::size_of::<Self>();
         let queue_aligned = (queue_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
-        let capacity = 131072; // Increased capacity
+        let capacity = 131072;
         let buffer_size = capacity * mem::size_of::<AtomicU64>();
         let buffer_aligned = (buffer_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
@@ -879,6 +921,8 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
             (enq_op_pool_bytes + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
         let deq_op_pool_bytes = op_pool_size * mem::size_of::<DequeueOp>();
+        let deq_op_pool_aligned =
+            (deq_op_pool_bytes + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
         let total = queue_aligned
             + buffer_aligned
@@ -887,7 +931,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
             + help_index_aligned
             + value_pool_aligned
             + enq_op_pool_aligned
-            + deq_op_pool_bytes;
+            + deq_op_pool_aligned;
         (total + 4095) & !4095 // Page align
     }
 

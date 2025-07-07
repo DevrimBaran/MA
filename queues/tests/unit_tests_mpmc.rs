@@ -1173,25 +1173,54 @@ mod test_feldman_dechev_enhanced {
             std::ptr::write(enq_op, EnqueueOp::new(42, 0));
 
             assert!(!(*enq_op).is_complete());
-            (*enq_op).complete();
+            assert!(!(*enq_op).was_successful());
+
+            // Test successful completion
+            (*enq_op).complete_success();
             assert!((*enq_op).is_complete());
+            assert!((*enq_op).was_successful());
 
             std::alloc::dealloc(enq_op as *mut u8, std::alloc::Layout::new::<EnqueueOp>());
 
+            // Test failure completion
+            let enq_op2 =
+                std::alloc::alloc(std::alloc::Layout::new::<EnqueueOp>()) as *mut EnqueueOp;
+            std::ptr::write(enq_op2, EnqueueOp::new(43, 0));
+
+            (*enq_op2).complete_failure();
+            assert!((*enq_op2).is_complete());
+            assert!(!(*enq_op2).was_successful());
+
+            std::alloc::dealloc(enq_op2 as *mut u8, std::alloc::Layout::new::<EnqueueOp>());
+
+            // Test DequeueOp
             let deq_op =
                 std::alloc::alloc(std::alloc::Layout::new::<DequeueOp>()) as *mut DequeueOp;
             std::ptr::write(deq_op, DequeueOp::new(0));
 
             assert!(!(*deq_op).is_complete());
+            assert!(!(*deq_op).was_successful());
             assert_eq!((*deq_op).get_result(), 0);
 
-            (*deq_op).set_result(123);
+            // Test successful dequeue
+            (*deq_op).complete_success(123);
+            assert!((*deq_op).is_complete());
+            assert!((*deq_op).was_successful());
             assert_eq!((*deq_op).get_result(), 123);
 
-            (*deq_op).complete();
-            assert!((*deq_op).is_complete());
-
             std::alloc::dealloc(deq_op as *mut u8, std::alloc::Layout::new::<DequeueOp>());
+
+            // Test failed dequeue
+            let deq_op2 =
+                std::alloc::alloc(std::alloc::Layout::new::<DequeueOp>()) as *mut DequeueOp;
+            std::ptr::write(deq_op2, DequeueOp::new(0));
+
+            (*deq_op2).complete_failure();
+            assert!((*deq_op2).is_complete());
+            assert!(!(*deq_op2).was_successful());
+            assert_eq!((*deq_op2).get_result(), 0); // Result unchanged on failure
+
+            std::alloc::dealloc(deq_op2 as *mut u8, std::alloc::Layout::new::<DequeueOp>());
         }
     }
 

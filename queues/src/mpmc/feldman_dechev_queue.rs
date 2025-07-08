@@ -1,4 +1,4 @@
-// paper in /paper/mpmc/feldman_dechev_v1.pdf and feldman_dechev_v2_(full).pdf and feldman_dechev_v3.pdf
+// Paper in /paper/mpmc/feldman_dechev_v1.pdf and feldman_dechev_v2_(full).pdf and feldman_dechev_v3.pdf
 use std::cell::UnsafeCell;
 use std::mem;
 use std::ptr;
@@ -14,7 +14,8 @@ const CHECK_DELAY: usize = 8; // Check for announcements every 8 operations
 const ITEMS_PER_THREAD: usize = 200_000;
 const OPS_PER_THREAD: usize = 500;
 
-// Node types stored in the ring buffer
+// Node types - Section 3 in paper
+// Paper uses separate EmptyNode/ElemNode classes, we use tagged pointers for IPC
 #[derive(Clone, Copy)]
 pub struct Node {
     value: u64, // Stores either EmptyType with seqid or pointer to ValueType
@@ -33,18 +34,22 @@ impl Node {
         }
     }
 
+    // is_EmptyNode() - Figure 1
     pub fn is_empty(&self) -> bool {
         (self.value & EMPTY_TYPE_MASK) != 0
     }
 
+    // is_ElemNode() - Figure 1
     pub fn is_value(&self) -> bool {
         !self.is_empty() && (self.value & DELAY_MARK_MASK) == 0
     }
 
+    // is_skipped() - Figure 1
     pub fn is_delay_marked(&self) -> bool {
         (self.value & DELAY_MARK_MASK) != 0
     }
 
+    // set_skipped() - Figure 1
     pub fn set_delay_mark(&mut self) {
         self.value |= DELAY_MARK_MASK;
     }
@@ -53,7 +58,6 @@ impl Node {
         if self.is_empty() {
             self.value >> 2
         } else {
-            // For ValueType, seqid is stored in the ValueType struct
             unsafe {
                 let ptr = (self.value & !DELAY_MARK_MASK) as *mut ValueType<usize>;
                 if ptr.is_null() {
@@ -74,7 +78,7 @@ impl Node {
     }
 }
 
-// ValueType stores the actual enqueued data
+// ValueType - stores actual enqueued data
 #[repr(C)]
 pub struct ValueType<T> {
     pub seqid: u64,
@@ -87,14 +91,14 @@ pub enum OpType {
     Dequeue,
 }
 
-// Operation record for enqueue
+// EnqueueOp - Section 8 Progress Assurance
 #[repr(C)]
 pub struct EnqueueOp {
     pub op_type: OpType,
     pub value: AtomicUsize,
     pub seqid: AtomicU64,
-    pub complete: AtomicBool,
-    pub success: AtomicBool, // Track if operation succeeded
+    pub complete: AtomicBool, // Replaces paper's helper field
+    pub success: AtomicBool,  // IPC adaptation - track success
     pub thread_id: usize,
 }
 
@@ -129,14 +133,14 @@ impl EnqueueOp {
     }
 }
 
-// Operation record for dequeue
+// DequeueOp - Section 8 Progress Assurance
 #[repr(C)]
 pub struct DequeueOp {
     pub op_type: OpType,
     pub result: AtomicUsize,
     pub seqid: AtomicU64,
     pub complete: AtomicBool,
-    pub success: AtomicBool, // Track if operation succeeded
+    pub success: AtomicBool,
     pub thread_id: usize,
 }
 
@@ -176,22 +180,22 @@ impl DequeueOp {
     }
 }
 
-// Main queue structure
+// WFQueue - corresponds to paper's ring buffer
 #[repr(C)]
 pub struct FeldmanDechevWFQueue<T: Send + Clone + 'static> {
-    // Queue state
+    // Core ring buffer - Section 4
     buffer: *mut AtomicU64, // Array of nodes
     capacity: usize,
-    head: AtomicU64,
-    tail: AtomicU64,
+    head: AtomicU64, // head sequence counter
+    tail: AtomicU64, // tail sequence counter
 
-    // Progress assurance
-    announcement_table: *mut AtomicPtr<()>, // Generic op pointers
+    // Progress assurance - Section 8
+    announcement_table: *mut AtomicPtr<()>, // Announcement table
     num_threads: usize,
-    operation_counter: *mut AtomicUsize, // Per-thread operation counters
-    help_index: *mut AtomicUsize,        // Per-thread help indices
+    operation_counter: *mut AtomicUsize, // Per-process op counters
+    help_index: *mut AtomicUsize,        // Per-process help indices
 
-    // Memory pools
+    // Memory pools - IPC adaptation (replaces dynamic allocation)
     value_pool: *mut ValueType<usize>,
     value_pool_size: usize,
     next_value: AtomicUsize,
@@ -201,11 +205,11 @@ pub struct FeldmanDechevWFQueue<T: Send + Clone + 'static> {
     next_enq_op: AtomicUsize,
     next_deq_op: AtomicUsize,
 
-    // Track active operations for debugging
+    // IPC monitoring
     active_enq_ops: AtomicUsize,
     active_deq_ops: AtomicUsize,
 
-    // Shared memory info
+    // Shared memory management
     base_ptr: *mut u8,
     total_size: usize,
 
@@ -216,12 +220,13 @@ unsafe impl<T: Send + Clone> Send for FeldmanDechevWFQueue<T> {}
 unsafe impl<T: Send + Clone> Sync for FeldmanDechevWFQueue<T> {}
 
 impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
+    // get_position() - Figure 1
     unsafe fn get_node(&self, pos: usize) -> &AtomicU64 {
         &*self.buffer.add(pos % self.capacity)
     }
 
+    // backoff() - Figure 1 (enhanced for IPC)
     unsafe fn backoff(&self, pos: usize, expected: Node) -> bool {
-        // Improved backoff with bounded iterations
         let mut spins = 1;
         for i in 0..10 {
             for _ in 0..spins.min(1024) {
@@ -236,7 +241,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
                 return true; // Value changed
             }
 
-            // Yield occasionally to prevent starvation
+            // IPC adaptation - yield for fairness
             if i > 5 {
                 std::thread::yield_now();
             }
@@ -244,7 +249,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         false
     }
 
-    // Check for announcements and help other threads
+    // TryHelpAnother() - Section 8 (adapted for periodic checking)
     unsafe fn check_for_announcement(&self, thread_id: usize) {
         let op_count = (*self.operation_counter.add(thread_id)).fetch_add(1, Ordering::AcqRel);
 
@@ -259,9 +264,8 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         }
     }
 
-    // Help another thread's operation
+    // Help another process's operation
     unsafe fn help_operation(&self, op_ptr: *mut (), helper_thread_id: usize) {
-        // First, determine what type of operation this is
         let op_type_ptr = op_ptr as *const OpType;
         let op_type = *op_type_ptr;
 
@@ -277,7 +281,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         }
     }
 
-    // Help complete an enqueue operation with proper bounds
+    // EnqueueOp::associate() - Algorithm 6
     unsafe fn help_enqueue(&self, op: *mut EnqueueOp, _helper_thread_id: usize) {
         if (*op).is_complete() {
             return;
@@ -285,7 +289,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
 
         let value = (*op).value.load(Ordering::Acquire);
 
-        // Try to complete the enqueue
+        // Get seqid for operation
         let mut seqid = (*op).seqid.load(Ordering::Acquire);
         if seqid == 0 {
             seqid = self.tail.fetch_add(1, Ordering::AcqRel);
@@ -298,7 +302,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
 
         let pos = (seqid % self.capacity as u64) as usize;
 
-        // Bound by MAX_FAILS + NUM_THREADS²
+        // Bounded helping - MAX_FAILS + NUM_THREADS²
         let max_help_attempts = MAX_FAILS + (self.num_threads * self.num_threads);
 
         for attempt in 0..max_help_attempts {
@@ -310,10 +314,9 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
             let node = Node { value: node_val };
 
             if node.is_empty() && node.get_seqid() <= seqid && !node.is_delay_marked() {
-                // Try to complete the enqueue
+                // IPC: allocate from pool instead of heap
                 let value_idx = self.next_value.fetch_add(1, Ordering::AcqRel);
                 if value_idx >= self.value_pool_size {
-                    // Mark operation as failed due to pool exhaustion
                     (*op).complete_failure();
                     return;
                 }
@@ -343,12 +346,11 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
                     return;
                 }
             } else if node.get_seqid() > seqid || node.is_value() {
-                // Position is already past our seqid
                 (*op).complete_failure();
                 return;
             }
 
-            // Yield periodically to prevent excessive spinning
+            // IPC: periodic yield
             if attempt % 1000 == 0 {
                 std::thread::yield_now();
             } else {
@@ -356,17 +358,15 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
             }
         }
 
-        // After MAX_FAILS + NUM_THREADS² attempts, mark as complete
         (*op).complete_failure();
     }
 
-    // Help complete a dequeue operation with proper bounds
+    // DequeueOp::associate() - Algorithm 2
     unsafe fn help_dequeue(&self, op: *mut DequeueOp, _helper_thread_id: usize) {
         if (*op).is_complete() {
             return;
         }
 
-        // Try to complete the dequeue
         let mut seqid = (*op).seqid.load(Ordering::Acquire);
         if seqid == 0 {
             seqid = self.head.fetch_add(1, Ordering::AcqRel);
@@ -379,7 +379,6 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
 
         let pos = (seqid % self.capacity as u64) as usize;
 
-        // Bound by MAX_FAILS + NUM_THREADS²
         let max_help_attempts = MAX_FAILS + (self.num_threads * self.num_threads);
 
         for attempt in 0..max_help_attempts {
@@ -409,12 +408,10 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
                     return;
                 }
             } else if node.get_seqid() > seqid {
-                // No element with this seqid exists
                 (*op).complete_failure();
                 return;
             }
 
-            // Yield periodically
             if attempt % 1000 == 0 {
                 std::thread::yield_now();
             } else {
@@ -422,11 +419,10 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
             }
         }
 
-        // After MAX_FAILS + NUM_THREADS² attempts, mark as complete
         (*op).complete_failure();
     }
 
-    // Make announcement for help
+    // make_announcement() - Section 8
     unsafe fn make_announcement(&self, thread_id: usize, op_ptr: *mut ()) {
         (*self.announcement_table.add(thread_id)).store(op_ptr, Ordering::Release);
         fence(Ordering::SeqCst);
@@ -437,24 +433,27 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         (*self.announcement_table.add(thread_id)).store(ptr::null_mut(), Ordering::Release);
     }
 
+    // Enqueue() - Algorithm 4
     pub fn enqueue(&self, thread_id: usize, item: T) -> Result<(), ()> {
         unsafe {
-            // Check for announcements periodically
+            // Line 1: try_help_another()
             self.check_for_announcement(thread_id);
 
             let mut fails = 0;
 
-            // Convert item to usize once, outside the loop
+            // IPC: convert to usize for shared memory
             let value_as_usize = std::mem::transmute_copy::<T, usize>(&item);
             std::mem::forget(item);
 
             loop {
+                // Line 11-14: Check MAX_FAILS
                 if fails >= MAX_FAILS {
-                    // Switch to wait-free slow path
                     return self.enqueue_slow_path(thread_id, value_as_usize);
                 }
 
+                // Line 7: seqid = next_tail_seq()
                 let seqid = self.tail.fetch_add(1, Ordering::AcqRel);
+                // Line 8: pos = get_position(seqid)
                 let pos = (seqid % self.capacity as u64) as usize;
 
                 loop {
@@ -463,29 +462,31 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
                         break;
                     }
 
+                    // Line 16: node = buffer[pos].load()
                     let node_val = self.get_node(pos).load(Ordering::Acquire);
                     let node = Node { value: node_val };
 
-                    // Check if marked as skipped
+                    // Line 20: if is_skipped(node)
                     if node.is_delay_marked() {
-                        break; // Get new seqid
+                        break; // Line 22: break
                     }
 
+                    // Line 26: if node.seqid < seqid
                     if node.is_empty() {
                         let node_seqid = node.get_seqid();
 
                         if node_seqid < seqid {
-                            // Backoff and retry
+                            // Line 27: backoff()
                             if !self.backoff(pos, node) {
                                 continue;
                             }
                         }
 
+                        // Line 28: if node.seqid <= seqid and is_EmptyNode(node)
                         if node_seqid <= seqid {
-                            // Try to enqueue
+                            // IPC: allocate from pool
                             let value_idx = self.next_value.fetch_add(1, Ordering::AcqRel);
                             if value_idx >= self.value_pool_size {
-                                // Try slow path before giving up
                                 return self.enqueue_slow_path(thread_id, value_as_usize);
                             }
 
@@ -501,6 +502,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
 
                             let new_node = Node::new_value(value_ptr, seqid);
 
+                            // Line 29: success = buffer[pos].cas(node, n_node)
                             if self
                                 .get_node(pos)
                                 .compare_exchange(
@@ -511,17 +513,15 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
                                 )
                                 .is_ok()
                             {
-                                return Ok(());
+                                return Ok(()); // Line 31: return true
                             }
 
-                            // CAS failed, continue
                             continue;
                         } else {
-                            // node_seqid > seqid, get new seqid
-                            break;
+                            // Line 34: else if node.seqid > seqid
+                            break; // Line 35: break
                         }
                     } else {
-                        // Position has a value, get new seqid
                         break;
                     }
                 }
@@ -529,25 +529,30 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         }
     }
 
+    // Dequeue() - Algorithm 1
     pub fn dequeue(&self, thread_id: usize) -> Result<T, ()> {
         unsafe {
-            // Check for announcements periodically
+            // Line 1: try_help_another()
             self.check_for_announcement(thread_id);
 
             let mut fails = 0;
 
             loop {
+                // Line 11-15: Check MAX_FAILS
                 if fails >= MAX_FAILS {
-                    // Switch to wait-free slow path
                     return self.dequeue_slow_path(thread_id);
                 }
 
+                // Line 4-6: Check if empty
                 if self.is_empty() {
                     return Err(());
                 }
 
+                // Line 7: seqid = next_head_seq()
                 let seqid = self.head.fetch_add(1, Ordering::AcqRel);
+                // Line 8: pos = get_position(seqid)
                 let pos = (seqid % self.capacity as u64) as usize;
+                // Line 9: n_node = EmptyNode(seqid + capacity)
                 let empty_node = Node::new_empty(seqid + self.capacity as u64);
 
                 loop {
@@ -556,11 +561,12 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
                         break;
                     }
 
+                    // Line 16: node = buffer[pos].load()
                     let node_val = self.get_node(pos).load(Ordering::Acquire);
                     let node = Node { value: node_val };
 
+                    // Line 20-25: if is_skipped(node) and is_EmptyNode(node)
                     if node.is_delay_marked() && node.is_empty() {
-                        // Already processed delay marked empty node
                         if self
                             .get_node(pos)
                             .compare_exchange(
@@ -571,25 +577,28 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
                             )
                             .is_ok()
                         {
-                            break;
+                            break; // Line 22: break
                         }
-                        continue;
+                        continue; // Line 24: continue
                     }
 
+                    // Line 37: if seqid < node.seqid
                     if node.get_seqid() > seqid {
-                        break; // Get new seqid
+                        break; // Line 38: break
                     }
 
+                    // Line 40: if is_ElemNode(node)
                     if node.is_value() {
                         let value_seqid = node.get_seqid();
 
                         if value_seqid == seqid {
-                            // This is our element
                             let mut replacement = empty_node;
+                            // Line 41-43: Handle delay marking
                             if node.is_delay_marked() {
                                 replacement.set_delay_mark();
                             }
 
+                            // Line 44: success = buffer[pos].cas(node, n_node)
                             if self
                                 .get_node(pos)
                                 .compare_exchange(
@@ -600,13 +609,13 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
                                 )
                                 .is_ok()
                             {
+                                // Line 46-47: Extract value and return
                                 let value_ptr = node.get_value_ptr();
                                 let value = (*(*value_ptr).value.get()).take().unwrap();
-                                // Transmute back to T
+                                // IPC: convert back from usize
                                 return Ok(std::mem::transmute_copy::<usize, T>(&value));
                             }
 
-                            // Retry if it was delay marked
                             let current = Node {
                                 value: self.get_node(pos).load(Ordering::Acquire),
                             };
@@ -614,18 +623,20 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
                                 continue;
                             }
                         } else if value_seqid < seqid {
-                            // Delayed element, mark for correction
+                            // Delayed element - mark for correction
                             if !self.backoff(pos, node) {
-                                // Mark as delayed
+                                // Line 34: set_skipped(&buffer[pos])
                                 self.atomic_delay_mark(pos);
                             }
                         }
                     } else if node.is_empty() {
                         let empty_seqid = node.get_seqid();
 
+                        // Line 26: if seqid > node.seqid
                         if empty_seqid < seqid {
+                            // Line 27: backoff()
                             if !self.backoff(pos, node) {
-                                // Try to advance
+                                // Line 30: Try to advance
                                 self.get_node(pos)
                                     .compare_exchange(
                                         node_val,
@@ -636,7 +647,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
                                     .ok();
                             }
                         } else {
-                            // Mark as delay marked empty with large seqid
+                            // IPC: use large seqid to prevent conflicts
                             let current_tail = self.tail.load(Ordering::Acquire);
                             let large_seqid = current_tail + 2 * self.capacity as u64;
                             let mut large_empty = Node::new_empty(large_seqid);
@@ -657,6 +668,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         }
     }
 
+    // Atomic delay marking (bitmarking) - Section 9
     unsafe fn atomic_delay_mark(&self, pos: usize) {
         loop {
             let current = self.get_node(pos).load(Ordering::Acquire);
@@ -678,18 +690,18 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         }
     }
 
-    // Slow path for enqueue with proper wait-freedom guarantee
+    // Wait-Free Enqueue - Algorithm 5
     unsafe fn enqueue_slow_path(&self, thread_id: usize, value: usize) -> Result<(), ()> {
-        // Track active operations
+        // IPC: track active operations
         self.active_enq_ops.fetch_add(1, Ordering::AcqRel);
 
-        // Use thread-local op slot to avoid pool exhaustion
+        // IPC: use thread-local slots to prevent exhaustion
         let op_idx = thread_id * OPS_PER_THREAD
             + (self.next_enq_op.fetch_add(1, Ordering::AcqRel) % OPS_PER_THREAD);
 
         if op_idx >= self.num_threads * OPS_PER_THREAD {
             self.active_enq_ops.fetch_sub(1, Ordering::AcqRel);
-            return Err(()); // Op pool exhausted
+            return Err(());
         }
 
         let op_ptr = self.enq_op_pool.add(op_idx);
@@ -698,8 +710,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         // Make announcement
         self.make_announcement(thread_id, op_ptr as *mut ());
 
-        // Wait for at most NUM_THREADS² * CHECK_DELAY operations
-        // This ensures all threads will have checked announcements
+        // Wait for NUM_THREADS² * CHECK_DELAY operations
         let max_wait_ops = self.num_threads * self.num_threads * CHECK_DELAY;
 
         for i in 0..max_wait_ops {
@@ -707,26 +718,20 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
                 break;
             }
 
-            // Try to help ourselves
             self.help_enqueue(op_ptr, thread_id);
 
-            // Check for other announcements periodically
             if i % CHECK_DELAY == 0 {
                 self.check_for_announcement(thread_id);
             }
 
-            // Yield periodically
             if i % 1000 == 0 {
                 std::thread::yield_now();
             }
         }
 
-        // Clear announcement
         self.clear_announcement(thread_id);
         self.active_enq_ops.fetch_sub(1, Ordering::AcqRel);
 
-        // After NUM_THREADS² * CHECK_DELAY operations, we're guaranteed
-        // all threads have seen our announcement and helped
         if (*op_ptr).is_complete() && (*op_ptr).was_successful() {
             Ok(())
         } else {
@@ -734,27 +739,23 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         }
     }
 
-    // Slow path for dequeue with proper wait-freedom guarantee
+    // Wait-Free Dequeue - Algorithm 3
     unsafe fn dequeue_slow_path(&self, thread_id: usize) -> Result<T, ()> {
-        // Track active operations
         self.active_deq_ops.fetch_add(1, Ordering::AcqRel);
 
-        // Use thread-local op slot
         let op_idx = thread_id * OPS_PER_THREAD
             + (self.next_deq_op.fetch_add(1, Ordering::AcqRel) % OPS_PER_THREAD);
 
         if op_idx >= self.num_threads * OPS_PER_THREAD {
             self.active_deq_ops.fetch_sub(1, Ordering::AcqRel);
-            return Err(()); // Op pool exhausted
+            return Err(());
         }
 
         let op_ptr = self.deq_op_pool.add(op_idx);
         ptr::write(op_ptr, DequeueOp::new(thread_id));
 
-        // Make announcement
         self.make_announcement(thread_id, op_ptr as *mut ());
 
-        // Wait for at most NUM_THREADS² * CHECK_DELAY operations
         let max_wait_ops = self.num_threads * self.num_threads * CHECK_DELAY;
 
         for i in 0..max_wait_ops {
@@ -762,21 +763,17 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
                 break;
             }
 
-            // Try to help ourselves
             self.help_dequeue(op_ptr, thread_id);
 
-            // Check for other announcements periodically
             if i % CHECK_DELAY == 0 {
                 self.check_for_announcement(thread_id);
             }
 
-            // Yield periodically
             if i % 1000 == 0 {
                 std::thread::yield_now();
             }
         }
 
-        // Clear announcement
         self.clear_announcement(thread_id);
         self.active_deq_ops.fetch_sub(1, Ordering::AcqRel);
 
@@ -788,15 +785,16 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         }
     }
 
+    // Initialize in shared memory (IPC adaptation)
     pub unsafe fn init_in_shared(mem: *mut u8, num_threads: usize) -> &'static mut Self {
         let queue_ptr = mem as *mut Self;
 
-        // Calculate memory layout with updated sizes
+        // Calculate memory layout
         let queue_size = mem::size_of::<Self>();
         let queue_aligned = (queue_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
         // Ring buffer
-        let capacity = 131072; // Increased from 65536 for better scalability
+        let capacity = 131072; // Larger for IPC
         let buffer_offset = queue_aligned;
         let buffer_size = capacity * mem::size_of::<AtomicU64>();
         let buffer_aligned = (buffer_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
@@ -823,7 +821,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         let value_pool_bytes = value_pool_size * mem::size_of::<ValueType<usize>>();
         let value_pool_aligned = (value_pool_bytes + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
-        // Op pools
+        // Operation pools
         let op_pool_size = num_threads * OPS_PER_THREAD;
         let enq_op_pool_offset = value_pool_offset + value_pool_aligned;
         let enq_op_pool_bytes = op_pool_size * mem::size_of::<EnqueueOp>();
@@ -837,7 +835,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
 
         let total_size = deq_op_pool_offset + deq_op_pool_aligned;
 
-        // Initialize buffer
+        // Initialize buffer with EmptyNodes
         let buffer_ptr = mem.add(buffer_offset) as *mut AtomicU64;
         for i in 0..capacity {
             let empty_node = Node::new_empty(i as u64);
@@ -856,10 +854,10 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
             ptr::write(op_counter_ptr.add(i), AtomicUsize::new(0));
         }
 
-        // Initialize help indices
+        // Initialize help indices - start at different positions
         let help_index_ptr = mem.add(help_index_offset) as *mut AtomicUsize;
         for i in 0..num_threads {
-            ptr::write(help_index_ptr.add(i), AtomicUsize::new(i)); // Start at different positions
+            ptr::write(help_index_ptr.add(i), AtomicUsize::new(i));
         }
 
         // Initialize queue
@@ -945,7 +943,7 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
         (tail - head) >= self.capacity as u64
     }
 
-    // Debug helpers
+    // IPC monitoring helpers
     pub fn active_operations(&self) -> (usize, usize) {
         (
             self.active_enq_ops.load(Ordering::Acquire),

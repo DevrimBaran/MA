@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::MpmcQueue;
 
 const CACHE_LINE_SIZE: usize = 64;
-const FALSE_SHARING_MULTIPLIER: usize = 8; // Padding multiplier to avoid false sharing
+const FALSE_SHARING_MULTIPLIER: usize = 8; // Paper section 3.3: padding by 8x to avoid false sharing
 
-// Operation types for requests
+// Paper section 3.1.3: Operation types for requests
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 enum OpType {
@@ -18,13 +18,13 @@ enum OpType {
     Dequeue = 2,
 }
 
-// Request structure that workers use to communicate with helper
+// Paper section 3.1.3: Request structure from state array
 #[repr(C, align(64))]
 pub struct Request<T> {
     pub op_type: AtomicU8,
     pub element: UnsafeCell<Option<T>>,
     pub is_completed: AtomicBool,
-    _padding: [u8; CACHE_LINE_SIZE - 17], // Ensure cache line alignment
+    _padding: [u8; CACHE_LINE_SIZE - 17], // IPC: explicit cache line padding
 }
 
 impl<T> Request<T> {
@@ -38,10 +38,10 @@ impl<T> Request<T> {
     }
 }
 
-// Node structure for the internal linked list
+// Paper section 3.1.3: Node structure for internal linked list
 struct Node<T> {
     value: Option<T>,
-    next: AtomicUsize, // Using usize to store pointer as offset in shared memory
+    next: AtomicUsize, // IPC: pointer as offset instead of raw pointer
 }
 
 impl<T> Node<T> {
@@ -53,26 +53,26 @@ impl<T> Node<T> {
     }
 }
 
-// Main queue structure
+// Paper section 3.1.3: Main queue structure (Listing 3.1)
 #[repr(C)]
 pub struct WFQueue<T: Send + Clone + 'static> {
-    // Queue state
-    head: AtomicUsize,
-    tail: AtomicUsize,
+    // Paper: Queue state from Listing 3.1
+    head: AtomicUsize, // IPC: as offset
+    tail: AtomicUsize, // IPC: as offset
     size: AtomicUsize,
-    pub num_threads: usize,
+    pub num_threads: usize, // Paper: workers
 
-    // Helper control
+    // IPC: Helper control flags
     helper_should_stop: AtomicBool,
     helper_running: AtomicBool,
 
-    // Memory layout offsets
+    // IPC: Memory layout management
     state_array_offset: usize,
     nodes_offset: usize,
     node_pool_size: usize,
     next_free_node: AtomicUsize,
 
-    // Shared memory info
+    // IPC: Shared memory tracking
     pub base_ptr: *mut u8,
     total_size: usize,
 
@@ -82,7 +82,7 @@ pub struct WFQueue<T: Send + Clone + 'static> {
 unsafe impl<T: Send + Clone> Send for WFQueue<T> {}
 unsafe impl<T: Send + Clone> Sync for WFQueue<T> {}
 
-// AtomicU8 wrapper for OpType
+// IPC: AtomicU8 wrapper since Rust doesn't have native AtomicU8
 pub struct AtomicU8(AtomicUsize);
 
 impl AtomicU8 {
@@ -100,15 +100,14 @@ impl AtomicU8 {
 }
 
 impl<T: Send + Clone + 'static> WFQueue<T> {
-    // Get request for a specific thread
+    // IPC: Get request from state array using offset calculation
     pub unsafe fn get_request(&self, thread_id: usize) -> &Request<T> {
         let state_array_ptr = self.base_ptr.add(self.state_array_offset) as *const Request<T>;
-        // Apply false sharing padding
-        let actual_index = thread_id * FALSE_SHARING_MULTIPLIER;
+        let actual_index = thread_id * FALSE_SHARING_MULTIPLIER; // Paper: false sharing padding
         &*state_array_ptr.add(actual_index)
     }
 
-    // Get node by index
+    // IPC: Get node by index (0 is null in paper)
     unsafe fn get_node(&self, index: usize) -> &mut Node<T> {
         if index == 0 {
             panic!("Attempting to access null node");
@@ -117,7 +116,7 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
         &mut *nodes_ptr.add(index - 1) // -1 because 0 is reserved for null
     }
 
-    // Allocate a new node
+    // IPC: Pre-allocated node pool instead of dynamic allocation
     unsafe fn allocate_node(&self, value: Option<T>) -> usize {
         let index = self.next_free_node.fetch_add(1, Ordering::AcqRel);
         let node = self.get_node(index + 1); // +1 because 0 is null
@@ -126,70 +125,79 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
         index + 1
     }
 
-    // Helper process main loop - MUST be called from a dedicated process/thread
+    // Paper Listing 3.5: Helper algorithm
     pub unsafe fn run_helper(&self) {
-        let mut current_index = 0;
+        let mut current_index = 0; // Paper line 2: id = 0
         self.helper_running.store(true, Ordering::Release);
 
+        // Paper line 4: infinite loop
         while !self.helper_should_stop.load(Ordering::Acquire) {
+            // Paper line 6: read request from state array
             let request = self.get_request(current_index);
             let op_type = request.op_type.load(Ordering::Acquire);
 
+            // Paper line 8-9: if there is a request
             if op_type != OpType::None as u8 && !request.is_completed.load(Ordering::Acquire) {
                 match op_type {
                     1 => {
-                        // Enqueue
+                        // Paper lines 11-22: Enqueue operation
                         let element = (*request.element.get()).clone();
                         if let Some(elem) = element {
+                            // Paper line 13: create new node with value e
                             let new_node_index = self.allocate_node(Some(elem));
                             let tail_index = self.tail.load(Ordering::Acquire);
 
-                            // Append to tail
+                            // Paper line 15: append node to tail
                             let tail_node = self.get_node(tail_index);
                             tail_node.next.store(new_node_index, Ordering::Release);
 
-                            // Update tail reference
+                            // Paper line 17: update tail reference
                             self.tail.store(new_node_index, Ordering::Release);
+                            // Paper line 19: increase size of queue
                             self.size.fetch_add(1, Ordering::AcqRel);
                         }
+                        // Paper line 21: mark request as completed
                         request.is_completed.store(true, Ordering::Release);
                     }
                     2 => {
-                        // Dequeue
+                        // Paper lines 25-51: Dequeue operation
                         let head_index = self.head.load(Ordering::Acquire);
                         let head_node = self.get_node(head_index);
                         let next_index = head_node.next.load(Ordering::Acquire);
 
                         if next_index != 0 {
-                            // Get the actual element
+                            // Paper line 35-50: queue has elements
                             let next_node = self.get_node(next_index);
                             let value = next_node.value.take();
 
-                            // Update head
+                            // Paper line 38: unlink top element
                             self.head.store(next_index, Ordering::Release);
 
+                            // Paper line 45: update request with element
                             *request.element.get() = value;
+                            // Paper line 47: decrease size
                             self.size.fetch_sub(1, Ordering::AcqRel);
                         } else {
-                            // Queue is empty
+                            // Paper line 27-32: queue is empty
                             *request.element.get() = None;
                         }
+                        // Paper line 49: mark request as completed
                         request.is_completed.store(true, Ordering::Release);
                     }
                     _ => {}
                 }
             }
 
-            // Move to next process in round-robin fashion
+            // Paper line 71: increment index id++%worker
             current_index = (current_index + 1) % self.num_threads;
 
-            // Small yield to prevent busy spinning
+            // small delay to avoid busy waiting
             if current_index == 0 {
                 std::hint::spin_loop();
             }
         }
 
-        // Process any remaining requests before exiting
+        // IPC: Clean shutdown - process remaining requests
         for _ in 0..self.num_threads {
             for i in 0..self.num_threads {
                 let request = self.get_request(i);
@@ -198,7 +206,6 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
                 if op_type != OpType::None as u8 && !request.is_completed.load(Ordering::Acquire) {
                     match op_type {
                         1 => {
-                            // Enqueue
                             let element = (*request.element.get()).clone();
                             if let Some(elem) = element {
                                 let new_node_index = self.allocate_node(Some(elem));
@@ -211,7 +218,6 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
                             request.is_completed.store(true, Ordering::Release);
                         }
                         2 => {
-                            // Dequeue
                             let head_index = self.head.load(Ordering::Acquire);
                             let head_node = self.get_node(head_index);
                             let next_index = head_node.next.load(Ordering::Acquire);
@@ -236,21 +242,21 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
         self.helper_running.store(false, Ordering::Release);
     }
 
-    // Initialize queue in shared memory
+    // IPC: Initialize queue in shared memory (adapted from Listing 3.1)
     pub unsafe fn init_in_shared(mem: *mut u8, num_threads: usize) -> &'static mut Self {
         let queue_ptr = mem as *mut Self;
 
-        // Calculate memory layout
+        // IPC: Calculate memory layout
         let queue_size = mem::size_of::<Self>();
         let queue_aligned = (queue_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
-        // State array with false sharing padding
+        // IPC: State array with false sharing padding
         let state_array_size =
             num_threads * FALSE_SHARING_MULTIPLIER * mem::size_of::<Request<T>>();
         let state_array_offset = queue_aligned;
         let state_array_aligned = (state_array_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
-        // Node pool
+        // IPC: Pre-allocated node pool
         let items_per_thread = 150_000;
         let node_pool_size = num_threads * items_per_thread * 2;
         let nodes_offset = state_array_offset + state_array_aligned;
@@ -258,14 +264,14 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
 
         let total_size = nodes_offset + nodes_size;
 
-        // Initialize queue header
+        // Paper Listing 3.1: Initialize queue
         ptr::write(
             queue_ptr,
             Self {
                 head: AtomicUsize::new(0),
                 tail: AtomicUsize::new(0),
                 size: AtomicUsize::new(0),
-                num_threads,
+                num_threads, // Paper: workers = n
                 helper_should_stop: AtomicBool::new(false),
                 helper_running: AtomicBool::new(false),
                 state_array_offset,
@@ -280,19 +286,19 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
 
         let queue = &mut *queue_ptr;
 
-        // Initialize state array
+        // Paper: Initialize state array
         let state_array_ptr = mem.add(state_array_offset) as *mut Request<T>;
         for i in 0..num_threads * FALSE_SHARING_MULTIPLIER {
             ptr::write(state_array_ptr.add(i), Request::new());
         }
 
-        // Initialize node pool
+        // IPC: Initialize node pool
         let nodes_ptr = mem.add(nodes_offset) as *mut Node<T>;
         for i in 0..node_pool_size {
             ptr::write(nodes_ptr.add(i), Node::new(None));
         }
 
-        // Initialize sentinel node
+        // Paper Listing 3.1: Create sentinel node
         let sentinel_index = queue.allocate_node(None);
         queue.head.store(sentinel_index, Ordering::Release);
         queue.tail.store(sentinel_index, Ordering::Release);
@@ -300,7 +306,7 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
         queue
     }
 
-    // Calculate required shared memory size
+    // IPC: Calculate required shared memory size
     pub fn shared_size(num_threads: usize) -> usize {
         let queue_size = mem::size_of::<Self>();
         let queue_aligned = (queue_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
@@ -317,7 +323,7 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
         (total + 4095) & !4095 // Page align
     }
 
-    // Stop helper thread
+    // IPC: Helper lifecycle management
     pub fn stop_helper(&self) {
         self.helper_should_stop.store(true, Ordering::Release);
         while self.helper_running.load(Ordering::Acquire) {
@@ -325,66 +331,68 @@ impl<T: Send + Clone + 'static> WFQueue<T> {
         }
     }
 
-    // Enqueue operation (following paper's Listing 3.2)
+    // Paper Listing 3.2: Enqueue operation
     pub fn enqueue(&self, thread_id: usize, item: T) -> Result<(), ()> {
         unsafe {
             if thread_id >= self.num_threads {
                 return Err(());
             }
 
+            // Paper line 3: get thread id (passed as param)
             let request = self.get_request(thread_id);
 
-            // Create request with element e and ENQUEUE type (lines 4-5 in paper)
+            // Paper line 5: create request with element e
             *request.element.get() = Some(item);
             request.is_completed.store(false, Ordering::Release);
 
-            // Post this request in state array (line 7 in paper)
+            // Paper line 7: post request in state array
             request
                 .op_type
                 .store(OpType::Enqueue as u8, Ordering::Release);
 
-            // Wait until the operation is completed (line 9 in paper)
+            // Paper line 9: wait until operation is completed
             while !request.is_completed.load(Ordering::Acquire) {
                 std::hint::spin_loop();
             }
 
-            // Clear the request from state array (line 11 in paper - stateArr[id] = null)
+            // Paper line 11: clear request from state array
             request.op_type.store(OpType::None as u8, Ordering::Release);
             unsafe {
                 *request.element.get() = None;
             }
 
-            Ok(())
+            Ok(()) // Paper line 13: return true
         }
     }
 
-    // Dequeue operation (following paper's Listing 3.3)
+    // Paper Listing 3.3: Dequeue operation
     pub fn dequeue(&self, thread_id: usize) -> Result<T, ()> {
         unsafe {
             if thread_id >= self.num_threads {
                 return Err(());
             }
 
+            // Paper line 3: get thread id (passed as param)
             let request = self.get_request(thread_id);
 
-            // Create request with empty value field and DEQUEUE type (lines 4-5 in paper)
+            // Paper line 5: create request with empty value field
             *request.element.get() = None;
             request.is_completed.store(false, Ordering::Release);
 
-            // Put the request in state array (line 7 in paper)
+            // Paper line 7: put request in state array
             request
                 .op_type
                 .store(OpType::Dequeue as u8, Ordering::Release);
 
-            // Wait until the operation completes (line 9 in paper)
+            // Paper line 9: wait until operation completes
             while !request.is_completed.load(Ordering::Acquire) {
                 std::hint::spin_loop();
             }
 
-            // Get result before clearing (line 13 in paper - return req.e)
+            // Paper line 13: return req.e
             let result = (*request.element.get()).take();
 
-            // Clear the request from state array (line 11 in paper)
+            // Paper line 11: clear request from state array
             request.op_type.store(OpType::None as u8, Ordering::Release);
 
             result.ok_or(())
@@ -423,6 +431,6 @@ impl<T: Send + Clone + 'static> MpmcQueue<T> for WFQueue<T> {
 
 impl<T: Send + Clone> Drop for WFQueue<T> {
     fn drop(&mut self) {
-        // In shared memory context, helper should be stopped externally
+        // IPC: Helper should be stopped externally before drop
     }
 }

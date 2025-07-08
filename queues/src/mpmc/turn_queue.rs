@@ -7,12 +7,12 @@ use std::sync::atomic::{fence, AtomicI32, AtomicPtr, AtomicUsize, Ordering};
 const NOIDX: i32 = -1;
 const CACHE_LINE_SIZE: usize = 64;
 
-// Node structure as described in Algorithm 1
+// Node structure - Algorithm 1
 #[repr(C, align(64))]
 struct Node<T> {
     item: *mut T,
-    enq_tid: usize,
-    deq_tid: AtomicI32,
+    enq_tid: usize,     // Used only by enqueue()
+    deq_tid: AtomicI32, // Used by dequeue()
     next: AtomicPtr<Node<T>>,
     _padding: [u8; CACHE_LINE_SIZE - 32],
 }
@@ -21,7 +21,7 @@ impl<T> Node<T> {
     fn new_sentinel() -> Self {
         Self {
             item: ptr::null_mut(),
-            enq_tid: 0,
+            enq_tid: 0, // Paper sets to 0 for sentinel
             deq_tid: AtomicI32::new(NOIDX),
             next: AtomicPtr::new(ptr::null_mut()),
             _padding: [0; CACHE_LINE_SIZE - 32],
@@ -39,7 +39,7 @@ impl<T> Node<T> {
     }
 }
 
-// Hazard pointer implementation for memory reclamation
+// Hazard pointer implementation for memory reclamation (Section 3.1)
 #[repr(C)]
 struct HazardPointers<T> {
     hp_list: *mut AtomicPtr<Node<T>>,
@@ -51,9 +51,10 @@ impl<T> HazardPointers<T> {
     const HP_HEAD: usize = 0;
     const HP_TAIL: usize = 1;
     const HP_NEXT: usize = 2;
-    const HP_DEQ: usize = 3;
+    const HP_DEQ: usize = 3; // For protecting deqhelp[ldeqTid] in line 52
     const MAX_HPS: usize = 4;
 
+    // IPC adaptation - initialize in shared memory
     unsafe fn new(base_ptr: *mut u8, offset: usize, num_threads: usize) -> Self {
         let hp_ptr = base_ptr.add(offset) as *mut AtomicPtr<Node<T>>;
         let total_hps = num_threads * Self::MAX_HPS;
@@ -70,6 +71,7 @@ impl<T> HazardPointers<T> {
         }
     }
 
+    // protectPtr from paper - Algorithm 5 line 84
     unsafe fn protect_ptr(
         &self,
         thread_id: usize,
@@ -82,6 +84,7 @@ impl<T> HazardPointers<T> {
         ptr
     }
 
+    // clear() method mentioned in paper
     unsafe fn clear(&self, thread_id: usize) {
         for i in 0..self.max_hps_per_thread {
             let idx = thread_id * self.max_hps_per_thread + i;
@@ -99,13 +102,13 @@ impl<T> HazardPointers<T> {
 pub struct TurnQueue<T: Send + Clone + 'static> {
     head: AtomicPtr<Node<T>>,
     tail: AtomicPtr<Node<T>>,
-    enqueuers: *mut AtomicPtr<Node<T>>,
-    deqself: *mut AtomicPtr<Node<T>>,
-    deqhelp: *mut AtomicPtr<Node<T>>,
+    enqueuers: *mut AtomicPtr<Node<T>>, // Array for enqueue requests
+    deqself: *mut AtomicPtr<Node<T>>,   // First array for dequeue requests
+    deqhelp: *mut AtomicPtr<Node<T>>,   // Second array for dequeue results
     hazard_pointers: HazardPointers<T>,
     num_threads: usize,
 
-    // Memory management
+    // IPC memory management - replaces heap allocation
     node_pool: *mut Node<T>,
     item_pool: *mut T,
     pool_size: usize,
@@ -128,7 +131,7 @@ impl<T: Send + Clone + 'static> TurnQueue<T> {
                 return Err(());
             }
 
-            // Allocate space for item and node
+            // IPC adaptation - allocate from pools instead of heap
             let item_idx = self.next_item.fetch_add(1, Ordering::AcqRel);
             if item_idx >= self.pool_size {
                 return Err(()); // Pool exhausted
@@ -142,15 +145,16 @@ impl<T: Send + Clone + 'static> TurnQueue<T> {
                 return Err(()); // Pool exhausted
             }
 
+            // Line 3: new Node(item,myidx)
             let my_node = self.node_pool.add(node_idx);
             ptr::write(my_node, Node::new(item_ptr, thread_id));
 
-            // Line 4: Store node in enqueuers array
+            // Line 4: enqueuers[myidx].store(myNode)
             (*self.enqueuers.add(thread_id)).store(my_node, Ordering::Release);
 
-            // Lines 5-25: Main enqueue loop
+            // Line 5: for (int i = 0; i < maxThreads; i++)
             for _ in 0..self.num_threads {
-                // Line 6-8: Check if our request was completed
+                // Lines 6-8: Check if our request was completed
                 if (*self.enqueuers.add(thread_id))
                     .load(Ordering::Acquire)
                     .is_null()
@@ -159,18 +163,19 @@ impl<T: Send + Clone + 'static> TurnQueue<T> {
                     return Ok(());
                 }
 
-                // Line 10-11: Protect and validate tail
+                // Line 10: hp.protectPtr(kHpTail, tail.load())
                 let ltail = self.hazard_pointers.protect_ptr(
                     thread_id,
                     HazardPointers::<T>::HP_TAIL,
                     self.tail.load(Ordering::Acquire),
                 );
 
+                // Line 11: if (ltail != tail.load()) continue
                 if ltail != self.tail.load(Ordering::Acquire) {
                     continue;
                 }
 
-                // Lines 12-15: Clear completed request from enqueuers
+                // Lines 12-15: Clear completed request
                 if (*self.enqueuers.add((*ltail).enq_tid)).load(Ordering::Acquire) == ltail {
                     (*self.enqueuers.add((*ltail).enq_tid))
                         .compare_exchange(
@@ -187,8 +192,9 @@ impl<T: Send + Clone + 'static> TurnQueue<T> {
                     let idx = (j + (*ltail).enq_tid) % self.num_threads;
                     let node_help = (*self.enqueuers.add(idx)).load(Ordering::Acquire);
 
+                    // Line 18: if (nodeHelp == nullptr) continue
                     if !node_help.is_null() {
-                        // Line 20: Try to append node
+                        // Line 20: ltail->next.compare_exchange_strong(nullnode, nodeHelp)
                         let null_node = ptr::null_mut();
                         if (*ltail)
                             .next
@@ -216,7 +222,7 @@ impl<T: Send + Clone + 'static> TurnQueue<T> {
                 }
             }
 
-            // Line 26: Clear our request
+            // Line 26: enqueuers[myidx].store(nullptr)
             (*self.enqueuers.add(thread_id)).store(ptr::null_mut(), Ordering::Release);
             self.hazard_pointers.clear(thread_id);
             Ok(())
@@ -235,49 +241,56 @@ impl<T: Send + Clone + 'static> TurnQueue<T> {
             let my_req = (*self.deqhelp.add(thread_id)).load(Ordering::Acquire);
             (*self.deqself.add(thread_id)).store(my_req, Ordering::Release);
 
-            // Lines 6-23: Main dequeue loop
+            // Line 6: for (int i=0; i < maxThreads; i++)
             for _ in 0..self.num_threads {
-                // Line 7: Check if request completed
+                // Line 7: if (deqhelp[myidx].load() != myReq) break
                 if (*self.deqhelp.add(thread_id)).load(Ordering::Acquire) != my_req {
                     break;
                 }
 
-                // Lines 8-9: Protect and validate head
+                // Line 8: hp.protectPtr(kHpHead, head.load())
                 let lhead = self.hazard_pointers.protect_ptr(
                     thread_id,
                     HazardPointers::<T>::HP_HEAD,
                     self.head.load(Ordering::Acquire),
                 );
 
+                // Line 9: if (lhead != head.load()) continue
                 if lhead != self.head.load(Ordering::Acquire) {
                     continue;
                 }
 
                 // Lines 10-19: Check if queue is empty
                 if lhead == self.tail.load(Ordering::Acquire) {
+                    // Line 11: deqself[myidx].store(prReq)
                     (*self.deqself.add(thread_id)).store(pr_req, Ordering::Release);
+                    // Line 12: giveUp(myReq, myidx)
                     self.give_up(thread_id, my_req);
 
+                    // Lines 13-16: Check if giveUp succeeded
                     if (*self.deqhelp.add(thread_id)).load(Ordering::Acquire) != my_req {
                         (*self.deqself.add(thread_id)).store(my_req, Ordering::Relaxed);
                         break;
                     }
 
+                    // Lines 17-18: Return nullptr
                     self.hazard_pointers.clear(thread_id);
                     return Err(());
                 }
 
-                // Lines 20-22: Process non-empty queue
+                // Line 20: hp.protectPtr(kHpNext, lhead->next.load())
                 let lnext = self.hazard_pointers.protect_ptr(
                     thread_id,
                     HazardPointers::<T>::HP_NEXT,
                     (*lhead).next.load(Ordering::Acquire),
                 );
 
+                // Line 21: if (lhead != head.load()) continue
                 if lhead != self.head.load(Ordering::Acquire) {
                     continue;
                 }
 
+                // Line 22: searchNext and casDeqAndHead
                 if !lnext.is_null() {
                     let deq_tid = self.search_next(lhead, lnext);
                     if deq_tid != NOIDX {
@@ -286,17 +299,16 @@ impl<T: Send + Clone + 'static> TurnQueue<T> {
                 }
             }
 
-            // Lines 24-31: Return result - FIXED LOGIC
+            // Lines 24-31: Return result
             let my_node = (*self.deqhelp.add(thread_id)).load(Ordering::Acquire);
 
-            // Check if we got a valid node assigned to us
+            // IPC adaptation - validate we got a valid node
             if my_node.is_null() || my_node == my_req {
-                // No node was assigned or still pointing to original request
                 self.hazard_pointers.clear(thread_id);
                 return Err(());
             }
 
-            // Help advance head if needed (lines 25-28 of paper)
+            // Lines 25-28: Help advance head if needed
             let lhead = self.hazard_pointers.protect_ptr(
                 thread_id,
                 HazardPointers::<T>::HP_HEAD,
@@ -311,19 +323,14 @@ impl<T: Send + Clone + 'static> TurnQueue<T> {
                     .ok();
             }
 
+            // Line 29: hp.clear()
             self.hazard_pointers.clear(thread_id);
 
-            // Now return the item from the node that was assigned to us
+            // Line 31: return myNode->item
             if (*my_node).item.is_null() {
-                // This shouldn't happen unless it's the sentinel
-                Err(())
+                Err(()) // Sentinel node
             } else {
-                // Read and return the item
                 let item = ptr::read((*my_node).item);
-
-                // In the paper, this is where hp.retire(prReq) would happen,
-                // but we don't need it in shared memory implementation
-
                 Ok(item)
             }
         }
@@ -331,17 +338,21 @@ impl<T: Send + Clone + 'static> TurnQueue<T> {
 
     // Algorithm 4, lines 34-45: searchNext
     unsafe fn search_next(&self, lhead: *mut Node<T>, lnext: *mut Node<T>) -> i32 {
+        // Line 35: const int turn = lhead->deqTid.load()
         let turn = (*lhead).deq_tid.load(Ordering::Acquire);
 
+        // Line 36: for (int idx=turn+1; idx < turn+maxThreads+1; idx++)
         for idx in (turn + 1)..(turn + self.num_threads as i32 + 1) {
             let id_deq = (idx % self.num_threads as i32) as usize;
 
+            // Line 38: if (deqself[idDeq] != deqhelp[idDeq]) continue
             if (*self.deqself.add(id_deq)).load(Ordering::Acquire)
                 != (*self.deqhelp.add(id_deq)).load(Ordering::Acquire)
             {
                 continue;
             }
 
+            // Lines 39-41: Try to assign node
             if (*lnext).deq_tid.load(Ordering::Acquire) == NOIDX {
                 (*lnext)
                     .deq_tid
@@ -351,22 +362,27 @@ impl<T: Send + Clone + 'static> TurnQueue<T> {
             break;
         }
 
+        // Line 44: return lnext->deqTid.load()
         (*lnext).deq_tid.load(Ordering::Acquire)
     }
 
     // Algorithm 4, lines 47-58: casDeqAndHead
     unsafe fn cas_deq_and_head(&self, lhead: *mut Node<T>, lnext: *mut Node<T>, thread_id: usize) {
+        // Line 48: const int ldeqTid = lnext->deqTid.load()
         let ldeq_tid = (*lnext).deq_tid.load(Ordering::Acquire) as usize;
 
+        // Lines 49-50: Direct assignment if it's our thread
         if ldeq_tid == thread_id {
             (*self.deqhelp.add(ldeq_tid)).store(lnext, Ordering::Release);
         } else if ldeq_tid < self.num_threads {
+            // Line 52: hp.protectPtr(kHpDeq, deqhelp[ldeqTid].load())
             let ldeqhelp = self.hazard_pointers.protect_ptr(
                 thread_id,
                 HazardPointers::<T>::HP_DEQ,
                 (*self.deqhelp.add(ldeq_tid)).load(Ordering::Acquire),
             );
 
+            // Lines 53-54: CAS to update deqhelp
             if ldeqhelp != lnext && lhead == self.head.load(Ordering::Acquire) {
                 (*self.deqhelp.add(ldeq_tid))
                     .compare_exchange(ldeqhelp, lnext, Ordering::AcqRel, Ordering::Acquire)
@@ -374,6 +390,7 @@ impl<T: Send + Clone + 'static> TurnQueue<T> {
             }
         }
 
+        // Line 57: head.compare_exchange_strong(lhead, lnext)
         self.head
             .compare_exchange(lhead, lnext, Ordering::AcqRel, Ordering::Acquire)
             .ok();
@@ -381,34 +398,42 @@ impl<T: Send + Clone + 'static> TurnQueue<T> {
 
     // Algorithm 4, lines 60-72: giveUp
     unsafe fn give_up(&self, thread_id: usize, my_req: *mut Node<T>) {
+        // Line 61: lhead = head.load()
         let lhead = self.head.load(Ordering::Acquire);
 
+        // Line 62: if (deqhelp[myidx] != myReq) return
         if (*self.deqhelp.add(thread_id)).load(Ordering::Acquire) != my_req {
             return;
         }
 
+        // Line 63: if (lhead == tail.load()) return
         if lhead == self.tail.load(Ordering::Acquire) {
             return;
         }
 
+        // Line 64: hp.protectPtr(kHpHead, lhead)
         let protected_head =
             self.hazard_pointers
                 .protect_ptr(thread_id, HazardPointers::<T>::HP_HEAD, lhead);
 
+        // Line 65: if (lhead != head.load()) return
         if protected_head != self.head.load(Ordering::Acquire) {
             return;
         }
 
+        // Line 66: hp.protectPtr(kHpNext, lhead->next.load())
         let lnext = self.hazard_pointers.protect_ptr(
             thread_id,
             HazardPointers::<T>::HP_NEXT,
             (*protected_head).next.load(Ordering::Acquire),
         );
 
+        // Line 67: if (lhead != head.load()) return
         if protected_head != self.head.load(Ordering::Acquire) {
             return;
         }
 
+        // Lines 68-70: Try to assign to self if no one else claimed it
         if self.search_next(protected_head, lnext) == NOIDX {
             (*lnext)
                 .deq_tid
@@ -416,10 +441,11 @@ impl<T: Send + Clone + 'static> TurnQueue<T> {
                 .ok();
         }
 
+        // Line 71: casDeqAndHead(lhead, lnext, myidx)
         self.cas_deq_and_head(protected_head, lnext, thread_id);
     }
 
-    // Initialize in shared memory
+    // IPC adaptation - initialize in shared memory
     pub unsafe fn init_in_shared(mem: *mut u8, num_threads: usize) -> &'static mut Self {
         let queue_ptr = mem as *mut Self;
 
@@ -427,7 +453,7 @@ impl<T: Send + Clone + 'static> TurnQueue<T> {
         let queue_size = mem::size_of::<Self>();
         let queue_aligned = (queue_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
-        // Arrays
+        // Arrays for enqueuers, deqself, deqhelp
         let enqueuers_offset = queue_aligned;
         let enqueuers_size = num_threads * mem::size_of::<AtomicPtr<Node<T>>>();
         let enqueuers_aligned = (enqueuers_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
@@ -445,7 +471,7 @@ impl<T: Send + Clone + 'static> TurnQueue<T> {
         let hp_size = num_threads * HazardPointers::<T>::size();
         let hp_aligned = (hp_size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
-        // Node and item pools
+        // IPC pools instead of heap allocation
         let items_per_thread = 150_000;
         let pool_size = num_threads * items_per_thread * 2;
 
@@ -473,14 +499,14 @@ impl<T: Send + Clone + 'static> TurnQueue<T> {
         let node_pool_ptr = mem.add(node_pool_offset) as *mut Node<T>;
         let item_pool_ptr = mem.add(item_pool_offset) as *mut T;
 
-        // Create sentinel node - it has no item
+        // Create sentinel node
         let sentinel = node_pool_ptr;
         ptr::write(sentinel, Node::new_sentinel());
 
-        // Initialize deqhelp with sentinel but deqself with null to ensure they're different initially
+        // Paper requires deqhelp != deqself initially
         for i in 0..num_threads {
             (*deqhelp_ptr.add(i)).store(sentinel, Ordering::Release);
-            // deqself remains null from the earlier initialization
+            // deqself remains null
         }
 
         // Initialize queue

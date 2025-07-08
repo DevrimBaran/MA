@@ -8,13 +8,13 @@ use crate::MpmcQueue;
 const CACHE_LINE_SIZE: usize = 64;
 const MAX_THREADS: usize = 64;
 
-// Node structure as in the paper
+// Node structure - Figure 1 in paper
 #[repr(C, align(64))]
 struct Node<T> {
     value: Option<T>,
     next: AtomicPtr<Node<T>>,
-    enq_tid: i32,
-    deq_tid: AtomicI32,
+    enq_tid: i32,       // Process that created this node
+    deq_tid: AtomicI32, // Process dequeuing this node (atomic for concurrent access)
 }
 
 impl<T> Node<T> {
@@ -37,7 +37,7 @@ impl<T> Node<T> {
     }
 }
 
-// Operation descriptor as in the paper
+// OpDesc structure - Figure 1 in paper
 #[repr(C, align(64))]
 struct OpDesc<T> {
     phase: i64,
@@ -66,7 +66,7 @@ impl<T> Clone for OpDesc<T> {
     }
 }
 
-// Atomic wrapper for OpDesc to ensure proper memory operations
+// Wrapper for atomic CAS operations on OpDesc (adaptation for shared memory)
 #[repr(C, align(64))]
 struct AtomicOpDesc<T> {
     data: AtomicUsize, // Points to OpDesc
@@ -99,6 +99,7 @@ impl<T> AtomicOpDesc<T> {
         desc_ptr
     }
 
+    // Adaptation of state.compareAndSet from paper
     unsafe fn compare_exchange(
         &self,
         expected: &OpDesc<T>,
@@ -150,7 +151,7 @@ impl<T> AtomicOpDesc<T> {
     }
 }
 
-// Pool for OpDesc allocations
+// Pool for OpDesc allocations (IPC adaptation - no heap allocation)
 struct DescPool<T> {
     pool: *mut OpDesc<T>,
     next_desc: AtomicUsize,
@@ -174,15 +175,15 @@ impl<T> DescPool<T> {
     }
 }
 
-// Main queue structure
+// WFQueue structure - corresponds to paper's queue
 #[repr(C)]
 pub struct KPQueue<T: Send + Clone + 'static> {
-    head: AtomicPtr<Node<T>>,
-    tail: AtomicPtr<Node<T>>,
-    state: *mut AtomicOpDesc<T>,
+    head: AtomicPtr<Node<T>>,    // Line 25 in paper
+    tail: AtomicPtr<Node<T>>,    // Line 25 in paper
+    state: *mut AtomicOpDesc<T>, // Line 26 - state array
     num_threads: usize,
 
-    // Memory management
+    // Memory management for IPC
     node_pool: *mut Node<T>,
     node_pool_size: usize,
     next_node: AtomicUsize,
@@ -199,17 +200,17 @@ unsafe impl<T: Send + Clone> Send for KPQueue<T> {}
 unsafe impl<T: Send + Clone> Sync for KPQueue<T> {}
 
 impl<T: Send + Clone + 'static> KPQueue<T> {
-    // Get state array entry for thread
+    // Get state array entry for process
     unsafe fn get_state(&self, tid: usize) -> &AtomicOpDesc<T> {
         &*self.state.add(tid)
     }
 
-    // Get descriptor pool for thread
+    // Get descriptor pool for process
     unsafe fn get_desc_pool(&self, tid: usize) -> &DescPool<T> {
         &*self.desc_pools.add(tid)
     }
 
-    // Allocate a node from the pool
+    // Allocate a node from the pool (replaces 'new Node' in paper)
     unsafe fn allocate_node(&self, value: T, enq_tid: i32) -> *mut Node<T> {
         let idx = self.next_node.fetch_add(1, Ordering::AcqRel);
         if idx >= self.node_pool_size {
@@ -221,7 +222,7 @@ impl<T: Send + Clone + 'static> KPQueue<T> {
         node
     }
 
-    // Get maximum phase from state array
+    // maxPhase() - Lines 48-57
     unsafe fn max_phase(&self) -> i64 {
         let mut max = -1i64;
         for i in 0..self.num_threads {
@@ -233,13 +234,13 @@ impl<T: Send + Clone + 'static> KPQueue<T> {
         max
     }
 
-    // Check if operation is still pending
+    // isStillPending() - Lines 58-60
     unsafe fn is_still_pending(&self, tid: usize, phase: i64) -> bool {
         let desc: OpDesc<T> = self.get_state(tid).load();
         desc.pending && desc.phase <= phase
     }
 
-    // Help method
+    // help() - Lines 36-47
     unsafe fn help(&self, phase: i64) {
         for i in 0..self.num_threads {
             let desc: OpDesc<T> = self.get_state(i).load();
@@ -253,17 +254,21 @@ impl<T: Send + Clone + 'static> KPQueue<T> {
         }
     }
 
-    // Help enqueue operation
+    // help_enq() - Lines 67-84
     unsafe fn help_enq(&self, tid: usize, phase: i64) {
         while self.is_still_pending(tid, phase) {
             let last = self.tail.load(Ordering::Acquire);
             let next = (*last).next.load(Ordering::Acquire);
 
             if last == self.tail.load(Ordering::Acquire) {
+                // Line 71
                 if next.is_null() {
+                    // Line 72 - enqueue can be applied
                     if self.is_still_pending(tid, phase) {
+                        // Line 73
                         let node = self.get_state(tid).load().node;
                         if !node.is_null() {
+                            // Line 74 - linearization point for enqueue
                             if (*last)
                                 .next
                                 .compare_exchange(
@@ -274,38 +279,42 @@ impl<T: Send + Clone + 'static> KPQueue<T> {
                                 )
                                 .is_ok()
                             {
-                                self.help_finish_enq();
+                                self.help_finish_enq(); // Line 75
                                 return;
                             }
                         }
                     }
                 } else {
-                    self.help_finish_enq();
+                    // Line 79 - some enqueue is in progress
+                    self.help_finish_enq(); // Line 80
                 }
             }
         }
     }
 
-    // Help finish enqueue
+    // help_finish_enq() - Lines 85-97
     unsafe fn help_finish_enq(&self) {
         let last = self.tail.load(Ordering::Acquire);
         let next = (*last).next.load(Ordering::Acquire);
 
         if !next.is_null() {
-            let tid = (*next).enq_tid;
+            // Line 88
+            let tid = (*next).enq_tid; // Line 89
             if tid != -1 {
                 let tid = tid as usize;
                 let cur_desc: OpDesc<T> = self.get_state(tid).load();
-                if last == self.tail.load(Ordering::Acquire)
-                    && !cur_desc.node.is_null()
-                    && cur_desc.node == next
+                if last == self.tail.load(Ordering::Acquire)  // Line 91
+                   && !cur_desc.node.is_null()
+                   && cur_desc.node == next
                 {
+                    // Line 92-93 - update state to not pending
                     let new_desc = OpDesc::new(cur_desc.phase, false, true, next);
                     let _ = self.get_state(tid).compare_exchange(
                         &cur_desc,
                         new_desc,
                         self.get_desc_pool(tid),
                     );
+                    // Line 94 - advance tail
                     self.tail
                         .compare_exchange(last, next, Ordering::AcqRel, Ordering::Acquire)
                         .ok();
@@ -318,20 +327,25 @@ impl<T: Send + Clone + 'static> KPQueue<T> {
         }
     }
 
-    // Help dequeue operation
+    // help_deq() - Lines 109-140
     unsafe fn help_deq(&self, tid: usize, phase: i64) {
         while self.is_still_pending(tid, phase) {
+            // Line 110
             let first = self.head.load(Ordering::Acquire);
             let last = self.tail.load(Ordering::Acquire);
             let next = (*first).next.load(Ordering::Acquire);
 
             if first == self.head.load(Ordering::Acquire) {
+                // Line 114
                 if first == last {
+                    // Line 115 - queue might be empty
                     if next.is_null() {
+                        // Line 116 - queue is empty
                         let cur_desc: OpDesc<T> = self.get_state(tid).load();
-                        if last == self.tail.load(Ordering::Acquire)
-                            && self.is_still_pending(tid, phase)
+                        if last == self.tail.load(Ordering::Acquire)  // Line 118
+                           && self.is_still_pending(tid, phase)
                         {
+                            // Lines 119-120 - mark dequeue as complete with null node
                             let new_desc =
                                 OpDesc::new(cur_desc.phase, false, false, ptr::null_mut());
                             let _ = self.get_state(tid).compare_exchange(
@@ -341,53 +355,63 @@ impl<T: Send + Clone + 'static> KPQueue<T> {
                             );
                         }
                     } else {
-                        self.help_finish_enq();
+                        // Line 122 - enqueue in progress
+                        self.help_finish_enq(); // Line 123
                     }
                 } else {
+                    // Line 125 - queue not empty
                     let cur_desc: OpDesc<T> = self.get_state(tid).load();
                     let node = cur_desc.node;
 
                     if !self.is_still_pending(tid, phase) {
+                        // Line 128
                         break;
                     }
 
                     if first == self.head.load(Ordering::Acquire) && node != first {
+                        // Line 129
+                        // Lines 130-131 - update state with reference to first node
                         let new_desc = OpDesc::new(cur_desc.phase, true, false, first);
                         if self
                             .get_state(tid)
                             .compare_exchange(&cur_desc, new_desc, self.get_desc_pool(tid))
                             .is_err()
                         {
-                            continue;
+                            continue; // Line 132
                         }
                     }
 
+                    // Line 135 - linearization point for dequeue
                     (*first)
                         .deq_tid
                         .compare_exchange(-1, tid as i32, Ordering::AcqRel, Ordering::Acquire)
                         .ok();
-                    self.help_finish_deq();
+                    self.help_finish_deq(); // Line 136
                 }
             }
         }
     }
 
-    // Help finish dequeue
+    // help_finish_deq() - Lines 141-153
     unsafe fn help_finish_deq(&self) {
         let first = self.head.load(Ordering::Acquire);
         let next = (*first).next.load(Ordering::Acquire);
-        let tid = (*first).deq_tid.load(Ordering::Acquire);
+        let tid = (*first).deq_tid.load(Ordering::Acquire); // Line 144
 
         if tid != -1 {
+            // Line 145
             let tid = tid as usize;
             let cur_desc: OpDesc<T> = self.get_state(tid).load();
             if first == self.head.load(Ordering::Acquire) && !next.is_null() {
+                // Line 147
+                // Lines 148-149 - update state to not pending
                 let new_desc = OpDesc::new(cur_desc.phase, false, false, cur_desc.node);
                 let _ = self.get_state(tid).compare_exchange(
                     &cur_desc,
                     new_desc,
                     self.get_desc_pool(tid),
                 );
+                // Line 150 - advance head
                 self.head
                     .compare_exchange(first, next, Ordering::AcqRel, Ordering::Acquire)
                     .ok();
@@ -395,50 +419,53 @@ impl<T: Send + Clone + 'static> KPQueue<T> {
         }
     }
 
-    // Enqueue operation
+    // enq() - Lines 61-66
     pub fn enqueue(&self, thread_id: usize, value: T) -> Result<(), ()> {
         unsafe {
-            let phase = self.max_phase() + 1;
+            let phase = self.max_phase() + 1; // Line 62
             let node = self.allocate_node(value, thread_id as i32);
 
+            // Line 63 - create and store new operation descriptor
             let new_desc = OpDesc::new(phase, true, true, node);
             self.get_state(thread_id)
                 .store(new_desc, self.get_desc_pool(thread_id));
 
-            self.help(phase);
-            self.help_finish_enq();
+            self.help(phase); // Line 64
+            self.help_finish_enq(); // Line 65
 
             Ok(())
         }
     }
 
-    // Dequeue operation
+    // deq() - Lines 98-108
     pub fn dequeue(&self, thread_id: usize) -> Result<T, ()> {
         unsafe {
-            let phase = self.max_phase() + 1;
+            let phase = self.max_phase() + 1; // Line 99
 
+            // Line 100 - create and store new operation descriptor
             let new_desc = OpDesc::new(phase, true, false, ptr::null_mut());
             self.get_state(thread_id)
                 .store(new_desc, self.get_desc_pool(thread_id));
 
-            self.help(phase);
-            self.help_finish_deq();
+            self.help(phase); // Line 101
+            self.help_finish_deq(); // Line 102
 
-            let node = self.get_state(thread_id).load().node;
+            let node = self.get_state(thread_id).load().node; // Line 103
             if node.is_null() {
-                Err(())
+                // Lines 104-106
+                Err(()) // EmptyException
             } else {
                 let next = (*node).next.load(Ordering::Acquire);
                 if next.is_null() {
                     Err(())
                 } else {
-                    Ok((*next).value.take().unwrap())
+                    Ok((*next).value.take().unwrap()) // Line 107
                 }
             }
         }
     }
 
-    // Initialize in shared memory
+    // Initialize in shared memory (IPC adaptation)
     pub unsafe fn init_in_shared(mem: *mut u8, num_threads: usize) -> &'static mut Self {
         let queue_ptr = mem as *mut Self;
 
@@ -472,7 +499,7 @@ impl<T: Send + Clone + 'static> KPQueue<T> {
 
         let total_size = node_pool_offset + node_pool_total_size;
 
-        // Initialize state array
+        // Initialize state array - Lines 32-34 in paper
         let state_ptr = mem.add(state_offset) as *mut AtomicOpDesc<T>;
         for i in 0..num_threads {
             ptr::write(state_ptr.add(i), AtomicOpDesc::<T>::new());
@@ -489,18 +516,18 @@ impl<T: Send + Clone + 'static> KPQueue<T> {
             );
         }
 
-        // Initialize node pool with sentinel
+        // Initialize with sentinel node - Line 28
         let node_pool_ptr = mem.add(node_pool_offset) as *mut Node<T>;
         let sentinel = node_pool_ptr;
         ptr::write(sentinel, Node::new_sentinel());
 
-        // Initialize queue
+        // Initialize queue - Lines 27-35
         ptr::write(
             queue_ptr,
             Self {
-                head: AtomicPtr::new(sentinel),
-                tail: AtomicPtr::new(sentinel),
-                state: state_ptr,
+                head: AtomicPtr::new(sentinel), // Line 29
+                tail: AtomicPtr::new(sentinel), // Line 30
+                state: state_ptr,               // Line 31
                 num_threads,
                 node_pool: node_pool_ptr,
                 node_pool_size,

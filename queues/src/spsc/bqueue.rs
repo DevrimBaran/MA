@@ -82,40 +82,25 @@ impl<T: Send + 'static> BQueue<T> {
         let batch_head = unsafe { *self.batch_head.get() };
 
         if head == batch_head {
-            // Need to probe for a batch of empty slots
-            let mut slots_to_probe = BATCH_SIZE.min(self.cap - 1); // Never probe the entire queue
+            // Probe BATCH_SIZE slots ahead (just ONE probe, no loop!)
+            let probe_idx = self.mod_(head + BATCH_SIZE - 1);
 
-            // Probe for a batch of empty slots
-            loop {
-                if slots_to_probe == 0 {
+            unsafe {
+                if (*self.valid.add(probe_idx)).load(Ordering::Acquire) {
+                    // Slot is occupied, queue is full
                     return Err(item);
                 }
-
-                let probe_idx = self.mod_(head + slots_to_probe - 1);
-
-                unsafe {
-                    // Check if the last slot in the batch is empty
-                    if !(*self.valid.add(probe_idx)).load(Ordering::Acquire) {
-                        // Found empty slots, update batch_head
-                        *self.batch_head.get() = self.mod_(head + slots_to_probe);
-                        break;
-                    }
-                }
-
-                // If we can't find slots_to_probe empty slots, try smaller batches
-                slots_to_probe >>= 1;
+                // Found empty slots, update batch_head
+                *self.batch_head.get() = self.mod_(head + BATCH_SIZE);
             }
         }
 
         unsafe {
-            // Write the data to buffer
             ptr::write(self.buf.add(head), MaybeUninit::new(item));
-            // Set valid flag with Release ordering to ensure data write happens-before
             (*self.valid.add(head)).store(true, Ordering::Release);
         }
 
         self.head.store(self.next(head), Ordering::Relaxed);
-
         Ok(())
     }
 

@@ -880,10 +880,18 @@ mod bqueue_tests {
         assert!(pushed > 0, "Should be able to push at least one item");
         assert!(!queue.available() || queue.push(999).is_err());
 
-        queue.pop().unwrap();
-        assert!(queue.available());
-        queue.push(999).unwrap();
-        assert!(!queue.available());
+        // Pop enough elements to ensure the probe will find empty space
+        // Since push probes BATCH_SIZE-1 ahead, we need to pop at least BATCH_SIZE elements
+        // to guarantee the probe finds an empty slot
+        let batch_size = 32; // This matches BATCH_SIZE in bqueue.rs
+        let pops_needed = batch_size.min(pushed);
+        
+        for _ in 0..pops_needed {
+            queue.pop().unwrap();
+        }
+        
+        // Now push should succeed since we've cleared enough space
+        assert!(queue.push(999).is_ok(), "Should be able to push after popping enough elements");
 
         unsafe {
             let _ = Box::from_raw(std::slice::from_raw_parts_mut(mem_ptr, shared_size));

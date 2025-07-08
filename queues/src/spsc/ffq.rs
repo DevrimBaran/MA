@@ -4,17 +4,14 @@ use crate::SpscQueue;
 use core::{cell::UnsafeCell, fmt, mem::MaybeUninit, ptr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-// FastForward-inspired implementation for value types
-// Uses a separate atomic flag to indicate full/empty state
-// This avoids head/tail comparisons while supporting arbitrary types
-
+// Uses a separate atomic flag to indicate full/empty state instead of NULL like in the original paper.
+// Was necessary to avoid atomicity issues in rust. Logic is still the same
 #[repr(C)]
 pub struct Slot<T> {
-    // Atomic flag: false = empty, true = full
+    // Atomic flag at the beginning of the slot
     pub flag: AtomicBool,
-    // Padding to separate flag from data
-    _pad: [u8; 64 - std::mem::size_of::<AtomicBool>()],
-    // The actual data
+    // Small padding to align data nicely (7 bytes on 64-bit systems) and stay within one cache line
+    _pad: [u8; 8 - std::mem::size_of::<AtomicBool>()],
     data: UnsafeCell<MaybeUninit<T>>,
 }
 
@@ -22,12 +19,13 @@ impl<T> Slot<T> {
     fn new() -> Self {
         Self {
             flag: AtomicBool::new(false),
-            _pad: [0u8; 64 - std::mem::size_of::<AtomicBool>()],
+            _pad: [0u8; 8 - std::mem::size_of::<AtomicBool>()],
             data: UnsafeCell::new(MaybeUninit::uninit()),
         }
     }
 }
 
+// indices are public for unit testing. Works also when private. The publicity is not used in the code so logic is not broken. Mak private if wanted.
 #[repr(C, align(64))]
 pub struct FfqQueue<T: Send + 'static> {
     pub head: AtomicUsize,

@@ -7,7 +7,7 @@ use std::ptr;
 use std::sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering};
 
 const H_PARTITION_SIZE: usize = 32;
-const LOCAL_BATCH_SIZE: usize = 32;
+const LOCAL_BATCH_SIZE: usize = 32; // Section 4.3 - batch size
 
 // Compact slot with atomic flag - same as IFFQ
 #[repr(C)]
@@ -27,14 +27,16 @@ impl<T> Slot<T> {
     }
 }
 
+// Producer fields with local buffer - Section 4.3
 #[repr(C, align(64))]
 pub struct ProducerFieldsB<T: Send + 'static> {
     write: AtomicUsize,
     pub limit: AtomicUsize,
-    local_buffer: UnsafeCell<[MaybeUninit<T>; LOCAL_BATCH_SIZE]>,
-    pub local_count: AtomicUsize,
+    local_buffer: UnsafeCell<[MaybeUninit<T>; LOCAL_BATCH_SIZE]>, // Producer-private buffer
+    pub local_count: AtomicUsize,                                 // Items in local buffer
 }
 
+// Consumer fields - same as IFFQ
 #[repr(C, align(64))]
 pub struct ConsumerFieldsB {
     read: AtomicUsize,
@@ -49,7 +51,7 @@ pub struct BiffqQueue<T: Send + 'static> {
     mask: usize,
     h_mask: usize,
     buffer: *mut Slot<T>,
-    owns_buffer: bool,
+    owns_buffer: bool, // IPC adaptation
 }
 
 unsafe impl<T: Send> Send for BiffqQueue<T> {}
@@ -62,6 +64,7 @@ pub struct BiffqPushError<T>(pub T);
 pub struct BiffqPopError;
 
 impl<T: Send + 'static> BiffqQueue<T> {
+    // IPC adaptation - calculate shared memory size
     pub fn shared_size(capacity: usize) -> usize {
         assert!(
             capacity > 0 && capacity.is_power_of_two(),
@@ -82,6 +85,7 @@ impl<T: Send + 'static> BiffqQueue<T> {
         layout.extend(buffer_layout).unwrap().0.size()
     }
 
+    // IPC adaptation - initialize in pre-allocated shared memory
     pub unsafe fn init_in_shared(mem_ptr: *mut u8, capacity: usize) -> &'static mut Self {
         assert!(
             capacity.is_power_of_two(),
@@ -125,7 +129,7 @@ impl<T: Send + 'static> BiffqQueue<T> {
                 mask: capacity - 1,
                 h_mask: H_PARTITION_SIZE - 1,
                 buffer: buffer_data_ptr,
-                owns_buffer: false,
+                owns_buffer: false, // IPC - buffer not heap allocated
             },
         );
         &mut *queue_ptr
@@ -136,6 +140,7 @@ impl<T: Send + 'static> BiffqQueue<T> {
         unsafe { &*self.buffer.add(index & self.mask) }
     }
 
+    // Publish buffered items - Section 4.3
     pub fn publish_batch_internal(&self) -> Result<usize, ()> {
         let local_count = self.prod.local_count.load(Ordering::Relaxed);
         if local_count == 0 {
@@ -147,8 +152,10 @@ impl<T: Send + 'static> BiffqQueue<T> {
         let mut current_limit = self.prod.limit.load(Ordering::Acquire);
         let mut published_count = 0;
 
+        // Try to write burst - relies on race condition for FC optimization
         for i in 0..local_count {
             if current_write == current_limit {
+                // Check H slots ahead
                 let next_limit_potential = current_limit.wrapping_add(H_PARTITION_SIZE);
                 let slot_to_check_idx = next_limit_potential & self.mask;
 
@@ -157,7 +164,7 @@ impl<T: Send + 'static> BiffqQueue<T> {
                     .flag
                     .load(Ordering::Acquire)
                 {
-                    // Slot is occupied, can't proceed
+                    // Can't proceed - copy remaining back
                     fence(Ordering::Release);
                     self.prod.write.store(current_write, Ordering::Release);
 
@@ -194,7 +201,7 @@ impl<T: Send + 'static> BiffqQueue<T> {
                 (*slot.data.get()).write(item_to_write);
             }
 
-            // Then set flag - this is the linearization point
+            // Set flag - linearization point
             slot.flag.store(true, Ordering::Release);
 
             current_write = current_write.wrapping_add(1);
@@ -207,6 +214,7 @@ impl<T: Send + 'static> BiffqQueue<T> {
         Ok(published_count)
     }
 
+    // Same as IFFQ dequeue
     fn dequeue_internal(&self) -> Result<T, BiffqPopError> {
         let current_read = self.cons.read.load(Ordering::Relaxed);
         let slot = self.get_slot(current_read);
@@ -226,7 +234,7 @@ impl<T: Send + 'static> BiffqQueue<T> {
             .read
             .store(current_read.wrapping_add(1), Ordering::Release);
 
-        // Lazy clear operation
+        // Lazy clear - same as IFFQ
         let current_clear = self.cons.clear.load(Ordering::Relaxed);
         let read_partition_start = current_read & !self.h_mask;
         let next_clear_target = read_partition_start.wrapping_sub(H_PARTITION_SIZE);
@@ -256,11 +264,13 @@ impl<T: Send + 'static> SpscQueue<T> for BiffqQueue<T> {
     type PushError = BiffqPushError<T>;
     type PopError = BiffqPopError;
 
+    // biffq_enq_local - Figure 13 in paper
     #[inline]
     fn push(&self, item: T) -> Result<(), Self::PushError> {
         let current_local_count = self.prod.local_count.load(Ordering::Relaxed);
 
         if current_local_count < LOCAL_BATCH_SIZE {
+            // Store in local buffer
             unsafe {
                 let local_buf_slot_ptr = (*self.prod.local_buffer.get())
                     .as_mut_ptr()
@@ -271,11 +281,13 @@ impl<T: Send + 'static> SpscQueue<T> for BiffqQueue<T> {
                 .local_count
                 .store(current_local_count + 1, Ordering::Release);
 
+            // Auto-publish when buffer full
             if current_local_count + 1 == LOCAL_BATCH_SIZE {
                 let _ = self.publish_batch_internal();
             }
             Ok(())
         } else {
+            // Buffer full, try to flush
             match self.publish_batch_internal() {
                 Ok(_published_count) => {
                     let new_local_count = self.prod.local_count.load(Ordering::Relaxed);
@@ -335,7 +347,9 @@ impl<T: Send + 'static> SpscQueue<T> for BiffqQueue<T> {
 }
 
 impl<T: Send + 'static> Drop for BiffqQueue<T> {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        // IPC - cleanup handled externally
+    }
 }
 
 impl<T: Send + fmt::Debug + 'static> fmt::Debug for BiffqQueue<T> {

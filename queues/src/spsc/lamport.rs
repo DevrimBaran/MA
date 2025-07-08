@@ -10,10 +10,10 @@ use std::{
 #[derive(Debug)]
 pub struct LamportQueue<T: Send> {
     pub mask: usize,
-    pub buf: ManuallyDrop<Box<[UnsafeCell<Option<T>>]>>,
-    pub head: AtomicUsize,
-    pub tail: AtomicUsize,
-    pub owns_buffer: bool,
+    pub buf: ManuallyDrop<Box<[UnsafeCell<Option<T>>]>>, // Circular buffer - Section 3
+    pub head: AtomicUsize,                               // Read index - group B
+    pub tail: AtomicUsize,                               // Write index - group A
+    pub owns_buffer: bool,                               // IPC adaptation - tracks ownership
 }
 
 unsafe impl<T: Send> Sync for LamportQueue<T> {}
@@ -22,14 +22,17 @@ unsafe impl<T: Send> Send for LamportQueue<T> {}
 impl<T: Send> LamportQueue<T> {
     #[inline]
     pub fn idx(&self, i: usize) -> usize {
-        i & self.mask
+        i & self.mask // Fast modulo for power-of-2 sizes
     }
 }
 
 impl<T: Send> LamportQueue<T> {
+    // IPC adaptation - calculate shared memory size
     pub const fn shared_size(cap: usize) -> usize {
         std::mem::size_of::<Self>() + cap * std::mem::size_of::<UnsafeCell<Option<T>>>()
     }
+
+    // IPC adaptation - initialize in pre-allocated shared memory
     pub unsafe fn init_in_shared(mem: *mut u8, cap: usize) -> &'static mut Self {
         assert!(cap.is_power_of_two());
 
@@ -49,7 +52,7 @@ impl<T: Send> LamportQueue<T> {
             buf: ManuallyDrop::new(boxed),
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
-            owns_buffer: false,
+            owns_buffer: false, // IPC - buffer not heap allocated
         });
 
         &mut *header
@@ -85,36 +88,39 @@ impl<T: Send + 'static> SpscQueue<T> for LamportQueue<T> {
     type PushError = ();
     type PopError = ();
 
+    // lq_enqueue - Figure 2 in paper
     #[inline]
     fn push(&self, item: T) -> Result<(), ()> {
         let tail = self.tail.load(Ordering::Acquire);
         let next = tail + 1;
 
-        let head = self.head.load(Ordering::Acquire);
+        let head = self.head.load(Ordering::Acquire); // Check if full
         if next == head + self.mask + 1 {
             return Err(());
         }
 
         let slot = self.idx(tail);
-        unsafe { *self.buf[slot].get() = Some(item) };
+        unsafe { *self.buf[slot].get() = Some(item) }; // Store item
 
-        self.tail.store(next, Ordering::Release);
+        self.tail.store(next, Ordering::Release); // store_release_barrier
         Ok(())
     }
 
+    // lq_dequeue - Figure 2 in paper
     #[inline]
     fn pop(&self) -> Result<T, ()> {
         let head = self.head.load(Ordering::Acquire);
         let tail = self.tail.load(Ordering::Acquire);
 
         if head == tail {
+            // Empty check
             return Err(());
         }
 
         let slot = self.idx(head);
 
         let cell_ptr = &self.buf[slot];
-        let val = unsafe { (*cell_ptr.get()).take() };
+        let val = unsafe { (*cell_ptr.get()).take() }; // load_acquire_barrier
 
         match val {
             Some(v) => {
@@ -141,5 +147,7 @@ impl<T: Send + 'static> SpscQueue<T> for LamportQueue<T> {
 }
 
 impl<T: Send> Drop for LamportQueue<T> {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        // IPC - cleanup handled externally
+    }
 }

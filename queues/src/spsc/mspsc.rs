@@ -5,19 +5,20 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::{cell::UnsafeCell, fmt, mem::MaybeUninit, ptr};
 use std::alloc::Layout;
 
-const LOCAL_BUF: usize = 32;
+const LOCAL_BUF: usize = 32; // Paper's MULTIPUSH_BUFFER_SIZE
 
 pub struct MultiPushQueue<T: Send + 'static> {
-    inner: *mut LamportQueue<T>,
-    local_buf: UnsafeCell<[MaybeUninit<T>; LOCAL_BUF]>,
-    pub local_count: AtomicUsize,
-    shared: AtomicBool,
+    inner: *mut LamportQueue<T>, // Underlying SPSC buffer
+    local_buf: UnsafeCell<[MaybeUninit<T>; LOCAL_BUF]>, // Local buffer for batching
+    pub local_count: AtomicUsize, // Paper's mcnt
+    shared: AtomicBool,          // IPC: track if in shared memory
 }
 
 unsafe impl<T: Send> Send for MultiPushQueue<T> {}
 unsafe impl<T: Send> Sync for MultiPushQueue<T> {}
 
 impl<T: Send + 'static> MultiPushQueue<T> {
+    // IPC: initialize in shared memory
     pub unsafe fn init_in_shared(mem: *mut u8, capacity: usize) -> &'static mut Self {
         let self_ptr = mem as *mut MaybeUninit<Self>;
 
@@ -40,6 +41,7 @@ impl<T: Send + 'static> MultiPushQueue<T> {
         &mut *(*self_ptr).as_mut_ptr()
     }
 
+    // IPC: calculate shared memory size
     pub fn shared_size(capacity: usize) -> usize {
         let self_layout = Layout::new::<Self>();
         let lamport_layout = Layout::from_size_align(
@@ -75,6 +77,7 @@ impl<T: Send + 'static> MultiPushQueue<T> {
         unsafe { &mut *self.inner }
     }
 
+    // Helper to calculate contiguous free space in ring
     #[inline(always)]
     fn contiguous_free_in_ring(&self) -> usize {
         let ring_ref = self.ring();
@@ -88,16 +91,17 @@ impl<T: Send + 'static> MultiPushQueue<T> {
         free_total.min(room_till_wrap)
     }
 
+    // flush() - Lines 22-24 in Figure 4
     pub fn flush(&self) -> bool {
         let count_to_push = self.local_count.load(Ordering::Relaxed);
         if count_to_push == 0 {
-            return true;
+            return true; // Line 23
         }
 
         let ring_instance = unsafe { &*self.inner };
 
         if self.contiguous_free_in_ring() < count_to_push {
-            return false;
+            return false; // Not enough space
         }
 
         let local_buf_array_ptr = self.local_buf.get();
@@ -111,6 +115,7 @@ impl<T: Send + 'static> MultiPushQueue<T> {
         unsafe {
             let local_buf_slice = &*local_buf_array_ptr;
 
+            // Lines 6-12 in Figure 4 - write in reverse order (critical!)
             for i in (0..count_to_push).rev() {
                 let item_from_local_buf = ptr::read(local_buf_slice[i].as_ptr());
                 let target_slot_in_ring = (current_ring_tail_val.wrapping_add(i)) & ring_mask;
@@ -120,29 +125,32 @@ impl<T: Send + 'static> MultiPushQueue<T> {
             }
         }
 
+        // Line 15 - update pwrite after all writes
         ring_tail_atomic_ptr.store(
             current_ring_tail_val.wrapping_add(count_to_push),
             Ordering::Release,
         );
 
-        self.local_count.store(0, Ordering::Relaxed);
+        self.local_count.store(0, Ordering::Relaxed); // Line 16 - reset mcnt
         true
     }
 }
 
 impl<T: Send + 'static> Drop for MultiPushQueue<T> {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {} // IPC: shared memory cleanup handled externally
 }
 
 impl<T: Send + 'static> SpscQueue<T> for MultiPushQueue<T> {
     type PushError = ();
     type PopError = <LamportQueue<T> as SpscQueue<T>>::PopError;
 
+    // mpush() - Lines 26-36 in Figure 4
     #[inline]
     fn push(&self, item: T) -> Result<(), Self::PushError> {
         let current_local_idx = self.local_count.load(Ordering::Relaxed);
 
         if current_local_idx < LOCAL_BUF {
+            // Line 30 - add to local buffer
             unsafe {
                 let slot_ptr = (*self.local_buf.get()).as_mut_ptr().add(current_local_idx);
                 slot_ptr.write(MaybeUninit::new(item));
@@ -150,16 +158,19 @@ impl<T: Send + 'static> SpscQueue<T> for MultiPushQueue<T> {
             self.local_count
                 .store(current_local_idx + 1, Ordering::Relaxed);
 
+            // Lines 32-33 - flush if buffer full
             if current_local_idx + 1 == LOCAL_BUF {
                 self.flush();
             }
             return Ok(());
         }
 
+        // Buffer full, try to flush then retry
         if self.flush() {
             return self.push(item);
         }
 
+        // Fallback to direct push
         match self.ring_mut().push(item) {
             Ok(_) => Ok(()),
             Err(_) => Err(()),
@@ -168,7 +179,7 @@ impl<T: Send + 'static> SpscQueue<T> for MultiPushQueue<T> {
 
     #[inline]
     fn pop(&self) -> Result<T, Self::PopError> {
-        self.ring().pop()
+        self.ring().pop() // Regular pop from underlying SPSC
     }
 
     #[inline]

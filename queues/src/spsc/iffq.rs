@@ -6,39 +6,38 @@ use std::mem::MaybeUninit;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-const H_PARTITION_SIZE: usize = 32;
+const H_PARTITION_SIZE: usize = 32; // Section 4.2 - H value
 
-// Compact slot with atomic flag
+// Compact slot with atomic flag - Section 4.1
 #[repr(C)]
 struct Slot<T> {
-    // Atomic flag: false = empty, true = full
-    flag: AtomicBool,
-    // Small padding to align data nicely (7 bytes on 64-bit systems)
-    _pad: [u8; 8 - std::mem::size_of::<AtomicBool>()],
-    // The actual data
+    flag: AtomicBool, // false = empty (NULL_ELEM), true = full
+    _pad: [u8; 8 - std::mem::size_of::<AtomicBool>()], // Align data to 8 bytes
     data: UnsafeCell<MaybeUninit<T>>,
 }
 
 impl<T> Slot<T> {
     fn new() -> Self {
         Self {
-            flag: AtomicBool::new(false),
+            flag: AtomicBool::new(false), // Initially empty
             _pad: [0u8; 8 - std::mem::size_of::<AtomicBool>()],
             data: UnsafeCell::new(MaybeUninit::uninit()),
         }
     }
 }
 
+// Producer fields - group D
 #[repr(C, align(64))]
 struct ProducerFields {
-    write: AtomicUsize,
-    limit: AtomicUsize,
+    write: AtomicUsize, // Current write position - Section 4.2
+    limit: AtomicUsize, // Write limit (H slots ahead check) - Section 4.2
 }
 
+// Consumer fields - group E
 #[repr(C, align(64))]
 pub struct ConsumerFields {
-    read: AtomicUsize,
-    pub clear: AtomicUsize,
+    read: AtomicUsize,      // Current read position - Section 4.2
+    pub clear: AtomicUsize, // Lazy clear position - Section 4.2
 }
 
 #[repr(C, align(64))]
@@ -46,10 +45,10 @@ pub struct IffqQueue<T: Send + 'static> {
     prod: ProducerFields,
     pub cons: ConsumerFields,
     capacity: usize,
-    mask: usize,
-    h_mask: usize,
+    mask: usize,   // For fast modulo
+    h_mask: usize, // H_PARTITION_SIZE - 1
     buffer: *mut Slot<T>,
-    owns_buffer: bool,
+    owns_buffer: bool, // IPC adaptation
 }
 
 unsafe impl<T: Send> Send for IffqQueue<T> {}
@@ -62,6 +61,7 @@ pub struct IffqPushError<T>(pub T);
 pub struct IffqPopError;
 
 impl<T: Send + 'static> IffqQueue<T> {
+    // IPC adaptation - calculate shared memory size
     pub fn shared_size(capacity: usize) -> usize {
         assert!(
             capacity > 0 && capacity.is_power_of_two(),
@@ -82,6 +82,7 @@ impl<T: Send + 'static> IffqQueue<T> {
         layout.extend(buffer_layout).unwrap().0.size()
     }
 
+    // IPC adaptation - initialize in pre-allocated shared memory
     pub unsafe fn init_in_shared(mem_ptr: *mut u8, capacity: usize) -> &'static mut Self {
         assert!(
             capacity.is_power_of_two(),
@@ -100,10 +101,12 @@ impl<T: Send + 'static> IffqQueue<T> {
         let queue_ptr = mem_ptr as *mut Self;
         let buffer_data_ptr = mem_ptr.add(std::mem::size_of::<Self>()) as *mut Slot<T>;
 
+        // Initialize all slots as empty
         for i in 0..capacity {
             ptr::write(buffer_data_ptr.add(i), Slot::new());
         }
 
+        // Initialize with 2H slots unused - Section 4.2
         ptr::write(
             queue_ptr,
             Self {
@@ -119,7 +122,7 @@ impl<T: Send + 'static> IffqQueue<T> {
                 mask: capacity - 1,
                 h_mask: H_PARTITION_SIZE - 1,
                 buffer: buffer_data_ptr,
-                owns_buffer: false,
+                owns_buffer: false, // IPC - buffer not heap allocated
             },
         );
         &mut *queue_ptr
@@ -130,21 +133,24 @@ impl<T: Send + 'static> IffqQueue<T> {
         unsafe { &*self.buffer.add(index & self.mask) }
     }
 
+    // iffq_enqueue - Figure 11 in paper
     fn enqueue_internal(&self, item: T) -> Result<(), IffqPushError<T>> {
         let current_write = self.prod.write.load(Ordering::Relaxed);
         let mut current_limit = self.prod.limit.load(Ordering::Acquire);
 
+        // Check if at limit
         if current_write == current_limit {
-            // Check H slots ahead to see if we can advance the limit
+            // Check H slots ahead - Section 4.2
             let next_limit_potential = current_limit.wrapping_add(H_PARTITION_SIZE);
             let slot_to_check_idx = next_limit_potential & self.mask;
 
             let slot = self.get_slot(slot_to_check_idx);
             if slot.flag.load(Ordering::Acquire) {
-                // Slot is occupied, can't advance
+                // Slot occupied
                 return Err(IffqPushError(item));
             }
 
+            // Advance limit
             self.prod
                 .limit
                 .store(next_limit_potential, Ordering::Release);
@@ -162,7 +168,7 @@ impl<T: Send + 'static> IffqQueue<T> {
             (*slot.data.get()).write(item);
         }
 
-        // Then set flag with Release ordering to ensure data write happens-before
+        // Set flag - linearization point
         slot.flag.store(true, Ordering::Release);
 
         self.prod
@@ -171,6 +177,7 @@ impl<T: Send + 'static> IffqQueue<T> {
         Ok(())
     }
 
+    // iffq_trydeq_local - Figure 11 in paper
     fn dequeue_internal(&self) -> Result<T, IffqPopError> {
         let current_read = self.cons.read.load(Ordering::Relaxed);
         let slot = self.get_slot(current_read);
@@ -183,14 +190,14 @@ impl<T: Send + 'static> IffqQueue<T> {
         // Read data
         let item = unsafe { (*slot.data.get()).assume_init_read() };
 
-        // Clear flag atomically
+        // Clear flag
         slot.flag.store(false, Ordering::Release);
 
         self.cons
             .read
             .store(current_read.wrapping_add(1), Ordering::Release);
 
-        // Lazy clear operation
+        // Lazy clear operation - Section 4.2
         let current_clear = self.cons.clear.load(Ordering::Relaxed);
         let read_partition_start = current_read & !self.h_mask;
         let next_clear_target = read_partition_start.wrapping_sub(H_PARTITION_SIZE);
@@ -202,7 +209,7 @@ impl<T: Send + 'static> IffqQueue<T> {
                 break;
             }
 
-            // The slot is already cleared when we read it, so just advance
+            // Advance clear pointer
             temp_clear = temp_clear.wrapping_add(1);
             advanced_clear = true;
         }
@@ -236,6 +243,7 @@ impl<T: Send + 'static> SpscQueue<T> for IffqQueue<T> {
         if write != limit {
             return true;
         }
+        // Check if can advance limit
         let next_limit_potential = limit.wrapping_add(H_PARTITION_SIZE);
         let slot_to_check_idx = next_limit_potential & self.mask;
         !self
@@ -252,7 +260,9 @@ impl<T: Send + 'static> SpscQueue<T> for IffqQueue<T> {
 }
 
 impl<T: Send + 'static> Drop for IffqQueue<T> {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        // IPC - cleanup handled externally
+    }
 }
 
 impl<T: Send + fmt::Debug + 'static> fmt::Debug for IffqQueue<T> {

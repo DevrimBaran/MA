@@ -6,90 +6,87 @@ use std::{
     sync::atomic::{fence, AtomicPtr, Ordering},
 };
 
-// Wrapper for raw pointer
+// IPC: wrapper for LamportQueue pointers
 #[derive(Copy, Clone)]
 struct LamportPtr<T: Send + 'static>(*mut LamportQueue<T>);
 
 unsafe impl<T: Send + 'static> Send for LamportPtr<T> {}
 unsafe impl<T: Send + 'static> Sync for LamportPtr<T> {}
 
-// Paper's BufferPool
+// BufferPool - Figure 3, lines 22-41 in paper
 #[repr(C)]
 struct BufferPool<T: Send + 'static> {
-    inuse: DynListQueue<LamportPtr<T>>,
-    cache: LamportQueue<LamportPtr<T>>,
+    inuse: DynListQueue<LamportPtr<T>>, // Line 23
+    cache: LamportQueue<LamportPtr<T>>, // Line 24
     segment_size: usize,
 }
 
 impl<T: Send + 'static> BufferPool<T> {
-    // Paper: next_w() - allocates new buffer for writer
+    // next_w() - Lines 26-32 in Figure 3
     fn next_w(&self) -> Option<*mut LamportQueue<T>> {
-        // Try to get from cache first
+        // Line 28 - try cache first
         if let Ok(buf_wrapper) = self.cache.pop() {
             let buf_ptr = buf_wrapper.0;
-            // Add to inuse queue
+            // Line 30 - add to inuse queue
             if self.inuse.push(buf_wrapper).is_err() {
-                // Put back if inuse is full
-                let _ = self.cache.push(LamportPtr(buf_ptr));
+                let _ = self.cache.push(LamportPtr(buf_ptr)); // IPC: return to cache if inuse full
                 return None;
             }
-            // Reset the buffer before use
+            // Reset buffer (paper implies this)
             unsafe {
                 (*buf_ptr).head.store(0, Ordering::Relaxed);
                 (*buf_ptr).tail.store(0, Ordering::Relaxed);
             }
-            return Some(buf_ptr);
+            return Some(buf_ptr); // Line 31
         }
 
-        None
+        None // IPC: no allocation, pre-allocated pool exhausted
     }
 
-    // Paper: next_r() - gets next buffer for reader
+    // next_r() - Lines 33-36 in Figure 3
     fn next_r(&self) -> Option<*mut LamportQueue<T>> {
-        self.inuse.pop().ok().map(|wrapper| wrapper.0)
+        self.inuse.pop().ok().map(|wrapper| wrapper.0) // Line 35
     }
 
-    // Paper: release() - returns buffer to pool
+    // release() - Lines 37-40 in Figure 3
     fn release(&self, buf: *mut LamportQueue<T>) {
         if buf.is_null() {
             return;
         }
 
         unsafe {
-            // Reset buffer
+            // Line 38 - reset pread and pwrite
             (*buf).head.store(0, Ordering::Relaxed);
             (*buf).tail.store(0, Ordering::Relaxed);
         }
 
-        // Try to add to cache
+        // Line 39 - try to add to cache
         let _ = self.cache.push(LamportPtr(buf));
     }
 }
 
+// uSPSC queue - corresponds to paper's unbounded queue
 #[repr(C, align(128))]
 pub struct UnboundedQueue<T: Send + 'static> {
-    // Paper: buf_r and buf_w
-    buf_r: AtomicPtr<LamportQueue<T>>,
-    _padding1: [u8; 120],
+    buf_r: AtomicPtr<LamportQueue<T>>, // Reader's buffer pointer
+    _padding1: [u8; 120],              // IPC: cache line separation
 
-    buf_w: AtomicPtr<LamportQueue<T>>,
+    buf_w: AtomicPtr<LamportQueue<T>>, // Writer's buffer pointer
     _padding2: [u8; 120],
 
-    // Paper: Pool
-    pool: BufferPool<T>,
+    pool: BufferPool<T>, // Pool of SPSC buffers
 
-    // Paper: size (segment size)
-    size: usize,
+    size: usize, // Line 1 - segment size
 }
 
 unsafe impl<T: Send + 'static> Send for UnboundedQueue<T> {}
 unsafe impl<T: Send + 'static> Sync for UnboundedQueue<T> {}
 
 impl<T: Send + 'static> UnboundedQueue<T> {
+    // IPC: calculate shared memory size
     pub fn shared_size(segment_size: usize, num_segments: usize) -> usize {
         use std::alloc::Layout;
 
-        // Ensure cache capacities are power of two
         let pool_capacity = num_segments.next_power_of_two();
 
         let layout_self = Layout::new::<Self>();
@@ -110,6 +107,7 @@ impl<T: Send + 'static> UnboundedQueue<T> {
         final_layout.size()
     }
 
+    // IPC: initialize in shared memory
     pub unsafe fn init_in_shared(
         mem_ptr: *mut u8,
         segment_size: usize,
@@ -124,7 +122,6 @@ impl<T: Send + 'static> UnboundedQueue<T> {
         assert!(segment_size.is_power_of_two());
 
         let pool_capacity = num_segments.next_power_of_two();
-
         let self_ptr = mem_ptr as *mut Self;
 
         let layout_self = Layout::new::<Self>();
@@ -186,9 +183,9 @@ impl<T: Send + 'static> UnboundedQueue<T> {
         ptr::write(
             self_ptr,
             Self {
-                buf_r: AtomicPtr::new(initial_segment),
+                buf_r: AtomicPtr::new(initial_segment), // Initially same buffer
                 _padding1: [0; 120],
-                buf_w: AtomicPtr::new(initial_segment),
+                buf_w: AtomicPtr::new(initial_segment), // Initially same buffer
                 _padding2: [0; 120],
                 pool,
                 size: segment_size,
@@ -204,58 +201,57 @@ impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
     type PushError = ();
     type PopError = ();
 
-    // Paper: push() - Figure 3, lines 3-8
+    // push() - Lines 3-8 in Figure 3
     fn push(&self, data: T) -> Result<(), Self::PushError> {
         let buf_w = self.buf_w.load(Ordering::Acquire);
 
-        // if (buf_w->full())
+        // Line 4 - if (buf_w->full())
         if unsafe { !(*buf_w).available() } {
-            // buf_w = pool.next_w()
+            // Line 5 - buf_w = pool.next_w()
             if let Some(new_buf) = self.pool.next_w() {
-                // WMB enforced by dSPSC push in next_w
-                fence(Ordering::Release);
+                fence(Ordering::Release); // WMB enforced by dSPSC push in next_w
                 self.buf_w.store(new_buf, Ordering::Release);
-                // buf_w->push(data)
+                // Line 6 - buf_w->push(data)
                 unsafe { (*new_buf).push(data).map_err(|_| ()) }
             } else {
                 Err(()) // No free buffers
             }
         } else {
-            // buf_w->push(data)
+            // Line 6 - buf_w->push(data)
             unsafe { (*buf_w).push(data).map_err(|_| ()) }
         }
     }
 
-    // Paper: pop() - Figure 3, lines 10-20
+    // pop() - Lines 10-20 in Figure 3
     fn pop(&self) -> Result<T, Self::PopError> {
         let buf_r = self.buf_r.load(Ordering::Acquire);
 
-        // if (buf_r->empty())
+        // Line 11 - if (buf_r->empty())
         if unsafe { (*buf_r).empty() } {
-            // if (buf_r == buf_w) return false
+            // Line 12 - if (buf_r == buf_w) return false
             let buf_w = self.buf_w.load(Ordering::Acquire);
             if buf_r == buf_w {
                 return Err(()); // Queue is truly empty
             }
 
-            // Second check after fence (paper's correctness requirement)
+            // Line 13 - second check after fence (paper's correctness requirement)
             fence(Ordering::Acquire);
             if unsafe { (*buf_r).empty() } {
-                // Switch to next buffer
+                // Lines 14-17 - switch to next buffer
                 if let Some(tmp) = self.pool.next_r() {
-                    self.pool.release(buf_r);
-                    self.buf_r.store(tmp, Ordering::Release);
-                    // Try pop from new buffer
+                    self.pool.release(buf_r); // Line 15
+                    self.buf_r.store(tmp, Ordering::Release); // Line 16
+                                                              // Try pop from new buffer
                     unsafe { (*tmp).pop() }
                 } else {
                     Err(())
                 }
             } else {
-                // Buffer not actually empty
+                // Buffer not actually empty after fence
                 unsafe { (*buf_r).pop() }
             }
         } else {
-            // return buf_r->pop(data)
+            // Line 19 - return buf_r->pop(data)
             unsafe { (*buf_r).pop() }
         }
     }
@@ -272,5 +268,5 @@ impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
 }
 
 impl<T: Send + 'static> Drop for UnboundedQueue<T> {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {} // IPC: shared memory cleanup handled externally
 }

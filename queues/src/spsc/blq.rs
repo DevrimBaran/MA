@@ -8,40 +8,39 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const K_CACHE_LINE_SLOTS: usize = 8;
 
+// Shared indices - groups A and B
 #[repr(C)]
 #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), repr(align(64)))]
 pub struct SharedIndices {
-    pub write: AtomicUsize,
-    pub read: AtomicUsize,
+    pub write: AtomicUsize, // Group A - Section 3.3
+    pub read: AtomicUsize,  // Group B - Section 3.3
 }
 
+// Producer private variables - group D
 #[repr(C)]
 #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), repr(align(64)))]
 struct ProducerPrivate {
-    read_shadow: usize,
-
-    write_priv: usize,
+    read_shadow: usize, // Lazy loaded read
+    write_priv: usize,  // Private write position for batching - Section 3.3
 }
 
+// Consumer private variables - group E
 #[repr(C)]
 #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), repr(align(64)))]
 struct ConsumerPrivate {
-    write_shadow: usize,
-
-    read_priv: usize,
+    write_shadow: usize, // Lazy loaded write
+    read_priv: usize,    // Private read position for batching - Section 3.3
 }
 
 #[repr(C)]
 pub struct BlqQueue<T: Send + 'static> {
     shared_indices: SharedIndices,
-
     prod_private: UnsafeCell<ProducerPrivate>,
-
     cons_private: UnsafeCell<ConsumerPrivate>,
     capacity: usize,
     mask: usize,
     buffer: ManuallyDrop<Box<[UnsafeCell<MaybeUninit<T>>]>>,
-    owns_buffer: bool,
+    owns_buffer: bool, // IPC adaptation
 }
 
 unsafe impl<T: Send> Send for BlqQueue<T> {}
@@ -54,6 +53,7 @@ pub struct BlqPushError<T>(pub T);
 pub struct BlqPopError;
 
 impl<T: Send + 'static> BlqQueue<T> {
+    // IPC adaptation - calculate shared memory size
     pub fn shared_size(capacity: usize) -> usize {
         assert!(
             capacity.is_power_of_two(),
@@ -72,6 +72,8 @@ impl<T: Send + 'static> BlqQueue<T> {
             layout_header.extend(layout_buffer_elements).unwrap();
         combined_layout.pad_to_align().size()
     }
+
+    // IPC adaptation - initialize in pre-allocated shared memory
     pub unsafe fn init_in_shared(mem: *mut u8, capacity: usize) -> &'static mut Self {
         assert!(
             capacity.is_power_of_two(),
@@ -113,13 +115,14 @@ impl<T: Send + 'static> BlqQueue<T> {
                 capacity,
                 mask: capacity - 1,
                 buffer: ManuallyDrop::new(boxed_buffer),
-                owns_buffer: false,
+                owns_buffer: false, // IPC - buffer not heap allocated
             },
         );
 
         &mut *queue_struct_ptr
     }
 
+    // blq_enq_space - Figure 6 in paper (part 1)
     #[inline]
     pub fn blq_enq_space(&self, needed: usize) -> usize {
         let prod_priv = unsafe { &mut *self.prod_private.get() };
@@ -127,6 +130,7 @@ impl<T: Send + 'static> BlqQueue<T> {
         let mut free_slots = (self.capacity - K_CACHE_LINE_SLOTS)
             .wrapping_sub(prod_priv.write_priv.wrapping_sub(prod_priv.read_shadow));
 
+        // Lazy load if not enough space
         if free_slots < needed {
             prod_priv.read_shadow = self.shared_indices.read.load(Ordering::Acquire);
             free_slots = (self.capacity - K_CACHE_LINE_SLOTS)
@@ -135,11 +139,13 @@ impl<T: Send + 'static> BlqQueue<T> {
         free_slots
     }
 
+    // blq_enq_local - Figure 6 in paper (part 2)
     #[inline]
     pub fn blq_enq_local(&self, item: T) -> Result<(), BlqPushError<T>> {
         let prod_priv = unsafe { &mut *self.prod_private.get() };
         let current_write_priv = prod_priv.write_priv;
 
+        // Check space without publishing
         let num_filled = current_write_priv.wrapping_sub(prod_priv.read_shadow);
         if num_filled >= self.capacity - K_CACHE_LINE_SLOTS {
             prod_priv.read_shadow = self.shared_indices.read.load(Ordering::Acquire);
@@ -150,6 +156,7 @@ impl<T: Send + 'static> BlqQueue<T> {
             }
         }
 
+        // Store locally without publishing
         let slot_idx = current_write_priv & self.mask;
         unsafe {
             ptr::write(
@@ -161,21 +168,25 @@ impl<T: Send + 'static> BlqQueue<T> {
         Ok(())
     }
 
+    // blq_enq_publish - Figure 6 in paper (part 3)
     #[inline]
     pub fn blq_enq_publish(&self) {
         let prod_priv = unsafe { &*self.prod_private.get() };
 
+        // Atomically publish all local enqueues
         self.shared_indices
             .write
             .store(prod_priv.write_priv, Ordering::Release);
     }
 
+    // blq_deq_space - Figure 7 in paper (part 1)
     #[inline]
     pub fn blq_deq_space(&self, needed: usize) -> usize {
         let cons_priv = unsafe { &mut *self.cons_private.get() };
 
         let mut available_items = cons_priv.write_shadow.wrapping_sub(cons_priv.read_priv);
 
+        // Lazy load if not enough items
         if available_items < needed {
             cons_priv.write_shadow = self.shared_indices.write.load(Ordering::Acquire);
             available_items = cons_priv.write_shadow.wrapping_sub(cons_priv.read_priv);
@@ -183,11 +194,13 @@ impl<T: Send + 'static> BlqQueue<T> {
         available_items
     }
 
+    // blq_deq_local - Figure 7 in paper (part 2)
     #[inline]
     pub fn blq_deq_local(&self) -> Result<T, BlqPopError> {
         let cons_priv = unsafe { &mut *self.cons_private.get() };
         let current_read_priv = cons_priv.read_priv;
 
+        // Check availability without publishing
         if current_read_priv == cons_priv.write_shadow {
             cons_priv.write_shadow = self.shared_indices.write.load(Ordering::Acquire);
             if current_read_priv == cons_priv.write_shadow {
@@ -195,16 +208,19 @@ impl<T: Send + 'static> BlqQueue<T> {
             }
         }
 
+        // Read locally without publishing
         let slot_idx = current_read_priv & self.mask;
         let item = unsafe { ptr::read((*self.buffer.get_unchecked(slot_idx)).get()).assume_init() };
         cons_priv.read_priv = current_read_priv.wrapping_add(1);
         Ok(item)
     }
 
+    // blq_deq_publish - Figure 7 in paper (part 3)
     #[inline]
     pub fn blq_deq_publish(&self) {
         let cons_priv = unsafe { &*self.cons_private.get() };
 
+        // Atomically publish all local dequeues
         self.shared_indices
             .read
             .store(cons_priv.read_priv, Ordering::Release);
@@ -215,6 +231,7 @@ impl<T: Send + 'static> SpscQueue<T> for BlqQueue<T> {
     type PushError = BlqPushError<T>;
     type PopError = BlqPopError;
 
+    // Single item push - uses batching API with batch size 1
     #[inline]
     fn push(&self, item: T) -> Result<(), Self::PushError> {
         if self.blq_enq_space(1) == 0 {
@@ -225,6 +242,7 @@ impl<T: Send + 'static> SpscQueue<T> for BlqQueue<T> {
         Ok(())
     }
 
+    // Single item pop - uses batching API with batch size 1
     #[inline]
     fn pop(&self) -> Result<T, Self::PopError> {
         if self.blq_deq_space(1) == 0 {
@@ -247,7 +265,9 @@ impl<T: Send + 'static> SpscQueue<T> for BlqQueue<T> {
 }
 
 impl<T: Send + 'static> Drop for BlqQueue<T> {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        // IPC - cleanup handled externally
+    }
 }
 
 impl<T: Send + fmt::Debug + 'static> fmt::Debug for BlqQueue<T> {

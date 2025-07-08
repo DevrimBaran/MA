@@ -6,25 +6,28 @@ use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub const K_CACHE_LINE_SLOTS: usize = 8;
+pub const K_CACHE_LINE_SLOTS: usize = 8; // Section 3.2 - K value
 
+// Shared control variables - groups A and B
 #[repr(C)]
 #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), repr(align(64)))]
 pub struct SharedIndices {
-    pub write: AtomicUsize,
-    pub read: AtomicUsize,
+    pub write: AtomicUsize, // Group A
+    pub read: AtomicUsize,  // Group B
 }
 
+// Producer private cache line - group D
 #[repr(C)]
 #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), repr(align(64)))]
 struct ProducerPrivate {
-    read_shadow: usize,
+    read_shadow: usize, // Lazy loaded copy of read - Section 3.2
 }
 
+// Consumer private cache line - group E
 #[repr(C)]
 #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), repr(align(64)))]
 struct ConsumerPrivate {
-    write_shadow: usize,
+    write_shadow: usize, // Lazy loaded copy of write - Section 3.2
 }
 
 #[repr(C)]
@@ -47,6 +50,7 @@ pub struct LlqPushError<T>(pub T);
 pub struct LlqPopError;
 
 impl<T: Send + 'static> LlqQueue<T> {
+    // IPC adaptation - calculate shared memory size
     pub fn llq_shared_size(capacity: usize) -> usize {
         assert!(
             capacity > K_CACHE_LINE_SLOTS,
@@ -66,6 +70,7 @@ impl<T: Send + 'static> LlqQueue<T> {
         combined_layout.pad_to_align().size()
     }
 
+    // IPC adaptation - initialize in pre-allocated shared memory
     pub unsafe fn init_in_shared(mem: *mut u8, capacity: usize) -> &'static mut Self {
         assert!(
             capacity.is_power_of_two(),
@@ -108,11 +113,14 @@ impl<T: Send + 'static> LlqQueue<T> {
         &mut *queue_struct_ptr
     }
 
+    // llq_enqueue - Figure 4 in paper
     fn enqueue_internal(&self, item: T) -> Result<(), LlqPushError<T>> {
         let prod_priv = unsafe { &mut *self.prod_private.get() };
         let current_write = self.shared_indices.write.load(Ordering::Relaxed);
 
+        // Check if N-K slots used (leave K empty) - Section 3.2
         if current_write.wrapping_sub(prod_priv.read_shadow) == self.capacity - K_CACHE_LINE_SLOTS {
+            // Lazy load read
             prod_priv.read_shadow = self.shared_indices.read.load(Ordering::Acquire);
             if current_write.wrapping_sub(prod_priv.read_shadow)
                 == self.capacity - K_CACHE_LINE_SLOTS
@@ -131,14 +139,16 @@ impl<T: Send + 'static> LlqQueue<T> {
 
         self.shared_indices
             .write
-            .store(current_write.wrapping_add(1), Ordering::Release);
+            .store(current_write.wrapping_add(1), Ordering::Release); // store_release_barrier
         Ok(())
     }
 
+    // llq_dequeue - Figure 4 in paper
     fn dequeue_internal(&self) -> Result<T, LlqPopError> {
         let cons_priv = unsafe { &mut *self.cons_private.get() };
         let current_read = self.shared_indices.read.load(Ordering::Relaxed);
 
+        // Lazy load write - Section 3.2
         if current_read == cons_priv.write_shadow {
             cons_priv.write_shadow = self.shared_indices.write.load(Ordering::Acquire);
             if current_read == cons_priv.write_shadow {
@@ -186,7 +196,9 @@ impl<T: Send + 'static> SpscQueue<T> for LlqQueue<T> {
 }
 
 impl<T: Send + 'static> Drop for LlqQueue<T> {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        // IPC - cleanup handled externally
+    }
 }
 
 impl<T: Send + fmt::Debug + 'static> fmt::Debug for LlqQueue<T> {

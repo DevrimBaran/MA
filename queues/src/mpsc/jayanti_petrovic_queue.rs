@@ -7,6 +7,7 @@ use std::sync::atomic::{fence, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use super::sesd_jp_queue::{Node as SesdNode, SesdJpQueue};
 use crate::MpscQueue as MpscQueueTrait;
 
+// IPC adaptation - pool for SESD nodes instead of heap allocation
 #[repr(C)]
 struct ShmBumpPool<T: Send + Clone + 'static> {
     base: AtomicPtr<u8>,
@@ -25,6 +26,7 @@ impl<T: Send + Clone + 'static> ShmBumpPool<T> {
         }
     }
 
+    // IPC adaptation - bounded attempts for wait-freedom
     unsafe fn free_sesd_node(&self, node_ptr: *mut SesdNode<(T, Timestamp)>) {
         if node_ptr.is_null() {
             return;
@@ -121,9 +123,10 @@ impl<T: Send + Clone + 'static> ShmBumpPool<T> {
     }
 }
 
+// Timestamp structure - Section 3 of paper
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timestamp {
-    // Use u32 for value and u16 for pid to fit in 64 bits total
+    // IPC adaptation: Use u32/u16 to fit in 64 bits (paper uses unbounded integers)
     val: u32,
     pid: u16,
 }
@@ -142,16 +145,18 @@ impl Ord for Timestamp {
     }
 }
 
+// Paper uses infinity symbol - we use max values
 pub const INFINITY_TS: Timestamp = Timestamp {
     val: u32::MAX,
     pid: u16::MAX,
 };
 
+// MinInfo stored at tree nodes - Section 1.1
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct MinInfo {
     ts: Timestamp,
-    leaf_idx: u16,
+    leaf_idx: u16, // which local queue has the minimum
 }
 
 impl MinInfo {
@@ -184,11 +189,11 @@ impl MinInfo {
     }
 }
 
-// We'll use 32 bits for version, leaving 32 bits for timestamp and 16 bits for leaf_idx
+// IPC adaptation: Versioned CAS to simulate LL/SC (paper assumes native LL/SC)
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct CompactMinInfo {
-    version: u32,
+    version: u32, // Added for CAS-based LL/SC simulation
     ts_val: u16,  // Reduced from u32 to u16
     ts_pid: u8,   // Reduced from u16 to u8
     leaf_idx: u8, // Reduced from u16 to u8
@@ -240,9 +245,10 @@ impl CompactMinInfo {
     }
 }
 
+// Tree node structure - Figure 1 in paper
 #[repr(C)]
 pub struct TreeNode {
-    // Store CompactMinInfo as a single atomic u64
+    // IPC adaptation: Store CompactMinInfo as atomic u64 for CAS
     compact_min_info: AtomicU64,
 }
 
@@ -266,7 +272,7 @@ impl TreeNode {
         self.read_compact_min_info().to_min_info()
     }
 
-    // This implements the LL/SC pattern using CAS with versioning
+    // Simulates LL/SC using CAS with versioning - Lines 16-18 in Figure 3 (paper says that this is possible)
     #[inline]
     unsafe fn cas_min_info(&self, old_compact: CompactMinInfo, new_min_info: MinInfo) -> bool {
         let new_compact = CompactMinInfo::from_min_info(new_min_info, old_compact.version + 1);
@@ -282,16 +288,17 @@ impl TreeNode {
     }
 }
 
+// Main queue structure - Figure 3 in paper
 #[repr(C)]
 pub struct JayantiPetrovicMpscQueue<T: Send + Clone + 'static> {
-    counter: AtomicU64,
+    counter: AtomicU64, // Line 1 in Figure 3 (tok variable)
     num_producers: usize,
-    local_queues_base: *mut SesdJpQueue<(T, Timestamp)>,
-    tree_nodes_base: *mut TreeNode,
+    local_queues_base: *mut SesdJpQueue<(T, Timestamp)>, // Q array
+    tree_nodes_base: *mut TreeNode,                      // T: treetype
     sesd_initial_dummies_base: *mut SesdNode<(T, Timestamp)>,
     sesd_help_slots_base: *mut MaybeUninit<(T, Timestamp)>,
     sesd_free_later_dummies_base: *mut SesdNode<(T, Timestamp)>,
-    sesd_node_pool: ShmBumpPool<T>,
+    sesd_node_pool: ShmBumpPool<T>, // IPC adaptation
 }
 
 unsafe impl<T: Send + Clone + 'static> Send for JayantiPetrovicMpscQueue<T> {}
@@ -333,6 +340,7 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
         total_size
     }
 
+    // IPC adaptation - initialize all data structures in shared memory
     pub unsafe fn init_in_shared(
         mem_ptr: *mut u8,
         num_producers: usize,
@@ -386,6 +394,7 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
         let sesd_node_pool_managed_bytes =
             sesd_node_pool_capacity * mem::size_of::<SesdNode<(T, Timestamp)>>();
 
+        // Initialization - counter = 0
         ptr::write(
             self_ptr,
             Self {
@@ -405,11 +414,13 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
 
         let queue_ref = &mut *self_ptr;
 
+        // Initialize tree nodes
         for i in 0..tree_node_count {
             let tree_node_raw_ptr = queue_ref.tree_nodes_base.add(i);
             TreeNode::init_in_shm(tree_node_raw_ptr);
         }
 
+        // Initialize local queues - Section 2
         for i in 0..num_producers {
             let lq_ptr = queue_ref.local_queues_base.add(i);
             let initial_dummy_node = queue_ref.sesd_initial_dummies_base.add(i);
@@ -464,13 +475,14 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
         )
     }
 
-    // Implement refresh() procedure using CAS
+    // refresh() - Lines 16-18 in Figure 3
     pub unsafe fn refresh(&self, u_idx: usize) -> bool {
         let u_node = self.get_tree_node(u_idx);
 
-        // "LL", load current value with version
+        // Line 16: LL(currentNode)
         let old_compact = u_node.read_compact_min_info();
 
+        // Line 17: read time stamps in currentNode's children
         let (left_child_idx_opt, right_child_idx_opt) = self.get_children_indices(u_idx);
 
         let left_ts_info = match left_child_idx_opt {
@@ -482,17 +494,20 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
             None => MinInfo::infinite(),
         };
 
+        // Let minT be the smallest time stamp read
         let new_min_info_val_for_u = if left_ts_info.ts <= right_ts_info.ts {
             left_ts_info
         } else {
             right_ts_info
         };
 
-        // "SC", compare and swap with version increment
+        // Line 18: return SC(currentNode, minT)
         u_node.cas_min_info(old_compact, new_min_info_val_for_u)
     }
 
+    // propagate(Q) - Lines 5-10 in Figure 3
     unsafe fn propagate(&self, producer_id: usize, is_enqueuer: bool) {
+        // Line 5: currentNode = Q
         let mut current_tree_node_idx = self.get_leaf_tree_node_idx(producer_id);
         let local_q = self.get_local_queue(producer_id);
 
@@ -516,28 +531,33 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
             .compact_min_info
             .store(new_compact.to_u64(), Ordering::Release);
 
-        // Propagate up the tree
+        // Line 6: repeat
         while let Some(parent_idx) = self.get_parent_idx(current_tree_node_idx) {
+            // Line 7: currentNode = parent(currentNode)
             current_tree_node_idx = parent_idx;
 
-            // if first refresh fails, do it again
+            // Line 8: if ¬refresh()
             if !self.refresh(current_tree_node_idx) {
+                // Line 9: refresh()
                 self.refresh(current_tree_node_idx);
             }
-            // Always do a second refresh
+            // Paper says to always do second refresh for correctness
             self.refresh(current_tree_node_idx);
-        }
+        } // Line 10: until(currentNode == root(T))
     }
 
     unsafe fn alloc_sesd_node_from_pool(&self) -> *mut SesdNode<(T, Timestamp)> {
         self.sesd_node_pool.alloc_sesd_node()
     }
 
+    // enqueue(p, v) - Lines 1-4 in Figure 3
     pub fn enqueue(&self, producer_id: usize, item: T) -> Result<(), ()> {
         if producer_id >= self.num_producers {
             return Err(());
         }
+        // Line 1: tok = LL(counter)
         let tok = self.counter.fetch_add(1, Ordering::Relaxed) as u32;
+        // Line 2: SC(counter, tok + 1) - implicit in fetch_add
         let ts = Timestamp {
             val: tok,
             pid: producer_id as u16,
@@ -549,20 +569,25 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
             if new_sesd_node_for_dummy.is_null() {
                 return Err(());
             }
+            // Line 3: enqueue2(Q[p], (v, (tok, p)))
             local_q.enqueue2((item, ts), new_sesd_node_for_dummy);
+            // Line 4: propagate(Q[p])
             self.propagate(producer_id, true);
         }
         Ok(())
     }
 
+    // dequeue(p) - Lines 11-15 in Figure 3
     pub fn dequeue(&self) -> Option<T> {
         unsafe {
             if self.num_producers == 0 {
                 return None;
             }
+            // Line 11: [t, q] = read(root(T))
             let root_node = self.get_tree_node(0);
             let min_info_at_root = root_node.read_min_info();
 
+            // Line 12: if (q == ⊥) return ⊥
             if min_info_at_root.ts == INFINITY_TS {
                 return None;
             }
@@ -582,8 +607,10 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
 
             let local_q_to_dequeue = self.get_local_queue(target_producer_id);
             let mut dequeued_node_to_free = ptr::null_mut();
+            // Line 13: ret = dequeue2(Q[q])
             let item_tuple_opt = local_q_to_dequeue.dequeue2(&mut dequeued_node_to_free);
 
+            // IPC adaptation - return node to pool
             if !dequeued_node_to_free.is_null() {
                 let initial_dummy_for_this_q =
                     self.sesd_initial_dummies_base.add(target_producer_id);
@@ -597,7 +624,9 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
                 }
             }
 
+            // Line 14: propagate(Q[q])
             self.propagate(target_producer_id, false);
+            // Line 15: return ret.val
             item_tuple_opt.map(|(item, _ts)| item)
         }
     }
@@ -623,6 +652,6 @@ impl<T: Send + Clone + 'static> MpscQueueTrait<T> for JayantiPetrovicMpscQueue<T
     }
 
     fn is_full(&self) -> bool {
-        false
+        false // Paper assumes unbounded queue
     }
 }

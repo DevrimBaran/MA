@@ -6,41 +6,46 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering}
 
 use crate::MpscQueue;
 
+// Node states from paper - Section 4.1
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(usize)]
 pub enum NodeState {
-    Empty = 0,
-    Set = 1,
-    Handled = 2,
+    Empty = 0,   // isSet = empty
+    Set = 1,     // isSet = set
+    Handled = 2, // isSet = handled
 }
 
+// Node structure - Algorithm 1, lines 1-3
 #[repr(C)]
 pub struct Node<T> {
-    data: MaybeUninit<T>,
-    pub is_set: AtomicUsize,
+    data: MaybeUninit<T>,    // T data
+    pub is_set: AtomicUsize, // atomic<State> isSet
 }
 
 impl<T> Node<T> {
+    // IPC adaptation: in-place initialization
     unsafe fn init_in_place(node_ptr: *mut Self) {
         ptr::addr_of_mut!((*node_ptr).data).write(MaybeUninit::uninit());
         ptr::addr_of_mut!((*node_ptr).is_set).write(AtomicUsize::new(NodeState::Empty as usize));
     }
 }
 
+// BufferList structure - Algorithm 1, lines 5-10
 #[repr(C)]
 pub struct BufferList<T> {
-    pub curr_buffer: *mut Node<T>,
-    pub capacity: usize,
-    next: AtomicPtr<BufferList<T>>,
-    pub prev: *mut BufferList<T>,
-    consumer_head_idx: AtomicUsize,
-    pub position_in_queue: u64,
-    pub is_array_reclaimed: AtomicBool,
-    next_in_garbage: AtomicPtr<BufferList<T>>,
-    next_free_meta: AtomicPtr<BufferList<T>>,
+    pub curr_buffer: *mut Node<T>,             // Node* currBuffer
+    pub capacity: usize,                       // IPC: explicit capacity tracking
+    next: AtomicPtr<BufferList<T>>,            // atomic<bufferList*> next
+    pub prev: *mut BufferList<T>,              // bufferList* prev
+    consumer_head_idx: AtomicUsize,            // unsigned int head (made atomic for IPC)
+    pub position_in_queue: u64,                // unsigned int positionInQueue
+    pub is_array_reclaimed: AtomicBool,        // IPC: track array reclamation
+    next_in_garbage: AtomicPtr<BufferList<T>>, // Paper's garbage list mechanism
+    next_free_meta: AtomicPtr<BufferList<T>>,  // IPC: metadata free list
 }
 
 impl<T: Send + 'static> BufferList<T> {
+    // IPC adaptation: in-place initialization
     unsafe fn init_metadata_in_place(
         bl_meta_ptr: *mut Self,
         node_array_ptr: *mut Node<T>,
@@ -58,6 +63,7 @@ impl<T: Send + 'static> BufferList<T> {
         ptr::addr_of_mut!((*bl_meta_ptr).next_in_garbage).write(AtomicPtr::new(ptr::null_mut()));
         ptr::addr_of_mut!((*bl_meta_ptr).next_free_meta).write(AtomicPtr::new(ptr::null_mut()));
 
+        // Initialize all nodes in buffer
         if !node_array_ptr.is_null() {
             for i in 0..capacity {
                 Node::init_in_place(node_array_ptr.add(i));
@@ -65,6 +71,7 @@ impl<T: Send + 'static> BufferList<T> {
         }
     }
 
+    // IPC/Rust adaptation: mark items as dropped when reclaiming
     unsafe fn mark_items_dropped_and_array_reclaimable(&mut self) {
         if self.curr_buffer.is_null() || self.is_array_reclaimed.load(Ordering::Relaxed) {
             return;
@@ -87,22 +94,27 @@ impl<T: Send + 'static> BufferList<T> {
     }
 }
 
+// IPC adaptation: pre-allocated pools instead of dynamic allocation
 #[repr(C)]
 struct SharedPools<T: Send + 'static> {
+    // Pool for BufferList metadata
     bl_meta_pool_start: *mut BufferList<T>,
     bl_meta_pool_capacity: usize,
     bl_meta_next_free_idx: AtomicUsize,
     bl_meta_free_list_head: AtomicPtr<BufferList<T>>,
 
+    // Pool for node arrays
     node_arrays_pool_start: *mut Node<T>,
     node_arrays_pool_total_nodes: usize,
     node_arrays_next_free_node_idx: AtomicUsize,
     buffer_capacity_per_array: usize,
 
+    // Free list for reclaimed node arrays
     node_array_slice_free_list_head: AtomicPtr<Node<T>>,
 }
 
 impl<T: Send + 'static> SharedPools<T> {
+    // IPC: allocate pools in shared memory
     unsafe fn new_in_place(
         mem_ptr: *mut u8,
         mut current_offset: usize,
@@ -110,21 +122,25 @@ impl<T: Send + 'static> SharedPools<T> {
         nodes_per_buffer: usize,
         total_node_capacity_for_pool: usize,
     ) -> (*mut Self, usize) {
+        // Align and place pools struct
         let self_align = align_of::<Self>();
         current_offset = (current_offset + self_align - 1) & !(self_align - 1);
         let pools_ptr = mem_ptr.add(current_offset) as *mut Self;
         current_offset += size_of::<Self>();
 
+        // Align and place metadata pool
         let bl_meta_align = align_of::<BufferList<T>>();
         current_offset = (current_offset + bl_meta_align - 1) & !(bl_meta_align - 1);
         let bl_meta_pool_start_ptr = mem_ptr.add(current_offset) as *mut BufferList<T>;
         current_offset += max_buffers_meta * size_of::<BufferList<T>>();
 
+        // Align and place node arrays pool
         let node_align = align_of::<Node<T>>();
         current_offset = (current_offset + node_align - 1) & !(node_align - 1);
         let node_arrays_pool_start_ptr = mem_ptr.add(current_offset) as *mut Node<T>;
         current_offset += total_node_capacity_for_pool * size_of::<Node<T>>();
 
+        // Initialize pools struct
         ptr::addr_of_mut!((*pools_ptr).bl_meta_pool_start).write(bl_meta_pool_start_ptr);
         ptr::addr_of_mut!((*pools_ptr).bl_meta_pool_capacity).write(max_buffers_meta);
         ptr::addr_of_mut!((*pools_ptr).bl_meta_next_free_idx).write(AtomicUsize::new(0));
@@ -142,11 +158,13 @@ impl<T: Send + 'static> SharedPools<T> {
         (pools_ptr, current_offset)
     }
 
+    // IPC: allocate BufferList with node array from pools
     unsafe fn alloc_bl_meta_with_node_array(
         &self,
         position_in_queue: u64,
         prev_buffer: *mut BufferList<T>,
     ) -> *mut BufferList<T> {
+        // Try free list first
         loop {
             let head = self.bl_meta_free_list_head.load(Ordering::Acquire);
             if head.is_null() {
@@ -160,6 +178,7 @@ impl<T: Send + 'static> SharedPools<T> {
             {
                 let node_array_ptr = self.alloc_node_array_slice();
                 if node_array_ptr.is_null() {
+                    // Return metadata to free list if can't get nodes
                     let mut current_free_head_meta =
                         self.bl_meta_free_list_head.load(Ordering::Acquire);
                     loop {
@@ -189,6 +208,7 @@ impl<T: Send + 'static> SharedPools<T> {
             }
         }
 
+        // Allocate from pool
         let meta_idx = self.bl_meta_next_free_idx.fetch_add(1, Ordering::AcqRel);
         if meta_idx >= self.bl_meta_pool_capacity {
             self.bl_meta_next_free_idx.fetch_sub(1, Ordering::Relaxed);
@@ -209,7 +229,9 @@ impl<T: Send + 'static> SharedPools<T> {
         bl_meta_ptr
     }
 
+    // IPC: allocate node array slice from pool
     unsafe fn alloc_node_array_slice(&self) -> *mut Node<T> {
+        // Try free list first
         loop {
             let free_head_slice = self.node_array_slice_free_list_head.load(Ordering::Acquire);
             if free_head_slice.is_null() {
@@ -231,6 +253,7 @@ impl<T: Send + 'static> SharedPools<T> {
             }
         }
 
+        // Allocate from pool
         let nodes_needed = self.buffer_capacity_per_array;
         let start_node_idx = self
             .node_arrays_next_free_node_idx
@@ -244,6 +267,7 @@ impl<T: Send + 'static> SharedPools<T> {
         self.node_arrays_pool_start.add(start_node_idx)
     }
 
+    // IPC: return metadata to pool
     unsafe fn dealloc_bl_meta_to_pool(&self, bl_meta_ptr: *mut BufferList<T>) {
         if bl_meta_ptr.is_null() {
             return;
@@ -266,6 +290,7 @@ impl<T: Send + 'static> SharedPools<T> {
         }
     }
 
+    // IPC: return node array to pool
     unsafe fn dealloc_node_array_slice(&self, node_array_ptr: *mut Node<T>) {
         if node_array_ptr.is_null() {
             return;
@@ -292,19 +317,21 @@ impl<T: Send + 'static> SharedPools<T> {
     }
 }
 
+// JiffyQueue structure - Algorithm 1, lines 11-13
 #[repr(C)]
 pub struct JiffyQueue<T: Send + 'static> {
-    pub head_of_queue: AtomicPtr<BufferList<T>>,
-    pub tail_of_queue: AtomicPtr<BufferList<T>>,
-    global_tail_location: AtomicU64,
-    pools: *const SharedPools<T>,
-    garbage_list_head: AtomicPtr<BufferList<T>>,
+    pub head_of_queue: AtomicPtr<BufferList<T>>, // bufferList* headOfQueue
+    pub tail_of_queue: AtomicPtr<BufferList<T>>, // atomic<bufferList*> tailOfQueue
+    global_tail_location: AtomicU64,             // atomic<unsigned int> tail
+    pools: *const SharedPools<T>,                // IPC: pools instead of heap allocation
+    garbage_list_head: AtomicPtr<BufferList<T>>, // Paper's garbage collection mechanism
 }
 
 unsafe impl<T: Send + 'static> Send for JiffyQueue<T> {}
 unsafe impl<T: Send + 'static> Sync for JiffyQueue<T> {}
 
 impl<T: Send + 'static> JiffyQueue<T> {
+    // IPC: calculate shared memory size
     pub fn shared_size(buffer_capacity_per_array: usize, max_buffers_in_pool: usize) -> usize {
         let buffer_capacity_per_array = buffer_capacity_per_array.max(1);
         let max_buffers_in_pool = max_buffers_in_pool.max(1);
@@ -314,18 +341,22 @@ impl<T: Send + 'static> JiffyQueue<T> {
             num_buffer_slots_for_node_arrays * buffer_capacity_per_array;
         let mut current_offset = 0;
 
+        // JiffyQueue struct
         let jq_align = align_of::<JiffyQueue<T>>();
         current_offset = (current_offset + jq_align - 1) & !(jq_align - 1);
         current_offset += size_of::<JiffyQueue<T>>();
 
+        // SharedPools struct
         let sp_align = align_of::<SharedPools<T>>();
         current_offset = (current_offset + sp_align - 1) & !(sp_align - 1);
         current_offset += size_of::<SharedPools<T>>();
 
+        // BufferList metadata pool
         let bl_meta_align = align_of::<BufferList<T>>();
         current_offset = (current_offset + bl_meta_align - 1) & !(bl_meta_align - 1);
         current_offset += max_buffers_in_pool * size_of::<BufferList<T>>();
 
+        // Node arrays pool
         let node_align = align_of::<Node<T>>();
         current_offset = (current_offset + node_align - 1) & !(node_align - 1);
         current_offset += total_node_capacity_for_pool * size_of::<Node<T>>();
@@ -333,6 +364,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
         current_offset
     }
 
+    // IPC: initialize in shared memory
     pub unsafe fn init_in_shared(
         mem_ptr: *mut u8,
         buffer_capacity_per_array: usize,
@@ -346,11 +378,13 @@ impl<T: Send + 'static> JiffyQueue<T> {
             num_buffer_slots_for_node_arrays * buffer_capacity_per_array;
         let mut current_offset = 0usize;
 
+        // Place queue struct
         let jq_align = align_of::<JiffyQueue<T>>();
         current_offset = (current_offset + jq_align - 1) & !(jq_align - 1);
         let queue_ptr = mem_ptr.add(current_offset) as *mut JiffyQueue<T>;
         current_offset += size_of::<JiffyQueue<T>>();
 
+        // Initialize pools
         let (pools_instance_ptr, _next_offset_after_pools) = SharedPools::<T>::new_in_place(
             mem_ptr,
             current_offset,
@@ -359,12 +393,14 @@ impl<T: Send + 'static> JiffyQueue<T> {
             total_node_capacity_for_pool,
         );
 
+        // Allocate initial buffer
         let initial_bl_ptr =
             (*pools_instance_ptr).alloc_bl_meta_with_node_array(0, ptr::null_mut());
         if initial_bl_ptr.is_null() {
             panic!("JiffyQueue: Failed to allocate initial buffer from shared pool during init.");
         }
 
+        // Initialize queue
         ptr::addr_of_mut!((*queue_ptr).head_of_queue).write(AtomicPtr::new(initial_bl_ptr));
         ptr::addr_of_mut!((*queue_ptr).tail_of_queue).write(AtomicPtr::new(initial_bl_ptr));
         ptr::addr_of_mut!((*queue_ptr).global_tail_location).write(AtomicU64::new(0));
@@ -382,13 +418,16 @@ impl<T: Send + 'static> JiffyQueue<T> {
         unsafe { &*self.pools }
     }
 
+    // enqueue() - Algorithm 2/4
     fn actual_enqueue(&self, data: T) -> Result<(), T> {
+        // Line 2: location = FAA(tail)
         let item_global_location = self.global_tail_location.fetch_add(1, Ordering::AcqRel);
         let mut current_producer_view_of_tail_bl = self.tail_of_queue.load(Ordering::Acquire);
         let mut new_bl_allocated_by_this_thread: *mut BufferList<T> = ptr::null_mut();
 
         loop {
             if current_producer_view_of_tail_bl.is_null() {
+                // IPC: cleanup allocated buffer if any
                 if !new_bl_allocated_by_this_thread.is_null() {
                     unsafe {
                         let bl_meta_ptr = new_bl_allocated_by_this_thread;
@@ -410,9 +449,11 @@ impl<T: Send + 'static> JiffyQueue<T> {
             let tail_bl_start_loc = tail_bl_ref.position_in_queue * (current_buffer_cap as u64);
             let tail_bl_end_loc = tail_bl_start_loc + (current_buffer_cap as u64);
 
+            // Line 3: while location is in unallocated buffer
             if item_global_location >= tail_bl_end_loc {
                 let mut next_bl_in_list = tail_bl_ref.next.load(Ordering::Acquire);
                 if next_bl_in_list.is_null() {
+                    // Line 4: allocate new buffer and try adding with CAS
                     if new_bl_allocated_by_this_thread.is_null() {
                         new_bl_allocated_by_this_thread = unsafe {
                             self.pools().alloc_bl_meta_with_node_array(
@@ -443,6 +484,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                             new_bl_allocated_by_this_thread = ptr::null_mut();
                         }
                         Err(actual_next) => {
+                            // Line 6: delete allocated buffer
                             next_bl_in_list = actual_next;
                             if !new_bl_allocated_by_this_thread.is_null() {
                                 unsafe {
@@ -476,8 +518,10 @@ impl<T: Send + 'static> JiffyQueue<T> {
                 }
                 continue;
             } else if item_global_location < tail_bl_start_loc {
+                // Line 10: while location is not in buffer pointed by tempTail
                 current_producer_view_of_tail_bl = tail_bl_ref.prev;
                 if current_producer_view_of_tail_bl.is_null() {
+                    // IPC: cleanup
                     if !new_bl_allocated_by_this_thread.is_null() {
                         unsafe {
                             let bl_meta_ptr = new_bl_allocated_by_this_thread;
@@ -494,11 +538,13 @@ impl<T: Send + 'static> JiffyQueue<T> {
                 }
                 continue;
             } else {
+                // Line 14: adjust location to corresponding index
                 let internal_idx = (item_global_location - tail_bl_start_loc) as usize;
                 if internal_idx >= tail_bl_ref.capacity {
                     current_producer_view_of_tail_bl = self.tail_of_queue.load(Ordering::Acquire);
                     continue;
                 }
+                // IPC: check if buffer was reclaimed
                 if tail_bl_ref.curr_buffer.is_null()
                     || tail_bl_ref.is_array_reclaimed.load(Ordering::Relaxed)
                 {
@@ -506,6 +552,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                     continue;
                 }
 
+                // Lines 15-16: store data and set flag
                 let node_ptr = unsafe { tail_bl_ref.curr_buffer.add(internal_idx) };
                 unsafe {
                     ptr::addr_of_mut!((*node_ptr).data).write(MaybeUninit::new(data));
@@ -514,11 +561,13 @@ impl<T: Send + 'static> JiffyQueue<T> {
                         .store(NodeState::Set as usize, Ordering::Release);
                 }
 
+                // Line 17: if location is second entry of last buffer
                 let is_globally_last_buffer = tail_bl_ref.next.load(Ordering::Acquire).is_null()
                     && current_producer_view_of_tail_bl
                         == self.tail_of_queue.load(Ordering::Relaxed);
 
                 if internal_idx == 1 && is_globally_last_buffer && self.buffer_capacity() > 1 {
+                    // Line 18: allocate new buffer and try adding with CAS
                     let prealloc_bl = unsafe {
                         self.pools().alloc_bl_meta_with_node_array(
                             tail_bl_ref.position_in_queue + 1,
@@ -545,6 +594,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                                 )
                                 .ok();
                         } else {
+                            // IPC: cleanup prealloc buffer
                             unsafe {
                                 let bl_meta_ptr = prealloc_bl;
                                 let node_array_to_dealloc = (*bl_meta_ptr).curr_buffer;
@@ -559,6 +609,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                     }
                 }
 
+                // IPC: cleanup any unused allocated buffer
                 if !new_bl_allocated_by_this_thread.is_null() {
                     unsafe {
                         let bl_meta_ptr = new_bl_allocated_by_this_thread;
@@ -576,6 +627,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
         }
     }
 
+    // fold() - Algorithm 6 - fold fully handled buffer in middle of queue
     pub unsafe fn attempt_fold_buffer(
         &self,
         bl_to_fold_ptr: *mut BufferList<T>,
@@ -587,6 +639,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
 
         let bl_to_fold_ref = &*bl_to_fold_ptr;
 
+        // Check all nodes are handled
         let all_handled = (0..bl_to_fold_ref.capacity).all(|i| {
             let node_ptr = bl_to_fold_ref.curr_buffer.add(i);
             (*node_ptr).is_set.load(Ordering::Acquire) == NodeState::Handled as usize
@@ -605,6 +658,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
 
         let prev_bl_ref = &*prev_bl_ptr;
 
+        // Shortcut this buffer
         match prev_bl_ref.next.compare_exchange(
             bl_to_fold_ptr,
             next_bl_ptr,
@@ -616,6 +670,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                     (*next_bl_ptr).prev = prev_bl_ptr;
                 }
 
+                // Line 53: delete[] tempHeadOfQueue->currbuffer
                 let node_array_to_dealloc = bl_to_fold_ref.curr_buffer;
                 let bl_to_fold_mut_ref = &mut *bl_to_fold_ptr;
                 bl_to_fold_mut_ref.mark_items_dropped_and_array_reclaimable();
@@ -625,6 +680,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                 }
                 bl_to_fold_mut_ref.curr_buffer = ptr::null_mut();
 
+                // Line 54: garbageList.addLast(tempHeadOfQueue)
                 let mut current_garbage_head = self.garbage_list_head.load(Ordering::Relaxed);
                 loop {
                     (*bl_to_fold_ptr)
@@ -646,6 +702,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
         }
     }
 
+    // Process garbage list - paper's deferred cleanup mechanism
     pub fn actual_process_garbage_list(&self, new_head_buffer_pos_threshold: u64) {
         let mut garbage_to_process_head = self
             .garbage_list_head
@@ -657,6 +714,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
         let mut still_deferred_list_head: *mut BufferList<T> = ptr::null_mut();
         let mut still_deferred_list_tail: *mut BufferList<T> = ptr::null_mut();
 
+        // Process each garbage item
         while !garbage_to_process_head.is_null() {
             let current_garbage_item_ptr = garbage_to_process_head;
             let item_ref = unsafe { &*current_garbage_item_ptr };
@@ -664,12 +722,14 @@ impl<T: Send + 'static> JiffyQueue<T> {
 
             let metadata_pos = item_ref.position_in_queue;
 
+            // Safe to delete if before threshold
             if metadata_pos < new_head_buffer_pos_threshold {
                 unsafe {
                     self.pools()
                         .dealloc_bl_meta_to_pool(current_garbage_item_ptr);
                 }
             } else {
+                // Defer deletion
                 unsafe {
                     (*current_garbage_item_ptr)
                         .next_in_garbage
@@ -682,6 +742,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
             }
         }
 
+        // Put deferred items back on garbage list
         if !still_deferred_list_head.is_null() {
             if still_deferred_list_tail.is_null() {
                 still_deferred_list_tail = still_deferred_list_head;
@@ -719,6 +780,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
         }
     }
 
+    // dequeue() - Algorithm 3/5
     fn actual_dequeue(&self) -> Option<T> {
         'retry_dequeue: loop {
             let current_bl_ptr = self.head_of_queue.load(Ordering::Acquire);
@@ -727,10 +789,11 @@ impl<T: Send + 'static> JiffyQueue<T> {
                 return None;
             }
 
-            let current_bl = unsafe { &*current_bl_ptr }; // Now using immutable reference
+            let current_bl = unsafe { &*current_bl_ptr };
 
-            // Skip handled elements
+            // Line 4: skip handled elements
             while current_bl.consumer_head_idx.load(Ordering::Relaxed) < current_bl.capacity {
+                // IPC: check if buffer reclaimed
                 if current_bl.curr_buffer.is_null()
                     || current_bl.is_array_reclaimed.load(Ordering::Relaxed)
                 {
@@ -748,7 +811,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                 }
             }
 
-            // Check if we need to move to next buffer
+            // Line 7: move to next buffer if exists
             let consumer_head_idx = current_bl.consumer_head_idx.load(Ordering::Relaxed);
             if consumer_head_idx >= current_bl.capacity
                 || current_bl.curr_buffer.is_null()
@@ -761,6 +824,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                     Some(unsafe { (*next_bl_candidate).position_in_queue })
                 };
 
+                // Process garbage before moving head
                 if !next_bl_candidate.is_null()
                     || current_bl.curr_buffer.is_null()
                     || current_bl.is_array_reclaimed.load(Ordering::Relaxed)
@@ -784,6 +848,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                             (*next_bl_candidate).prev = ptr::null_mut();
                         }
                     }
+                    // IPC: cleanup old head buffer
                     unsafe {
                         let node_array_to_dealloc = current_bl.curr_buffer;
                         let current_bl_mut = &mut *current_bl_ptr;
@@ -809,10 +874,12 @@ impl<T: Send + 'static> JiffyQueue<T> {
             let n_node_ptr = unsafe { current_bl.curr_buffer.add(n_idx_in_buffer) };
             let n_state = unsafe { (*n_node_ptr).is_set.load(Ordering::Acquire) };
 
+            // Check if queue is empty
             let n_global_loc = current_bl.position_in_queue * (self.buffer_capacity() as u64)
                 + (n_idx_in_buffer as u64);
             let tail_loc = self.global_tail_location.load(Ordering::Acquire);
 
+            // Line 10: if queue is empty
             if n_global_loc >= tail_loc
                 && (n_state == NodeState::Empty as usize || n_state == NodeState::Handled as usize)
                 && current_bl_ptr == self.tail_of_queue.load(Ordering::Acquire)
@@ -820,6 +887,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                 return None;
             }
 
+            // Line 15: if n.isSet == set
             if n_state == NodeState::Set as usize {
                 if unsafe {
                     (*n_node_ptr)
@@ -832,6 +900,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                         )
                         .is_ok()
                 } {
+                    // Line 36: advance head
                     current_bl.consumer_head_idx.fetch_add(1, Ordering::Relaxed);
                     let data = unsafe { ptr::read(&(*n_node_ptr).data).assume_init() };
                     return Some(data);
@@ -839,6 +908,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                     continue 'retry_dequeue;
                 }
             } else if n_state == NodeState::Empty as usize {
+                // Line 14: if n.isSet == empty (scan for set element)
                 let mut temp_n_scan_current_bl_ptr = current_bl_ptr;
                 let mut temp_n_scan_current_idx = if temp_n_scan_current_bl_ptr == current_bl_ptr {
                     n_idx_in_buffer + 1
@@ -846,12 +916,14 @@ impl<T: Send + 'static> JiffyQueue<T> {
                     0
                 };
 
+                // Line 15: scan - Algorithm 8
                 'find_initial_temp_n: loop {
                     if temp_n_scan_current_bl_ptr.is_null() {
                         return None;
                     }
                     let search_bl = unsafe { &*temp_n_scan_current_bl_ptr };
 
+                    // IPC: check if buffer reclaimed
                     if search_bl.curr_buffer.is_null()
                         || search_bl.is_array_reclaimed.load(Ordering::Relaxed)
                     {
@@ -871,6 +943,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                             let mut final_temp_n_bl_ptr = temp_n_scan_current_bl_ptr;
                             let mut final_temp_n_idx = scan_idx;
 
+                            // Line 28: rescan - Algorithm 9
                             'rescan_phase: loop {
                                 let mut rescan_bl_ptr = current_bl_ptr;
                                 let mut rescan_idx_in_buf = n_idx_in_buffer;
@@ -884,6 +957,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                                     }
                                     let r_bl = unsafe { &*rescan_bl_ptr };
 
+                                    // IPC: check if buffer reclaimed
                                     if r_bl.curr_buffer.is_null()
                                         || r_bl.is_array_reclaimed.load(Ordering::Relaxed)
                                     {
@@ -906,6 +980,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                                         unsafe { (*e_node_ptr).is_set.load(Ordering::Acquire) };
 
                                     if e_node_state == NodeState::Set as usize {
+                                        // Found earlier set item - restart from there
                                         final_temp_n_bl_ptr = rescan_bl_ptr;
                                         final_temp_n_idx = rescan_idx_in_buf;
                                         earlier_set_found_this_pass = true;
@@ -918,6 +993,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                                 }
                             }
 
+                            // Line 32: tempN.isSet = handled
                             let item_bl_ref = unsafe { &*final_temp_n_bl_ptr };
                             if item_bl_ref.curr_buffer.is_null()
                                 || item_bl_ref.is_array_reclaimed.load(Ordering::Relaxed)
@@ -938,6 +1014,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                                     )
                                     .is_ok()
                             } {
+                                // Line 35: if tempN = n then advance head
                                 if final_temp_n_bl_ptr == current_bl_ptr
                                     && final_temp_n_idx
                                         == current_bl.consumer_head_idx.load(Ordering::Relaxed)
@@ -955,11 +1032,11 @@ impl<T: Send + 'static> JiffyQueue<T> {
                         scan_idx += 1;
                     }
 
-                    // Reached end of buffer without finding a set element
+                    // Line 17: fold the queue
                     let buffer_just_scanned_ptr = temp_n_scan_current_bl_ptr;
                     let next_bl_for_scan = search_bl.next.load(Ordering::Acquire);
 
-                    // Only attempt to fold if this isn't the current buffer
+                    // Only fold if not current buffer
                     if buffer_just_scanned_ptr != current_bl_ptr {
                         let mut is_fully_handled = true;
                         if search_bl.curr_buffer.is_null()
@@ -1024,16 +1101,18 @@ impl<T: Send + 'static> MpscQueue<T> for JiffyQueue<T> {
         let head_bl = unsafe { &*head_bl_ptr };
 
         let head_global_position = head_bl.position_in_queue * (self.buffer_capacity() as u64)
-            + (head_bl.consumer_head_idx.load(Ordering::Relaxed) as u64); // Changed to use load()
+            + (head_bl.consumer_head_idx.load(Ordering::Relaxed) as u64);
 
         head_global_position >= tail_location
     }
 
     fn is_full(&self) -> bool {
-        false
+        false // Unbounded queue
     }
 }
 
 impl<T: Send + 'static> Drop for JiffyQueue<T> {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        // Shared memory cleanup handled externally
+    }
 }

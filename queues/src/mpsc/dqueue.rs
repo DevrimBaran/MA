@@ -1,4 +1,4 @@
-// paper in /paper/mpmc/dqueue.pdf
+// Paper in /paper/mpmc/dqueue.pdf
 use std::cell::UnsafeCell;
 use std::mem::{self, MaybeUninit};
 use std::ptr;
@@ -16,20 +16,23 @@ pub const N_SEGMENT_CAPACITY: usize = 64;
 #[cfg(not(miri))]
 pub const N_SEGMENT_CAPACITY: usize = 262144;
 
+// Segment structure - Algorithm 3 in paper
 #[repr(C, align(64))]
 pub struct Segment<T> {
     pub id: u64,
-    cells: *mut UnsafeCell<MaybeUninit<Option<T>>>,
+    cells: *mut UnsafeCell<MaybeUninit<Option<T>>>, // IPC: raw pointer instead of array
     next: AtomicPtr<Segment<T>>,
-    next_free: AtomicPtr<Segment<T>>,
+    next_free: AtomicPtr<Segment<T>>, // IPC: for segment pool management
 }
 
+// Request structure - Algorithm 3 in paper
 #[repr(C)]
 struct Request<T> {
     val: MaybeUninit<T>,
     cid: u64,
 }
 
+// Producer structure - Algorithm 3 in paper
 #[repr(C, align(64))]
 pub struct Producer<T> {
     local_buffer: UnsafeCell<[MaybeUninit<Request<T>>; L_LOCAL_BUFFER_CAPACITY]>,
@@ -39,6 +42,7 @@ pub struct Producer<T> {
 }
 
 impl<T> Producer<T> {
+    // IPC: Initialize producer in shared memory
     unsafe fn init_in_place(producer_ptr: *mut Self, initial_segment: *mut Segment<T>) {
         let buffer_ptr = (*producer_ptr).local_buffer.get() as *mut MaybeUninit<Request<T>>;
         for i in 0..L_LOCAL_BUFFER_CAPACITY {
@@ -49,36 +53,43 @@ impl<T> Producer<T> {
         ptr::addr_of_mut!((*producer_ptr).pseg).write(AtomicPtr::new(initial_segment));
     }
 
+    // wrap() - Algorithm 3, line 69
     #[inline(always)]
     fn local_wrap(i: usize) -> usize {
         i % L_LOCAL_BUFFER_CAPACITY
     }
 
+    // next() - Algorithm 3, line 70
     #[inline(always)]
     fn local_next(i: usize) -> usize {
         Self::local_wrap(i + 1)
     }
 }
 
+// Queue structure - Algorithm 3 in paper
 #[repr(C, align(64))]
 pub struct DQueue<T: Send + Clone + 'static> {
-    q_head: AtomicU64,
-    q_tail: AtomicU64,
-    pub qseg: AtomicPtr<Segment<T>>,
-    producers_array: *mut Producer<T>,
+    q_head: AtomicU64,                 // Algorithm 3, line 45
+    q_tail: AtomicU64,                 // Algorithm 3, line 45
+    pub qseg: AtomicPtr<Segment<T>>,   // Algorithm 3, line 45
+    producers_array: *mut Producer<T>, // IPC: array of producers
     pub num_producers: usize,
+
+    // IPC: Memory management for shared memory
     segment_pool_metadata: *mut Segment<T>,
     segment_cells_pool: *mut UnsafeCell<MaybeUninit<Option<T>>>,
     segment_pool_capacity: usize,
     next_free_segment_idx: AtomicUsize,
     free_segment_list_head: AtomicPtr<Segment<T>>,
-    cseg: AtomicPtr<Segment<T>>,
+
+    cseg: AtomicPtr<Segment<T>>, // Algorithm 3, line 48 (consumer segment cache)
 }
 
 unsafe impl<T: Send + Clone + 'static> Send for DQueue<T> {}
 unsafe impl<T: Send + Clone + 'static> Sync for DQueue<T> {}
 
 impl<T: Send + Clone + 'static> DQueue<T> {
+    // IPC: Calculate total shared memory size
     pub fn shared_size(num_producers: usize, segment_pool_capacity: usize) -> usize {
         let self_align = mem::align_of::<Self>();
         let producers_align = mem::align_of::<Producer<T>>();
@@ -111,6 +122,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         (total_size + 63) & !63
     }
 
+    // IPC: Initialize queue in shared memory
     pub unsafe fn init_in_shared(
         mem_ptr: *mut u8,
         num_producers: usize,
@@ -125,10 +137,8 @@ impl<T: Send + Clone + 'static> DQueue<T> {
             ptr
         };
 
-        // Ensure Self is aligned to 64 bytes
         let q_ptr = align_and_advance(&mut current_offset, mem::size_of::<Self>(), 64) as *mut Self;
 
-        // Ensure Producer array is aligned to 64 bytes (since Producer is repr(C, align(64)))
         let p_arr_ptr = if num_producers > 0 {
             align_and_advance(
                 &mut current_offset,
@@ -138,11 +148,13 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         } else {
             ptr::null_mut()
         };
+
         let seg_pool_meta_ptr = align_and_advance(
             &mut current_offset,
             segment_pool_capacity * mem::size_of::<Segment<T>>(),
             mem::align_of::<Segment<T>>(),
         ) as *mut Segment<T>;
+
         let seg_cells_pool_ptr = align_and_advance(
             &mut current_offset,
             segment_pool_capacity
@@ -151,6 +163,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
             mem::align_of::<UnsafeCell<MaybeUninit<Option<T>>>>(),
         ) as *mut UnsafeCell<MaybeUninit<Option<T>>>;
 
+        // Initialize queue fields
         ptr::addr_of_mut!((*q_ptr).q_head).write(AtomicU64::new(0));
         ptr::addr_of_mut!((*q_ptr).q_tail).write(AtomicU64::new(0));
         ptr::addr_of_mut!((*q_ptr).producers_array).write(p_arr_ptr);
@@ -161,6 +174,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         ptr::addr_of_mut!((*q_ptr).next_free_segment_idx).write(AtomicUsize::new(0));
         ptr::addr_of_mut!((*q_ptr).free_segment_list_head).write(AtomicPtr::new(ptr::null_mut()));
 
+        // Allocate initial segment
         let self_ref_for_alloc = &*q_ptr;
         let init_seg_ptr = self_ref_for_alloc.alloc_segment_from_pool_raw(0, true);
         if init_seg_ptr.is_null() {
@@ -169,6 +183,8 @@ impl<T: Send + Clone + 'static> DQueue<T> {
 
         ptr::addr_of_mut!((*q_ptr).qseg).write(AtomicPtr::new(init_seg_ptr));
         ptr::addr_of_mut!((*q_ptr).cseg).write(AtomicPtr::new(init_seg_ptr));
+
+        // Initialize producers
         if num_producers > 0 && !p_arr_ptr.is_null() {
             for i in 0..num_producers {
                 Producer::init_in_place(p_arr_ptr.add(i), init_seg_ptr);
@@ -177,7 +193,9 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         &mut *q_ptr
     }
 
+    // IPC: Allocate segment from pre-allocated pool (replaces malloc)
     unsafe fn alloc_segment_from_pool_raw(&self, seg_id: u64, is_initial: bool) -> *mut Segment<T> {
+        // Try to reuse from free list
         let mut head = self.free_segment_list_head.load(Ordering::Acquire);
         while !head.is_null() {
             let next_free_seg = (*head).next_free.load(Ordering::Relaxed);
@@ -212,6 +230,8 @@ impl<T: Send + Clone + 'static> DQueue<T> {
                 Err(new_head) => head = new_head,
             }
         }
+
+        // Allocate new from pool
         let mut idx;
         if is_initial {
             match self.next_free_segment_idx.compare_exchange(
@@ -228,10 +248,12 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         } else {
             idx = self.next_free_segment_idx.fetch_add(1, Ordering::Relaxed);
         }
+
         if idx >= self.segment_pool_capacity {
             self.next_free_segment_idx.fetch_sub(1, Ordering::Relaxed);
             return ptr::null_mut();
         }
+
         let seg_meta_ptr = self.segment_pool_metadata.add(idx);
         let cells_start_ptr = self.segment_cells_pool.add(idx * N_SEGMENT_CAPACITY);
         ptr::addr_of_mut!((*seg_meta_ptr).id).write(seg_id);
@@ -244,6 +266,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         seg_meta_ptr
     }
 
+    // IPC: Return segment to free list for reuse
     pub unsafe fn release_segment_to_pool(&self, seg_to_free: *mut Segment<T>) {
         if seg_to_free.is_null() {
             return;
@@ -263,10 +286,12 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         }
     }
 
+    // new_segment() - Algorithm 3, lines 49-55 (adapted for IPC)
     pub unsafe fn new_segment(&self, id: u64) -> *mut Segment<T> {
         self.alloc_segment_from_pool_raw(id, false)
     }
 
+    // find_segment() - Algorithm 3, lines 56-68
     pub unsafe fn find_segment(
         &self,
         sp_cache: *mut Segment<T>,
@@ -278,16 +303,20 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         } else {
             self.qseg.load(Ordering::Acquire)
         };
+
         if current_seg_ptr.is_null() {
             return ptr::null_mut();
         }
+
         let mut loop_count = 0;
         let max_loops = self.segment_pool_capacity + self.num_producers + 20;
+
         while (*current_seg_ptr).id < target_segment_id {
             loop_count += 1;
             if loop_count > max_loops {
                 return ptr::null_mut();
             }
+
             let mut next_ptr = (*current_seg_ptr).next.load(Ordering::Acquire);
             if next_ptr.is_null() {
                 let next_expected_id = (*current_seg_ptr).id + 1;
@@ -299,6 +328,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
                             return ptr::null_mut();
                         }
                     } else {
+                        // Algorithm 3, line 62 - CAS to append segment
                         match (*current_seg_ptr).next.compare_exchange(
                             ptr::null_mut(),
                             new_seg_ptr,
@@ -307,7 +337,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
                         ) {
                             Ok(_) => next_ptr = new_seg_ptr,
                             Err(existing_next) => {
-                                self.release_segment_to_pool(new_seg_ptr);
+                                self.release_segment_to_pool(new_seg_ptr); // IPC: return to pool
                                 next_ptr = existing_next;
                             }
                         }
@@ -325,6 +355,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
                 return ptr::null_mut();
             }
         }
+
         if (*current_seg_ptr).id == target_segment_id {
             current_seg_ptr
         } else {
@@ -332,6 +363,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         }
     }
 
+    // IPC: Garbage collection (not in paper - needed for shared memory)
     pub unsafe fn run_gc(&self) {
         let q_head_snapshot = self.q_head.load(Ordering::Acquire);
         let consumer_cached_cseg_ptr = self.cseg.load(Ordering::Acquire);
@@ -340,6 +372,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
             return;
         }
 
+        // Find minimum segment referenced by producers
         let mut min_producer_referenced_seg_id = u64::MAX;
         if self.num_producers > 0 {
             for i in 0..self.num_producers {
@@ -349,6 +382,8 @@ impl<T: Send + Clone + 'static> DQueue<T> {
                     min_producer_referenced_seg_id =
                         min_producer_referenced_seg_id.min((*p_cached_seg).id);
                 }
+
+                // Check local buffers
                 let local_h = (*p_struct).local_head.load(Ordering::Relaxed);
                 let local_t = (*p_struct).local_tail.load(Ordering::Relaxed);
                 let local_buf_ptr = (*p_struct).local_buffer.get();
@@ -368,6 +403,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
 
         let safe_seg_id = min_producer_referenced_seg_id;
 
+        // Advance qseg if possible
         loop {
             let current_q_seg_val = self.qseg.load(Ordering::Acquire);
             if current_q_seg_val.is_null()
@@ -402,6 +438,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
             }
         }
 
+        // Reclaim intermediate segments
         let mut prev_seg_ptr = self.qseg.load(Ordering::Acquire);
         if prev_seg_ptr.is_null() {
             return;
@@ -417,6 +454,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
             if current_seg_id < safe_seg_id {
                 is_safe_to_reclaim = false;
             } else {
+                // Check if any producer needs this segment
                 for i in 0..self.num_producers {
                     let p_struct = self.producers_array.add(i);
                     let local_h = (*p_struct).local_head.load(Ordering::Relaxed);
@@ -470,6 +508,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         }
     }
 
+    // dump_local_buffer() - Algorithm 4, lines 71-80
     pub unsafe fn dump_local_buffer(&self, producer_idx: usize) {
         if self.num_producers == 0 || producer_idx >= self.num_producers {
             return;
@@ -486,6 +525,8 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         let mut producer_cached_pseg = pseg_atomic.load(Ordering::Acquire);
         let mut iter_count = 0;
         let max_local_iters = L_LOCAL_BUFFER_CAPACITY + 5;
+
+        // Algorithm 4, lines 72-79
         while current_local_h != local_tail_val {
             iter_count += 1;
             if iter_count > max_local_iters {
@@ -495,6 +536,8 @@ impl<T: Send + Clone + 'static> DQueue<T> {
             let req_ptr = (*req_mu_ptr).as_ptr();
             let cid = (*req_ptr).cid;
             let target_seg_id = cid / N_SEGMENT_CAPACITY as u64;
+
+            // Algorithm 4, line 75 - find segment
             let target_seg_ptr =
                 if !producer_cached_pseg.is_null() && (*producer_cached_pseg).id == target_seg_id {
                     producer_cached_pseg
@@ -504,23 +547,32 @@ impl<T: Send + Clone + 'static> DQueue<T> {
             if target_seg_ptr.is_null() {
                 break;
             }
+
+            // Algorithm 4, line 78 - update pseg if needed
             if producer_cached_pseg != target_seg_ptr {
                 pseg_atomic.store(target_seg_ptr, Ordering::Release);
                 producer_cached_pseg = target_seg_ptr;
             }
+
+            // Algorithm 4, line 76 - write value
             let cell_idx = (cid % N_SEGMENT_CAPACITY as u64) as usize;
             let cell_ptr = (*target_seg_ptr).cells.add(cell_idx);
             let val_to_write = ptr::read(&(*req_ptr).val).assume_init();
             ptr::write((*cell_ptr).get(), MaybeUninit::new(Some(val_to_write)));
+
+            // Algorithm 4, line 77
             current_local_h = Producer::<T>::local_next(current_local_h);
         }
         local_head_atomic.store(current_local_h, Ordering::Release);
     }
 
+    // help_enqueue() - Algorithm 5, lines 90-102
     pub unsafe fn help_enqueue(&self) {
         if self.num_producers == 0 {
             return;
         }
+
+        // Algorithm 5, line 91 - for each producer
         for i in 0..self.num_producers {
             let p_struct_ptr = self.producers_array.add(i);
             let local_head_atomic = &(*p_struct_ptr).local_head;
@@ -534,6 +586,8 @@ impl<T: Send + Clone + 'static> DQueue<T> {
             let mut producer_cached_pseg_hint = pseg_atomic.load(Ordering::Acquire);
             let mut iter_count = 0;
             let max_local_iters = L_LOCAL_BUFFER_CAPACITY + 5;
+
+            // Algorithm 5, line 92 - for each request in local_buffer
             while current_local_h != local_tail_val {
                 iter_count += 1;
                 if iter_count > max_local_iters {
@@ -542,8 +596,12 @@ impl<T: Send + Clone + 'static> DQueue<T> {
                 let req_mu_ptr =
                     (local_buf_ptr as *const MaybeUninit<Request<T>>).add(current_local_h);
                 let req_ptr = (*req_mu_ptr).as_ptr();
+
+                // Algorithm 5, lines 93-94
                 let cid = (*req_ptr).cid;
                 let val_clone = (*(*req_ptr).val.as_ptr()).clone();
+
+                // Algorithm 5, line 95
                 let target_seg_id = cid / N_SEGMENT_CAPACITY as u64;
                 let target_seg_ptr = if !producer_cached_pseg_hint.is_null()
                     && (*producer_cached_pseg_hint).id == target_seg_id
@@ -559,10 +617,14 @@ impl<T: Send + Clone + 'static> DQueue<T> {
                         };
                     self.find_segment(hint_to_use, cid)
                 };
+
+                // Algorithm 5, line 96 - break if segment not found
                 if target_seg_ptr.is_null() {
                     break;
                 }
                 producer_cached_pseg_hint = target_seg_ptr;
+
+                // Algorithm 5, lines 97-99 - check and write if empty
                 let cell_idx = (cid % N_SEGMENT_CAPACITY as u64) as usize;
                 let cell_ptr = (*target_seg_ptr).cells.add(cell_idx);
                 let option_ptr_in_cell = (*cell_ptr).get();
@@ -576,6 +638,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         }
     }
 
+    // enqueue() - Algorithm 4, lines 81-89
     pub fn enqueue(&self, producer_idx: usize, item: T) -> Result<(), ()> {
         if self.num_producers == 0 || producer_idx >= self.num_producers {
             return Err(());
@@ -586,8 +649,11 @@ impl<T: Send + Clone + 'static> DQueue<T> {
             let local_tail = &(*p_struct).local_tail;
             let local_buf_ptr = (*p_struct).local_buffer.get();
             let current_local_t_val = local_tail.load(Ordering::Relaxed);
+
+            // Algorithm 4, line 82 - check if buffer full
             if Producer::<T>::local_next(current_local_t_val) == local_head.load(Ordering::Acquire)
             {
+                // Algorithm 4, line 83
                 self.dump_local_buffer(producer_idx);
                 if Producer::<T>::local_next(local_tail.load(Ordering::Relaxed))
                     == local_head.load(Ordering::Acquire)
@@ -595,7 +661,11 @@ impl<T: Send + Clone + 'static> DQueue<T> {
                     return Err(());
                 }
             }
+
+            // Algorithm 4, line 87 - FAA on tail (linearization point)
             let cid = self.q_tail.fetch_add(1, Ordering::AcqRel);
+
+            // Algorithm 4, lines 85-86 - store in local buffer
             let tail_idx_for_write = local_tail.load(Ordering::Relaxed);
             let req_slot_ptr =
                 (local_buf_ptr as *mut MaybeUninit<Request<T>>).add(tail_idx_for_write);
@@ -606,6 +676,8 @@ impl<T: Send + Clone + 'static> DQueue<T> {
                     cid,
                 }),
             );
+
+            // Algorithm 4, line 88
             local_tail.store(
                 Producer::<T>::local_next(tail_idx_for_write),
                 Ordering::Release,
@@ -614,10 +686,13 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         Ok(())
     }
 
+    // dequeue() - Algorithm 5, lines 103-113
     pub fn dequeue(&self) -> Option<T> {
         unsafe {
             let head_val = self.q_head.load(Ordering::Acquire);
             let mut q_tail_snapshot = self.q_tail.load(Ordering::Acquire);
+
+            // Check if queue empty
             if head_val >= q_tail_snapshot {
                 let mut producer_has_items = false;
                 if self.num_producers > 0 {
@@ -634,13 +709,17 @@ impl<T: Send + Clone + 'static> DQueue<T> {
                 if !producer_has_items {
                     q_tail_snapshot = self.q_tail.load(Ordering::Acquire);
                     if head_val >= q_tail_snapshot {
-                        return None;
+                        return None; // Algorithm 5, line 108
                     }
                 }
             }
+
+            // Algorithm 5, line 104 - find segment
             let consumer_cached_cseg = self.cseg.load(Ordering::Acquire);
             let mut seg = self.find_segment(consumer_cached_cseg, head_val);
+
             if seg.is_null() {
+                // Need help
                 self.help_enqueue();
                 q_tail_snapshot = self.q_tail.load(Ordering::Acquire);
                 let current_head_val_after_help = self.q_head.load(Ordering::Acquire);
@@ -664,6 +743,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
                 return match item_opt_retry {
                     Some(item_val_retry) => {
                         ptr::write(item_mu_opt_ptr_retry, MaybeUninit::new(None));
+                        // Algorithm 5, line 111 (linearization point)
                         self.q_head
                             .store(current_head_val_after_help + 1, Ordering::Release);
                         Some(item_val_retry)
@@ -674,20 +754,27 @@ impl<T: Send + Clone + 'static> DQueue<T> {
                     }
                 };
             }
+
+            // Algorithm 5, line 105 - update cseg if needed
             if seg != consumer_cached_cseg {
                 self.cseg.store(seg, Ordering::Release);
             }
+
+            // Algorithm 5, line 106 - read cell
             let cell_idx = (head_val % N_SEGMENT_CAPACITY as u64) as usize;
             let cell_ptr = (*seg).cells.add(cell_idx);
             let item_mu_opt_ptr = (*cell_ptr).get();
             let item_opt = ptr::read(item_mu_opt_ptr).assume_init();
+
             match item_opt {
                 Some(item_val) => {
                     ptr::write(item_mu_opt_ptr, MaybeUninit::new(None));
+                    // Algorithm 5, line 111 (linearization point)
                     self.q_head.store(head_val + 1, Ordering::Release);
-                    Some(item_val)
+                    Some(item_val) // Algorithm 5, line 112
                 }
                 None => {
+                    // Algorithm 5, line 107 - cell empty
                     ptr::write(item_mu_opt_ptr, MaybeUninit::new(None));
                     let tail_now = self.q_tail.load(Ordering::Acquire);
                     if head_val >= tail_now {
@@ -704,15 +791,18 @@ impl<T: Send + Clone + 'static> DQueue<T> {
                             }
                         }
                         if !producer_has_items {
-                            return None;
+                            return None; // Algorithm 5, line 108
                         }
                     }
+
+                    // Algorithm 5, line 109 - help and retry
                     self.help_enqueue();
                     let item_after_help_mu_opt_ptr = (*(*seg).cells.add(cell_idx)).get();
                     let item_opt_after_help = ptr::read(item_after_help_mu_opt_ptr).assume_init();
                     match item_opt_after_help {
                         Some(item_val_after_help) => {
                             ptr::write(item_after_help_mu_opt_ptr, MaybeUninit::new(None));
+                            // Algorithm 5, line 111 (linearization point)
                             self.q_head.store(head_val + 1, Ordering::Release);
                             Some(item_val_after_help)
                         }
@@ -730,12 +820,15 @@ impl<T: Send + Clone + 'static> DQueue<T> {
 impl<T: Send + Clone + 'static> MpscQueue<T> for DQueue<T> {
     type PushError = ();
     type PopError = ();
+
     fn push(&self, _item: T) -> Result<(), Self::PushError> {
         panic!("DQueue::push on MpscQueue trait. Use DQueue::enqueue(producer_id, item) or BenchMpscQueue::bench_push.");
     }
+
     fn pop(&self) -> Result<T, Self::PopError> {
         self.dequeue().ok_or(())
     }
+
     fn is_empty(&self) -> bool {
         let head = self.q_head.load(Ordering::Acquire);
         let tail = self.q_tail.load(Ordering::Acquire);
@@ -747,7 +840,7 @@ impl<T: Send + Clone + 'static> MpscQueue<T> for DQueue<T> {
                         if (*p).local_head.load(Ordering::Relaxed)
                             != (*p).local_tail.load(Ordering::Relaxed)
                         {
-                            return false; // Local buffer has items!
+                            return false; // Local buffer has items
                         }
                     }
                 }
@@ -756,6 +849,7 @@ impl<T: Send + Clone + 'static> MpscQueue<T> for DQueue<T> {
         }
         false
     }
+
     fn is_full(&self) -> bool {
         false
     }

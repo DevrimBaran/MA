@@ -822,34 +822,27 @@ mod bqueue_tests {
         let mut memory = AlignedMemory::new(shared_size, 64);
         let queue = unsafe { BQueue::init_in_shared(memory.as_mut_ptr(), MIRI_MEDIUM_CAPACITY) };
 
-        // Try to fill the queue to capacity
         let mut pushed = 0;
         for i in 0..MIRI_MEDIUM_CAPACITY {
             match queue.push(i) {
                 Ok(_) => pushed += 1,
                 Err(_) => {
-                    // Queue is full
                     break;
                 }
             }
         }
 
         assert!(pushed > 0, "Should be able to push at least one item");
-        
-        // At this point, either the queue should report not available OR push should fail
+
         assert!(!queue.available() || queue.push(999).is_err());
 
-        // Pop enough elements to ensure the probe will find empty space
-        // Since push probes BATCH_SIZE-1 ahead, we need to pop at least BATCH_SIZE elements
-        // to guarantee the probe finds an empty slot
-        let batch_size = 32; // This matches BATCH_SIZE in bqueue.rs
+        let batch_size = 32;
         let pops_needed = batch_size.min(pushed);
-        
+
         for _ in 0..pops_needed {
             queue.pop().unwrap();
         }
-        
-        // Now push should succeed since we've cleared enough space
+
         queue.push(999).unwrap();
     }
 

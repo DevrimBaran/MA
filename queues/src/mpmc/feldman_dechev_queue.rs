@@ -1,4 +1,4 @@
-// Paper in /paper/mpmc/feldman_dechev_v1.pdf and feldman_dechev_v2_(full).pdf and feldman_dechev_v3.pdf
+// Paper in /paper/mpmc/feldman_dechev_v1.pdf and feldman_dechev_v2_(full).pdf (oriented) and feldman_dechev_v3.pdf
 use std::cell::UnsafeCell;
 use std::mem;
 use std::ptr;

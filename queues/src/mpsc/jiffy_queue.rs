@@ -1,4 +1,4 @@
-// paper in /paper/mpsc/jiffy_full.pdf and /paper/mpsc/jiffy_short.pdf
+// paper in /paper/mpsc/jiffy_full.pdf (oriented) and /paper/mpsc/jiffy_short.pdf
 use std::fmt;
 use std::mem::{align_of, size_of, MaybeUninit};
 use std::ptr;

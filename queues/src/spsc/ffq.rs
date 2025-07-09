@@ -28,10 +28,10 @@ impl<T> Slot<T> {
 #[repr(C, align(64))]
 pub struct FfqQueue<T: Send + 'static> {
     // Paper: head index (enqueue position)
-    pub head: AtomicUsize, // in paper private, but here public only for unit tests. Pub logic is not used.
+    pub head: AtomicUsize, // in paper private (section 3.3), but here public only for unit tests. Pub logic is not used. You can test it and remove pub. Benchmarks would still work, just the unit tests not.
     _pad1: [u8; 64 - std::mem::size_of::<AtomicUsize>()], // IPC: cache line padding
     // Paper: tail index (dequeue position)
-    pub tail: AtomicUsize, // in paper private, but here public only for unit tests. Pub logic is not used.
+    pub tail: AtomicUsize, // in paper private (section 3.3), but here public only for unit tests. Pub logic is not used. You can test it and remove pub. Benchmarks would still work, just the unit tests not.
     _pad2: [u8; 64 - std::mem::size_of::<AtomicUsize>()], // IPC: cache line padding
     capacity: usize,
     pub mask: usize, // IPC optimization: mask for fast modulo

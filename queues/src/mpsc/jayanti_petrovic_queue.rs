@@ -555,6 +555,8 @@ impl<T: Send + Clone + 'static> JayantiPetrovicMpscQueue<T> {
         if producer_id >= self.num_producers {
             return Err(());
         }
+        // Papers ll/sc changed to fetch_add because in paper the ll/sc is just used as an atomic increment.
+        // CAS would be too expensive in execution time so we use FAA to just increment the counter and save it to tok aomically.
         // Line 1: tok = LL(counter)
         let tok = self.counter.fetch_add(1, Ordering::Relaxed) as u32;
         // Line 2: SC(counter, tok + 1) - implicit in fetch_add

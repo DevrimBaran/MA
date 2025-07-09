@@ -1,4 +1,4 @@
-// paper in /paper/dspc-uspsc-mspsc-full.pdf and /paper/dspc-uspsc-mspsc.pdf
+// paper in /paper/dspc-uspsc-mspsc.pdf
 use crate::spsc::LamportQueue;
 use crate::SpscQueue;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -115,7 +115,7 @@ impl<T: Send + 'static> MultiPushQueue<T> {
         unsafe {
             let local_buf_slice = &*local_buf_array_ptr;
 
-            // Lines 6-12 in Figure 4 - write in reverse order (critical!)
+            // Lines 6-12 in Figure 4 - write in reverse order
             for i in (0..count_to_push).rev() {
                 let item_from_local_buf = ptr::read(local_buf_slice[i].as_ptr());
                 let target_slot_in_ring = (current_ring_tail_val.wrapping_add(i)) & ring_mask;

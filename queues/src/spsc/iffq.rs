@@ -197,7 +197,7 @@ impl<T: Send + 'static> IffqQueue<T> {
             .read
             .store(current_read.wrapping_add(1), Ordering::Release);
 
-        // Lazy clear operation - Section 4.2
+        // Lazy clear operation - Section 4.2 (iifq_dec_publish function from paper integrated here)
         let current_clear = self.cons.clear.load(Ordering::Relaxed);
         let read_partition_start = current_read & !self.h_mask;
         let next_clear_target = read_partition_start.wrapping_sub(H_PARTITION_SIZE);
@@ -217,6 +217,7 @@ impl<T: Send + 'static> IffqQueue<T> {
         if advanced_clear {
             self.cons.clear.store(temp_clear, Ordering::Release);
         }
+        // iffq_dec_publish logic ends here
 
         Ok(item)
     }

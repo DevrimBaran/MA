@@ -1,4 +1,4 @@
-// paper in /paper/dspc-uspsc-mspsc-full.pdf and /paper/dspc-uspsc-mspsc.pdf
+// paper in /paper/dspc-uspsc-mspsc.pdf and /paper/dspc-uspsc.pdf (oriented towards latter one)
 use crate::spsc::LamportQueue;
 use crate::{DynListQueue, SpscQueue};
 use std::{

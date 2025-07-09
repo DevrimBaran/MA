@@ -286,7 +286,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         }
     }
 
-    // new_segment() - Algorithm 3, lines 49-55 (adapted for IPC)
+    // new_segment() - Algorithm 3, lines 49-55
     pub unsafe fn new_segment(&self, id: u64) -> *mut Segment<T> {
         self.alloc_segment_from_pool_raw(id, false)
     }
@@ -363,7 +363,7 @@ impl<T: Send + Clone + 'static> DQueue<T> {
         }
     }
 
-    // IPC: Garbage collection (not in paper - needed for shared memory)
+    // / Garbage collection - Algorithm 6 in paper (adapted for shared memory)
     pub unsafe fn run_gc(&self) {
         let q_head_snapshot = self.q_head.load(Ordering::Acquire);
         let consumer_cached_cseg_ptr = self.cseg.load(Ordering::Acquire);

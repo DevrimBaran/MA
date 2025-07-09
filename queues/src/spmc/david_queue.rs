@@ -152,10 +152,10 @@ impl<T: Send + Clone + 'static> DavidQueue<T> {
 
             let x_ptr = self.allocate_item(item);
 
-            // Step 1: val ← Swap(ITEMS[enq_row, tail], x)
+            // Line 1: val ← Swap(ITEMS[enq_row, tail], x)
             let val = self.get_item(state.enq_row, state.tail).swap(x_ptr);
 
-            // Step 2-6: if val = ⊤ then
+            // Line 2-6: if val = ⊤ then
             if val == TOP {
                 // increment(enq_row)
                 state.enq_row += 1;
@@ -166,14 +166,14 @@ impl<T: Send + Clone + 'static> DavidQueue<T> {
                 // tail ← 0
                 state.tail = 0;
 
-                // Step 5: Swap(ITEMS[enq_row, tail], x)
+                // Line 5: Swap(ITEMS[enq_row, tail], x)
                 self.get_item(state.enq_row, state.tail).swap(x_ptr);
 
-                // Step 6: Write(ROW, enq_row)
+                // Line 6: Write(ROW, enq_row)
                 self.row.store(state.enq_row, Ordering::Release);
             }
 
-            // Step 7: increment(tail)
+            // Line 7: increment(tail)
             state.tail += 1;
 
             Ok(())
@@ -184,16 +184,16 @@ impl<T: Send + Clone + 'static> DavidQueue<T> {
     pub fn dequeue(&self, _consumer_id: usize) -> Result<T, ()> {
         unsafe {
             // First try the paper's exact algorithm
-            // Step 1: deq_row ← Read(ROW)
+            // Line 1: deq_row ← Read(ROW)
             let deq_row = self.row.load(Ordering::Acquire);
 
-            // Step 2: head ← Fetch&Increment(HEAD[deq_row])
+            // Line 2: head ← Fetch&Increment(HEAD[deq_row])
             let head = self.get_head(deq_row).fetch_increment();
 
-            // Step 3: val ← Swap(ITEMS[deq_row, head], ⊤)
+            // Line 3: val ← Swap(ITEMS[deq_row, head], ⊤)
             let val = self.get_item(deq_row, head).swap(TOP);
 
-            // Step 4: if val = ⊥ then return ε else return val
+            // Line 4: if val = ⊥ then return ε else return val
             if val != BOTTOM && val != TOP {
                 return Ok(self.get_pooled_item(val));
             }

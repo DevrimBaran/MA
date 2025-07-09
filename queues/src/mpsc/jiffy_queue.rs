@@ -824,7 +824,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                     Some(unsafe { (*next_bl_candidate).position_in_queue })
                 };
 
-                // Process garbage before moving head
+                // Process garbage before moving head (Algorithm 7, lines 70-75)
                 if !next_bl_candidate.is_null()
                     || current_bl.curr_buffer.is_null()
                     || current_bl.is_array_reclaimed.load(Ordering::Relaxed)
@@ -833,6 +833,7 @@ impl<T: Send + 'static> JiffyQueue<T> {
                     self.actual_process_garbage_list(threshold);
                 }
 
+                // Algorithm 7, lines 76-77
                 if self
                     .head_of_queue
                     .compare_exchange(

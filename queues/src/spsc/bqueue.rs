@@ -78,6 +78,7 @@ impl<T: Send + 'static> BQueue<T> {
         idx & self.mask // MOD() function in paper
     }
 
+    // figure 7
     pub fn push(&self, item: T) -> Result<(), T> {
         let head = self.head.load(Ordering::Relaxed);
         let batch_head = unsafe { *self.batch_head.get() };
@@ -108,6 +109,7 @@ impl<T: Send + 'static> BQueue<T> {
         Ok(()) // Line Q10: return SUCCESS
     }
 
+    // figure 7
     pub fn pop(&self) -> Result<T, ()> {
         let tail = self.tail.load(Ordering::Relaxed);
         let batch_tail = unsafe { *self.batch_tail.get() };

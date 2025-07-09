@@ -122,7 +122,7 @@ impl<T: Send + 'static> BlqQueue<T> {
         &mut *queue_struct_ptr
     }
 
-    // blq_enq_space - Figure 6 in paper (part 1)
+    // blq_enq_space - Figure 6 in paper
     #[inline]
     pub fn blq_enq_space(&self, needed: usize) -> usize {
         let prod_priv = unsafe { &mut *self.prod_private.get() };
@@ -139,7 +139,7 @@ impl<T: Send + 'static> BlqQueue<T> {
         free_slots
     }
 
-    // blq_enq_local - Figure 6 in paper (part 2)
+    // blq_enq_local - Figure 6 in paper
     #[inline]
     pub fn blq_enq_local(&self, item: T) -> Result<(), BlqPushError<T>> {
         let prod_priv = unsafe { &mut *self.prod_private.get() };
@@ -168,7 +168,7 @@ impl<T: Send + 'static> BlqQueue<T> {
         Ok(())
     }
 
-    // blq_enq_publish - Figure 6 in paper (part 3)
+    // blq_enq_publish - Figure 6 in paper
     #[inline]
     pub fn blq_enq_publish(&self) {
         let prod_priv = unsafe { &*self.prod_private.get() };
@@ -179,7 +179,7 @@ impl<T: Send + 'static> BlqQueue<T> {
             .store(prod_priv.write_priv, Ordering::Release);
     }
 
-    // blq_deq_space - Figure 7 in paper (part 1)
+    // blq_deq_space - Figure 7 in paper
     #[inline]
     pub fn blq_deq_space(&self, needed: usize) -> usize {
         let cons_priv = unsafe { &mut *self.cons_private.get() };
@@ -194,7 +194,7 @@ impl<T: Send + 'static> BlqQueue<T> {
         available_items
     }
 
-    // blq_deq_local - Figure 7 in paper (part 2)
+    // blq_deq_local - Figure 7 in paper
     #[inline]
     pub fn blq_deq_local(&self) -> Result<T, BlqPopError> {
         let cons_priv = unsafe { &mut *self.cons_private.get() };
@@ -215,7 +215,7 @@ impl<T: Send + 'static> BlqQueue<T> {
         Ok(item)
     }
 
-    // blq_deq_publish - Figure 7 in paper (part 3)
+    // blq_deq_publish - Figure 7 in paper
     #[inline]
     pub fn blq_deq_publish(&self) {
         let cons_priv = unsafe { &*self.cons_private.get() };

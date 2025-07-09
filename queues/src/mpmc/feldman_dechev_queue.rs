@@ -14,7 +14,7 @@ const CHECK_DELAY: usize = 8; // Check for announcements every 8 operations
 const ITEMS_PER_THREAD: usize = 200_000;
 const OPS_PER_THREAD: usize = 500;
 
-// Node types - Section 3 in paper
+// Node types - Section 4 in paper
 // Paper uses separate EmptyNode/ElemNode classes, we use tagged pointers for IPC
 #[derive(Clone, Copy)]
 pub struct Node {
@@ -91,7 +91,8 @@ pub enum OpType {
     Dequeue,
 }
 
-// EnqueueOp - Section 8 Progress Assurance
+// EnqueueOp - Operation record for wait-free enqueue (implied by Algorithm 5)
+// Paper doesn't explicitly define this structure, but it's needed for the announcement table
 #[repr(C)]
 pub struct EnqueueOp {
     pub op_type: OpType,
@@ -133,7 +134,8 @@ impl EnqueueOp {
     }
 }
 
-// DequeueOp - Section 8 Progress Assurance
+// DequeueOp - Operation record for wait-free dequeue (implied by Algorithm 3)
+// Paper doesn't explicitly define this structure, but it's needed for the announcement table
 #[repr(C)]
 pub struct DequeueOp {
     pub op_type: OpType,
@@ -468,15 +470,15 @@ impl<T: Send + Clone + 'static> FeldmanDechevWFQueue<T> {
 
                     // Line 20: if is_skipped(node)
                     if node.is_delay_marked() {
-                        break; // Line 22: break
+                        break; // Line 21: break
                     }
 
-                    // Line 26: if node.seqid < seqid
+                    // Line 22: else if node.seqid < seqid
                     if node.is_empty() {
                         let node_seqid = node.get_seqid();
 
                         if node_seqid < seqid {
-                            // Line 27: backoff()
+                            // Line 23: backoff()
                             if !self.backoff(pos, node) {
                                 continue;
                             }

@@ -81,7 +81,7 @@ impl DeqReq {
         self.state.store(s, Ordering::SeqCst);
     }
 
-    // CAS at line 183
+    // CAS at line 183 - Listing 4
     pub fn try_announce(&self, old_idx: u64, new_idx: u64) -> bool {
         let old = (1u64 << 63) | old_idx;
         let new = (1u64 << 63) | new_idx;
@@ -90,7 +90,7 @@ impl DeqReq {
             .is_ok()
     }
 
-    // CAS at line 196
+    // CAS at line 196 - Listing 4
     pub fn try_complete(&self, idx: u64) -> bool {
         let old = (1u64 << 63) | idx;
         let new = idx; // pending = 0

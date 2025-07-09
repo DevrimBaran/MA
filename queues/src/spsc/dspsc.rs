@@ -1,4 +1,4 @@
-// paper in /paper/dspc-uspsc-mspsc-full.pdf and /paper/dspc-uspsc-mspsc.pdf
+// paper in /paper/dspc-uspsc-mspsc.pdf and /paper/dspc-uspsc.pdf (oriented towards latter one)
 use crate::spsc::lamport::LamportQueue;
 use crate::SpscQueue;
 use std::{
@@ -124,7 +124,7 @@ impl<T: Send + 'static> DynListQueue<T> {
         &mut *self_ptr
     }
 
-    // Lines 10-11 in Figure 2 - try cache first, fallback to malloc
+    // Lines 10-11 in Figure 2 - try cache (we allocate from pre allocated pool)
     fn alloc_node(&self, v: T) -> Option<*mut Node<T>> {
         if let Ok(node_ptr) = self.node_cache.pop() {
             let node = node_ptr.0;

@@ -140,7 +140,7 @@ impl<T: Send + 'static> BiffqQueue<T> {
         unsafe { &*self.buffer.add(index & self.mask) }
     }
 
-    // Publish buffered items - Section 4.3
+    // Publish buffered items - Section 4.3 (biffq_enq_publish - figure 13)
     pub fn publish_batch_internal(&self) -> Result<usize, ()> {
         let local_count = self.prod.local_count.load(Ordering::Relaxed);
         if local_count == 0 {
@@ -214,7 +214,7 @@ impl<T: Send + 'static> BiffqQueue<T> {
         Ok(published_count)
     }
 
-    // Same as IFFQ dequeue
+    // Same as IFFQ dequeue ("Consumer-side routines are not shown, as they are the same as illustrated in Figure 11 (iifq.rs)")
     fn dequeue_internal(&self) -> Result<T, BiffqPopError> {
         let current_read = self.cons.read.load(Ordering::Relaxed);
         let slot = self.get_slot(current_read);
@@ -316,6 +316,7 @@ impl<T: Send + 'static> SpscQueue<T> for BiffqQueue<T> {
         self.dequeue_internal()
     }
 
+    // integrates biffq_wspace - figure 13
     #[inline]
     fn available(&self) -> bool {
         if self.prod.local_count.load(Ordering::Relaxed) < LOCAL_BATCH_SIZE {

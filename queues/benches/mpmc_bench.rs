@@ -718,7 +718,7 @@ fn bench_kogan_petrank_queue(c: &mut Criterion) {
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(1))
-        .measurement_time(Duration::from_secs(2500))
+        .measurement_time(Duration::from_secs(4200))
         .sample_size(500)
 }
 

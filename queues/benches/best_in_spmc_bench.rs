@@ -16,7 +16,7 @@ use queues::{
 };
 
 const PERFORMANCE_TEST: bool = false;
-const ITEMS_PER_PRODUCER_TARGET: usize = 5_000;
+const ITEMS_PER_PRODUCER_TARGET: usize = 100_000;
 const CONSUMER_COUNTS_TO_TEST: &[usize] = &[1, 2, 4, 8, 14];
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 100_000_000;
 
@@ -263,6 +263,7 @@ where
 fn bench_david_native(c: &mut Criterion) {
     for &num_consumers in CONSUMER_COUNTS_TO_TEST {
         let bench_name = format!("David (Native SPMC) - 1P{}C", num_consumers);
+        let items_to_produce = ITEMS_PER_PRODUCER_TARGET * num_consumers;
         c.bench_function(&bench_name, |b| {
             b.iter_custom(|_iters| {
                 let queue_init = |num_cons: usize| {
@@ -292,7 +293,7 @@ fn bench_david_native(c: &mut Criterion) {
                     )
                 };
 
-                fork_and_run_spmc(queue_init, num_consumers, ITEMS_PER_PRODUCER_TARGET)
+                fork_and_run_spmc(queue_init, num_consumers, items_to_produce)
             })
         });
     }
@@ -301,6 +302,8 @@ fn bench_david_native(c: &mut Criterion) {
 fn bench_ymc_as_spmc(c: &mut Criterion) {
     for &num_consumers in CONSUMER_COUNTS_TO_TEST {
         let bench_name = format!("YMC (MPMC as SPMC) - 1P{}C", num_consumers);
+        let items_to_produce = ITEMS_PER_PRODUCER_TARGET * num_consumers;
+
         c.bench_function(&bench_name, |b| {
             b.iter_custom(|_iters| {
                 let queue_init = |num_cons: usize| {
@@ -312,7 +315,7 @@ fn bench_ymc_as_spmc(c: &mut Criterion) {
                     (q as &'static dyn BenchSpmcQueue<usize>, shm_ptr, bytes)
                 };
 
-                fork_and_run_spmc(queue_init, num_consumers, ITEMS_PER_PRODUCER_TARGET)
+                fork_and_run_spmc(queue_init, num_consumers, items_to_produce)
             })
         });
     }
@@ -321,8 +324,8 @@ fn bench_ymc_as_spmc(c: &mut Criterion) {
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(2))
-        .measurement_time(Duration::from_secs(10))
-        .sample_size(10)
+        .measurement_time(Duration::from_secs(4200))
+        .sample_size(500)
 }
 
 criterion_group! {

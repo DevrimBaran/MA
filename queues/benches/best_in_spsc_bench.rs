@@ -16,7 +16,7 @@ use queues::{
 use std::sync::atomic::{AtomicU32, Ordering};
 
 const PERFORMANCE_TEST: bool = false;
-const RING_CAP: usize = 16_384;
+const RING_CAP: usize = 32_768;
 const ITERS: usize = 300_000;
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 1_000_000_000;
 
@@ -300,8 +300,8 @@ where
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(1))
-        .measurement_time(Duration::from_secs(60))
-        .sample_size(10)
+        .measurement_time(Duration::from_secs(4200))
+        .sample_size(500)
 }
 
 criterion_group! {
@@ -309,8 +309,8 @@ criterion_group! {
     config = custom_criterion();
     targets =
         bench_biffq_native,
-        bench_dqueue_as_spsc,
         bench_ymc_as_spsc,
+        bench_dqueue_as_spsc,
         bench_david_as_spsc,
 }
 criterion_main!(benches);

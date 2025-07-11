@@ -270,8 +270,10 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
 
     // SPSC variant for benchmarks
     pub fn spsc_shared_size() -> usize {
-        let num_segments = 25_000;
         let num_threads = 2;
+        let items_per_thread = 300_000;
+        let max_items = items_per_thread * num_threads * 2;
+        let num_segments = std::cmp::min((max_items + SEGMENT_SIZE - 1) / SEGMENT_SIZE, 8192);
 
         let queue_size = mem::size_of::<Self>();
         let handles_size = num_threads * mem::size_of::<Handle>();
@@ -284,7 +286,9 @@ impl<T: Send + Clone + 'static> YangCrummeyQueue<T> {
     pub unsafe fn init_in_shared_spsc(mem: *mut u8) -> &'static mut Self {
         let queue_ptr = mem as *mut Self;
         let num_threads = 2;
-        let num_segments = 25_000;
+        let items_per_thread = 300_000;
+        let max_items = items_per_thread * num_threads * 2;
+        let num_segments = std::cmp::min((max_items + SEGMENT_SIZE - 1) / SEGMENT_SIZE, 8192);
 
         let queue_size = mem::size_of::<Self>();
         let handles_offset = (queue_size + 127) & !127;

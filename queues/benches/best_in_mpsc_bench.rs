@@ -13,7 +13,7 @@ use std::time::Duration;
 use queues::{DQueue, MpscQueue, YangCrummeyQueue};
 
 const PERFORMANCE_TEST: bool = false;
-const ITEMS_PER_PRODUCER_TARGET: usize = 10_000;
+const ITEMS_PER_PRODUCER_TARGET: usize = 100_000;
 const PRODUCER_COUNTS_TO_TEST: &[usize] = &[1, 2, 4, 8, 14];
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 100_000_000;
 
@@ -300,9 +300,9 @@ fn bench_ymc_as_mpsc(c: &mut Criterion) {
 
 fn custom_criterion() -> Criterion {
     Criterion::default()
-        .warm_up_time(Duration::from_secs(2))
-        .measurement_time(Duration::from_secs(10))
-        .sample_size(10)
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(4200))
+        .sample_size(500)
 }
 
 criterion_group! {

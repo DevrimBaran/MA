@@ -11,7 +11,7 @@ MPSC_QUEUE_ALGORITHMS = ["DQueue (Native MPSC)", "YMC (MPMC as MPSC)"]
 # Producer counts to test
 PRODUCER_COUNTS = [1, 2, 4, 8, 14]
 # This should match ITEMS_PER_PRODUCER_TARGET from your best_in_mpsc_bench.rs
-ITEMS_PER_PRODUCER = 400_000
+ITEMS_PER_PRODUCER = 100_000
 
 # Output file names and titles
 VIOLIN_PLOT_FILE_TEMPLATE = "best_in_mpsc_performance_violin_{}P1C.png"
@@ -158,7 +158,7 @@ def main():
                 ),
             )
 
-        plot_title_violin = f'MPSC Performance Comparison ({num_producers} Producer{"s" if num_producers > 1 else ""}, 1 Consumer, {ITEMS_PER_PRODUCER:,} items/prod)'
+        plot_title_violin = f'MPSC Performance Comparison ({num_producers} Producer{"s" if num_producers > 1 else ""}, 1 Consumer, {num_producers * ITEMS_PER_PRODUCER:,} items)'
         plt.title(plot_title_violin, fontsize=16, pad=20)
         plt.xticks(rotation=15, ha="right", fontsize=12)
         plt.yticks(fontsize=10)

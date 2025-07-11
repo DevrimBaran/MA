@@ -11,7 +11,7 @@ SPMC_QUEUE_ALGORITHMS = ["David (Native SPMC)", "YMC (MPMC as SPMC)"]
 # Consumer counts to test
 CONSUMER_COUNTS = [1, 2, 4, 8, 14]
 # This should match ITEMS_PER_PRODUCER_TARGET from your best_in_spmc_bench.rs
-ITEMS_PER_PRODUCER = 5_000
+ITEMS_PER_PRODUCER = 100_000
 
 # Output file names and titles
 VIOLIN_PLOT_FILE_TEMPLATE = "best_in_spmc_performance_violin_1P{}C.png"
@@ -155,7 +155,7 @@ def main():
                 ),
             )
 
-        plot_title_violin = f'SPMC Performance Comparison (1 Producer, {num_consumers} Consumer{"s" if num_consumers > 1 else ""}, {ITEMS_PER_PRODUCER:,} items)'
+        plot_title_violin = f'SPMC Performance Comparison (1 Producer, {num_consumers} Consumer{"s" if num_consumers > 1 else ""}, {num_consumers * ITEMS_PER_PRODUCER:,} items)'
         plt.title(plot_title_violin, fontsize=16, pad=20)
         plt.xticks(rotation=15, ha="right", fontsize=12)
         plt.yticks(fontsize=10)
@@ -222,7 +222,7 @@ def main():
     plt.text(
         0.98,
         0.02,
-        f"1 Producer, {ITEMS_PER_PRODUCER:,} items",
+        f"For each consumer, {ITEMS_PER_PRODUCER:,} items produced",
         ha="right",
         va="bottom",
         transform=plt.gca().transAxes,

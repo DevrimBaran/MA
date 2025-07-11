@@ -5,7 +5,6 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 
-# --- Configuration ---
 CRITERION_BASE_PATH = "./target/criterion/"
 
 BENCHMARK_FUNCTION_IDS = [
@@ -16,7 +15,7 @@ BENCHMARK_FUNCTION_IDS = [
 ]
 
 OUTPUT_PLOT_FILE = "best_algorithms_in_spsc_performance.png"
-PLOT_TITLE = "Best Queue Algorithms Performance Comparison in SPSC Scenario"
+PLOT_TITLE = "MPSC Performance Comparison. 300.000 Total Items"
 Y_AXIS_LABEL = "Execution Time per Sample (µs)"
 
 
@@ -74,7 +73,7 @@ def load_benchmark_data(base_path, benchmark_file_stem, function_id_folder_name)
 def main():
     all_data = []
     benchmark_labels_for_plot = []
-    mean_values_dict = {}  # Store mean values for annotation
+    mean_values_dict = {}
 
     for bench_func_id_from_config in BENCHMARK_FUNCTION_IDS:
         print(f"\nProcessing configured Benchmark ID: {bench_func_id_from_config}")
@@ -87,7 +86,7 @@ def main():
             print(
                 f"  Successfully loaded {len(samples_ns)} samples for ID '{bench_func_id_from_config}' (from folder '{folder_to_try}')"
             )
-            samples_us = samples_ns / 1000.0  # Convert nanoseconds to microseconds
+            samples_us = samples_ns / 1000.0
             all_data.append(samples_us)
             benchmark_labels_for_plot.append(bench_func_id_from_config)
             mean_values_dict[bench_func_id_from_config] = np.mean(samples_us)
@@ -114,18 +113,12 @@ def main():
         scale="width",
     )
 
-    # Disable scientific notation on y-axis
     ax.ticklabel_format(style="plain", axis="y")
-
-    # Add mean value annotations
     for i, (queue_type, mean_val) in enumerate(mean_values_dict.items()):
-        # Get the maximum value for this queue type to position the text
         queue_data = df[df["Queue Type"] == queue_type][Y_AXIS_LABEL]
         y_pos = (
             queue_data.max() + (df[Y_AXIS_LABEL].max() - df[Y_AXIS_LABEL].min()) * 0.02
         )
-
-        # Add the mean value text with unit
         ax.text(
             i,
             y_pos,
@@ -145,17 +138,6 @@ def main():
     plt.xlabel("Queue Algorithm", fontsize=12)
     plt.grid(axis="y", linestyle=":", alpha=0.7)
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-
-    # Add a subtitle with test parameters
-    plt.text(
-        0.5,
-        0.01,
-        "Test: 1 Producer, 1 Consumer, 10K Items",
-        ha="center",
-        transform=plt.gcf().transFigure,
-        fontsize=10,
-        style="italic",
-    )
 
     try:
         plt.savefig(OUTPUT_PLOT_FILE, dpi=150)

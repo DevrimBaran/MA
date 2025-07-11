@@ -5,22 +5,15 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 
-# --- Configuration ---
 CRITERION_BASE_PATH = "./target/criterion/"
 MPSC_QUEUE_GROUPS = ["DrescherMPSC", "JayantiPetrovicMPSC", "JiffyMPSC", "DQueueMPSC"]
-# Producer counts to generate individual plots for and to use in the summary plot
 PRODUCER_COUNTS = [1, 2, 4, 8, 14]
-# This should match ITEMS_PER_PRODUCER_TARGET from your mpsc_bench.rs
 ITEMS_PER_PRODUCER = 500_000
 
 # Output file names and titles
 VIOLIN_PLOT_FILE_TEMPLATE = "mpsc_performance_violin_{}_producers.png"
 SUMMARY_LINE_PLOT_FILE = "mpsc_mean_performance_vs_producers.png"
-Y_AXIS_LABEL = "Execution Time per Sample (µs)"  # Adjusted for clarity
-# Note: The raw times from Criterion are total duration for all items.
-# We will calculate per-operation time for better comparison if needed, or plot total time.
-# For now, let's plot the total time for processing all items,
-# as 'Execution Time per sample' from Criterion refers to one run of fork_and_run_mpsc.
+Y_AXIS_LABEL = "Execution Time per Sample (µs)"
 
 
 def load_benchmark_data(base_path, queue_group_name, num_producers, items_per_producer):
@@ -28,8 +21,6 @@ def load_benchmark_data(base_path, queue_group_name, num_producers, items_per_pr
     Loads benchmark data for a specific MPSC queue and producer count.
     Assumes benchmark ID format: "{N}Prod_{M}ItemsPer"
     """
-    # Construct the benchmark ID based on the naming convention in mpsc_bench.rs
-    # The format! in Rust was "{}Prod_{}ItemsPer", where the second part is items_per_prod for that run.
     benchmark_id_suffix = f"{num_producers}Prod_{items_per_producer}ItemsPer"
 
     path_segment = os.path.join(
@@ -43,15 +34,13 @@ def load_benchmark_data(base_path, queue_group_name, num_producers, items_per_pr
     try:
         with open(path_segment, "r") as f:
             data = json.load(f)
-
-        # Criterion's sample.json stores sample times in nanoseconds
         if (
             isinstance(data, dict)
             and "times" in data
             and isinstance(data["times"], list)
         ):
             if all(isinstance(x, (int, float)) for x in data["times"]):
-                return np.array(data["times"])  # Keep in nanoseconds for now
+                return np.array(data["times"])
             else:
                 print(f"Warning: Non-numeric time data in '{path_segment}'")
                 return None
@@ -72,20 +61,14 @@ def load_benchmark_data(base_path, queue_group_name, num_producers, items_per_pr
 
 
 def main():
-    all_benchmark_data = []  # To store data for the summary plot
-    # Structure: [{'Queue Type': str, 'Producer Count': int, 'Mean Time (ns)': float, 'Times (ns)': np.array}]
-
-    # --- Generate Violin Plot for each Producer Count ---
+    all_benchmark_data = []
     for num_prods in PRODUCER_COUNTS:
         print(f"\n--- Processing for {num_prods} Producer(s) ---")
 
-        current_producer_count_data = []  # For the current violin plot
-        mean_values_dict = {}  # Store mean values for annotation
-        # Structure for violin plot: [{'Queue Type': str, 'Time (µs)': float}]
+        current_producer_count_data = []
+        mean_values_dict = {}
 
-        items_this_run_per_producer = (
-            ITEMS_PER_PRODUCER  # Each producer sends this many
-        )
+        items_this_run_per_producer = ITEMS_PER_PRODUCER
         total_items_this_run = num_prods * items_this_run_per_producer
 
         for queue_group in MPSC_QUEUE_GROUPS:
@@ -98,7 +81,6 @@ def main():
                     f"  Successfully loaded {len(samples_ns)} samples for {queue_group} with {num_prods} producer(s)."
                 )
 
-                # Convert raw times (total duration for all operations in one benchmark run) to microseconds
                 times_us = samples_ns / 1000.0
 
                 mean_values_dict[queue_group] = np.mean(times_us)
@@ -111,15 +93,12 @@ def main():
                         }
                     )
 
-                # Store data for summary plot
                 all_benchmark_data.append(
                     {
                         "Queue Type": queue_group,
                         "Producer Count": num_prods,
-                        "Mean Time (ns)": np.mean(
-                            samples_ns
-                        ),  # Mean of total durations
-                        "Times (ns)": samples_ns,  # Keep all samples for potential further analysis
+                        "Mean Time (ns)": np.mean(samples_ns),
+                        "Times (ns)": samples_ns,
                     }
                 )
             else:
@@ -135,7 +114,7 @@ def main():
 
         df_violin = pd.DataFrame(current_producer_count_data)
 
-        plt.figure(figsize=(12, 8))  # Adjusted size for better readability
+        plt.figure(figsize=(12, 8))
         ax = sns.violinplot(
             x="Queue Type",
             y="Execution Time for All Operations (µs)",
@@ -146,12 +125,9 @@ def main():
             scale="width",
         )
 
-        # Disable scientific notation on y-axis
         ax.ticklabel_format(style="plain", axis="y")
 
-        # Add mean value annotations
         for i, (queue_type, mean_val) in enumerate(mean_values_dict.items()):
-            # Get the maximum value for this queue type to position the text
             queue_data = df_violin[df_violin["Queue Type"] == queue_type][
                 "Execution Time for All Operations (µs)"
             ]
@@ -163,8 +139,6 @@ def main():
                 )
                 * 0.02
             )
-
-            # Add the mean value text
             ax.text(
                 i,
                 y_pos,
@@ -189,9 +163,7 @@ def main():
         )  # Total time for ITERS operations
         plt.xlabel("Queue Type", fontsize=12)
         plt.grid(axis="y", linestyle=":", alpha=0.7)
-        plt.tight_layout(
-            rect=[0, 0.03, 1, 0.95]
-        )  # Adjust layout to prevent title overlap
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
         output_filename_violin = VIOLIN_PLOT_FILE_TEMPLATE.format(num_prods)
         try:
@@ -201,16 +173,12 @@ def main():
             print(f"  Error saving violin plot: {e}")
         plt.close()
 
-    # --- Generate Summary Line Graph ---
     if not all_benchmark_data:
         print("\nError: No data collected for summary plot. Exiting.")
         return
 
     summary_df_data = []
     for record in all_benchmark_data:
-        # Calculate mean time per sample (total items = Producer Count * ITEMS_PER_PRODUCER)
-        # This gives a normalized view if desired, or we can plot total time.
-        # Let's plot mean total execution time first, as it's directly from Criterion's sample.
         mean_total_time_us = record["Mean Time (ns)"] / 1000.0
 
         summary_df_data.append(
@@ -237,20 +205,30 @@ def main():
         linewidth=2.5,
     )
 
-    # Disable scientific notation on y-axis
     ax.ticklabel_format(style="plain", axis="y")
 
     plt.title(
         "MPSC Queues: Mean Performance vs. Number of Producers", fontsize=16, pad=20
     )
     plt.xlabel("Number of Producers", fontsize=12)
-    plt.ylabel(
-        "Mean Total Execution Time (µs)", fontsize=12
-    )  # Total time for all items
-    plt.xticks(PRODUCER_COUNTS)  # Ensure all tested producer counts are shown as ticks
+    plt.ylabel("Mean Total Execution Time (µs)", fontsize=12)
+    plt.xticks(PRODUCER_COUNTS)
     plt.legend(title="Queue Type", fontsize=10, title_fontsize=12)
     plt.grid(True, linestyle=":", alpha=0.7)
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.text(
+        0.98,
+        0.02,
+        f"{ITEMS_PER_PRODUCER:,} items/producer",
+        ha="right",
+        va="bottom",
+        transform=plt.gca().transAxes,
+        fontsize=9,
+        style="italic",
+        bbox=dict(
+            boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.8
+        ),
+    )
 
     try:
         plt.savefig(SUMMARY_LINE_PLOT_FILE, dpi=150)

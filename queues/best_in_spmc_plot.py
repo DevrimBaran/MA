@@ -5,15 +5,11 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 
-# --- Configuration ---
 CRITERION_BASE_PATH = "./target/criterion/"
 SPMC_QUEUE_ALGORITHMS = ["David (Native SPMC)", "YMC (MPMC as SPMC)"]
-# Consumer counts to test
 CONSUMER_COUNTS = [1, 2, 4, 8, 14]
-# This should match ITEMS_PER_PRODUCER_TARGET from your best_in_spmc_bench.rs
 ITEMS_PER_PRODUCER = 100_000
 
-# Output file names and titles
 VIOLIN_PLOT_FILE_TEMPLATE = "best_in_spmc_performance_violin_1P{}C.png"
 SUMMARY_LINE_PLOT_FILE = "best_in_spmc_mean_performance_vs_consumers.png"
 Y_AXIS_LABEL = "Execution Time per Sample (µs)"
@@ -35,15 +31,13 @@ def load_benchmark_data(base_path, queue_algo_name, num_consumers):
     try:
         with open(path_segment, "r") as f:
             data = json.load(f)
-
-        # Criterion's sample.json stores sample times in nanoseconds
         if (
             isinstance(data, dict)
             and "times" in data
             and isinstance(data["times"], list)
         ):
             if all(isinstance(x, (int, float)) for x in data["times"]):
-                return np.array(data["times"])  # Keep in nanoseconds for now
+                return np.array(data["times"])
             else:
                 print(f"Warning: Non-numeric time data in '{path_segment}'")
                 return None
@@ -64,15 +58,12 @@ def load_benchmark_data(base_path, queue_algo_name, num_consumers):
 
 
 def main():
-    all_benchmark_data = []  # To store data for the summary plot
-    # Structure: [{'Algorithm': str, 'Consumer Count': int, 'Mean Time (µs)': float, 'Times (µs)': np.array}]
-
-    # --- Generate Violin Plot for each Consumer Count ---
+    all_benchmark_data = []
     for num_consumers in CONSUMER_COUNTS:
         print(f"\n--- Processing for 1 Producer, {num_consumers} Consumer(s) ---")
 
-        current_consumer_count_data = []  # For the current violin plot
-        mean_values_dict = {}  # Store mean values for annotation
+        current_consumer_count_data = []
+        mean_values_dict = {}
 
         for queue_algo in SPMC_QUEUE_ALGORITHMS:
             samples_ns = load_benchmark_data(
@@ -83,8 +74,6 @@ def main():
                 print(
                     f"  Successfully loaded {len(samples_ns)} samples for {queue_algo} with 1P{num_consumers}C."
                 )
-
-                # Convert raw times to microseconds
                 times_us = samples_ns / 1000.0
 
                 mean_values_dict[queue_algo] = np.mean(times_us)
@@ -93,8 +82,6 @@ def main():
                     current_consumer_count_data.append(
                         {"Algorithm": queue_algo, Y_AXIS_LABEL: time_val_us}
                     )
-
-                # Store data for summary plot
                 all_benchmark_data.append(
                     {
                         "Algorithm": queue_algo,
@@ -116,7 +103,7 @@ def main():
 
         df_violin = pd.DataFrame(current_consumer_count_data)
 
-        plt.figure(figsize=(10, 8))
+        plt.figure(figsize=(12, 9))
         ax = sns.violinplot(
             x="Algorithm",
             y=Y_AXIS_LABEL,
@@ -126,20 +113,14 @@ def main():
             inner="quartile",
             scale="width",
         )
-
-        # Disable scientific notation on y-axis
         ax.ticklabel_format(style="plain", axis="y")
-
-        # Add mean value annotations
         for i, (algo, mean_val) in enumerate(mean_values_dict.items()):
-            # Get the maximum value for this algorithm to position the text
             algo_data = df_violin[df_violin["Algorithm"] == algo][Y_AXIS_LABEL]
             y_pos = (
                 algo_data.max()
                 + (df_violin[Y_AXIS_LABEL].max() - df_violin[Y_AXIS_LABEL].min()) * 0.02
             )
 
-            # Add the mean value text
             ax.text(
                 i,
                 y_pos,
@@ -155,29 +136,27 @@ def main():
                 ),
             )
 
-        plot_title_violin = f'SPMC Performance Comparison (1 Producer, {num_consumers} Consumer{"s" if num_consumers > 1 else ""}, {num_consumers * ITEMS_PER_PRODUCER:,} items)'
+        plot_title_violin = f'SPMC Performance Comparison (1 Producer, {num_consumers} Consumer{"s" if num_consumers > 1 else ""}, {num_consumers * ITEMS_PER_PRODUCER:,} Total Items)'
         plt.title(plot_title_violin, fontsize=16, pad=20)
         plt.xticks(rotation=15, ha="right", fontsize=12)
         plt.yticks(fontsize=10)
         plt.ylabel(Y_AXIS_LABEL, fontsize=12)
         plt.xlabel("Algorithm", fontsize=12)
         plt.grid(axis="y", linestyle=":", alpha=0.7)
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.tight_layout(rect=[0, 0.03, 1, 0.93])
 
         output_filename_violin = VIOLIN_PLOT_FILE_TEMPLATE.format(num_consumers)
         try:
-            plt.savefig(output_filename_violin, dpi=150)
+            plt.savefig(output_filename_violin, dpi=150, bbox_inches='tight')
             print(f"  Violin plot saved to {output_filename_violin}")
         except Exception as e:
             print(f"  Error saving violin plot: {e}")
         plt.close()
 
-    # --- Generate Summary Line Graph ---
     if not all_benchmark_data:
         print("\nError: No data collected for summary plot. Exiting.")
         return
 
-    # Prepare data for summary plot
     summary_data = []
     for record in all_benchmark_data:
         summary_data.append(
@@ -192,7 +171,6 @@ def main():
 
     fig, ax = plt.subplots(figsize=(10, 6))
 
-    # Plot lines for each algorithm
     for algo in SPMC_QUEUE_ALGORITHMS:
         algo_data = df_summary[df_summary["Algorithm"] == algo].sort_values(
             "Consumer Count"
@@ -206,7 +184,6 @@ def main():
             label=algo,
         )
 
-    # Disable scientific notation on y-axis
     ax.ticklabel_format(style="plain", axis="y")
 
     plt.title(
@@ -217,8 +194,6 @@ def main():
     plt.legend(loc="best", fontsize=10)
     plt.grid(True, linestyle=":", alpha=0.7)
     plt.xticks(CONSUMER_COUNTS)
-
-    # Add annotation about test parameters
     plt.text(
         0.98,
         0.02,

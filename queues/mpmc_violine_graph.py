@@ -6,7 +6,6 @@ import seaborn as sns
 import numpy as np
 from itertools import product
 
-# --- Configuration ---
 CRITERION_BASE_PATH = "./target/criterion/"
 MPMC_QUEUE_GROUPS = [
     "VermaMPMC",
@@ -17,9 +16,7 @@ MPMC_QUEUE_GROUPS = [
     "KoganPetrankMPMC",
 ]
 
-# Process configurations to test (matches PROCESS_COUNTS_TO_TEST in mpmc_bench.rs)
 PROCESS_CONFIGS = [(1, 1), (2, 2), (4, 4), (6, 6)]
-# This should match ITEMS_PER_PROCESS_TARGET from your mpmc_bench.rs
 ITEMS_PER_PROCESS = 170_000
 
 # Output file names
@@ -32,7 +29,6 @@ def load_benchmark_data(base_path, queue_group_name, num_producers, num_consumer
     Loads benchmark data for a specific MPMC queue and producer/consumer configuration.
     Assumes benchmark ID format: "{N}P_{M}C"
     """
-    # Construct the benchmark ID based on the naming convention in mpmc_bench.rs
     benchmark_id = f"{num_producers}P_{num_consumers}C"
 
     path_segment = os.path.join(
@@ -47,14 +43,13 @@ def load_benchmark_data(base_path, queue_group_name, num_producers, num_consumer
         with open(path_segment, "r") as f:
             data = json.load(f)
 
-        # Criterion's sample.json stores sample times in nanoseconds
         if (
             isinstance(data, dict)
             and "times" in data
             and isinstance(data["times"], list)
         ):
             if all(isinstance(x, (int, float)) for x in data["times"]):
-                return np.array(data["times"])  # Keep in nanoseconds for now
+                return np.array(data["times"])
             else:
                 print(f"Warning: Non-numeric time data in '{path_segment}'")
                 return None
@@ -75,16 +70,14 @@ def load_benchmark_data(base_path, queue_group_name, num_producers, num_consumer
 
 
 def main():
-    all_benchmark_data = []  # To store data for summary plots
-
-    # --- Generate Violin Plot for each Producer/Consumer Configuration ---
+    all_benchmark_data = []
     for num_prods, num_cons in PROCESS_CONFIGS:
         print(
             f"\n--- Processing for {num_prods} Producer(s), {num_cons} Consumer(s) ---"
         )
 
-        current_config_data = []  # For the current violin plot
-        mean_values_dict = {}  # Store mean values for annotation
+        current_config_data = []
+        mean_values_dict = {}
         total_items = num_prods * ITEMS_PER_PROCESS
 
         for queue_group in MPMC_QUEUE_GROUPS:
@@ -96,8 +89,6 @@ def main():
                 print(
                     f"  Successfully loaded {len(samples_ns)} samples for {queue_group} with {num_prods}P/{num_cons}C."
                 )
-
-                # Convert to microseconds for better readability
                 times_us = samples_ns / 1000.0
 
                 queue_name_short = queue_group.replace("MPMC", "")
@@ -106,12 +97,10 @@ def main():
                 for time_val_us in times_us:
                     current_config_data.append(
                         {
-                            "Queue Type": queue_name_short,  # Shorten names
+                            "Queue Type": queue_name_short,
                             "Execution Time (µs)": time_val_us,
                         }
                     )
-
-                # Store data for summary plots
                 all_benchmark_data.append(
                     {
                         "Queue Type": queue_group,
@@ -137,8 +126,6 @@ def main():
             continue
 
         df_violin = pd.DataFrame(current_config_data)
-
-        # Create violin plot
         plt.figure(figsize=(14, 8))
         ax = sns.violinplot(
             x="Queue Type",
@@ -149,13 +136,8 @@ def main():
             inner="quartile",
             scale="width",
         )
-
-        # Disable scientific notation on y-axis
         ax.ticklabel_format(style="plain", axis="y")
-
-        # Add mean value annotations
         for i, (queue_type, mean_val) in enumerate(mean_values_dict.items()):
-            # Get the maximum value for this queue type to position the text
             queue_data = df_violin[df_violin["Queue Type"] == queue_type][
                 "Execution Time (µs)"
             ]
@@ -168,7 +150,6 @@ def main():
                 * 0.02
             )
 
-            # Add the mean value text
             ax.text(
                 i,
                 y_pos,
@@ -201,7 +182,6 @@ def main():
             print(f"  Error saving violin plot: {e}")
         plt.close()
 
-    # --- Generate Summary Line Plot (Performance vs Processes Count) ---
     if all_benchmark_data:
         summary_df_data = []
         for record in all_benchmark_data:
@@ -227,7 +207,6 @@ def main():
             markersize=8,
         )
 
-        # Disable scientific notation on y-axis
         ax.ticklabel_format(style="plain", axis="y")
 
         plt.title(
@@ -235,10 +214,23 @@ def main():
         )
         plt.xlabel("Total Process Count (Producers + Consumers)", fontsize=12)
         plt.ylabel("Mean Execution Time (µs)", fontsize=12)
-        plt.xticks([2, 4, 8, 12])  # Based on PROCESS_CONFIGS
+        plt.xticks([2, 4, 8, 12])
         plt.legend(title="Queue Type", fontsize=10, title_fontsize=12)
         plt.grid(True, linestyle=":", alpha=0.7)
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.text(
+            0.98,
+            0.02,
+            f"{ITEMS_PER_PROCESS:,} items/producer",
+            ha="right",
+            va="bottom",
+            transform=plt.gca().transAxes,
+            fontsize=9,
+            style="italic",
+            bbox=dict(
+                boxstyle="round,pad=0.3", facecolor="white", edgecolor="gray", alpha=0.8
+            ),
+        )
 
         try:
             plt.savefig(SUMMARY_LINE_PLOT_FILE, dpi=150, bbox_inches="tight")
@@ -247,7 +239,6 @@ def main():
             print(f"Error saving summary line plot: {e}")
         plt.close()
 
-    # --- Print Summary Statistics ---
     if all_benchmark_data:
         print("\n--- Summary Statistics ---")
         df_stats = pd.DataFrame(all_benchmark_data)

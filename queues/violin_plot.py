@@ -23,7 +23,7 @@ BENCHMARK_FUNCTION_IDS = [
 ]
 
 OUTPUT_PLOT_FILE = "spsc_queue_performance_violin_test.png"
-PLOT_TITLE = "Performance Comparison for IPC SPSC Queues via shared memory"
+PLOT_TITLE = "MPSC Performance Comparison (35.000.000 Total Items)"
 Y_AXIS_LABEL = "Execution Time per Sample (µs)"
 
 

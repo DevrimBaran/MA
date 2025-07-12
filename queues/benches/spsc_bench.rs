@@ -657,14 +657,19 @@ where
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(2))
-        .measurement_time(Duration::from_secs(15))
-        .sample_size(10)
+        .measurement_time(Duration::from_secs(5000))
+        .sample_size(500)
 }
 
 criterion_group! {
     name = benches;
     config = custom_criterion();
     targets =
+        bench_lamport,
+        bench_bqueue,
+        bench_mp,
+        bench_dspsc,
+        bench_unbounded,
         bench_iffq,
         bench_biffq,
         bench_ffq,

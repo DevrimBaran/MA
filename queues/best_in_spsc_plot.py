@@ -8,7 +8,7 @@ import numpy as np
 CRITERION_BASE_PATH = "./target/criterion/"
 
 BENCHMARK_FUNCTION_IDS = [
-    "BiffQ (Native SPSC)",
+    "BLQ (Native SPSC)",
     "DQueue (MPSC as SPSC)",
     "YMC (MPMC as SPSC)",
     "David (SPMC as SPSC)",
@@ -102,7 +102,7 @@ def main():
 
     df = pd.DataFrame(plot_data_list)
 
-    plt.figure(figsize=(14, 8))
+    plt.figure(figsize=(14, 10))
     ax = sns.violinplot(
         x="Queue Type",
         y=Y_AXIS_LABEL,

@@ -385,8 +385,8 @@ where
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(1))
-        .measurement_time(Duration::from_secs(15))
-        .sample_size(10)
+        .measurement_time(Duration::from_secs(4200))
+        .sample_size(500)
 }
 
 criterion_group! {

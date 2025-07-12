@@ -110,7 +110,7 @@ def main():
 
     df = pd.DataFrame(plot_data_list)
 
-    plt.figure(figsize=(16, 9))
+    plt.figure(figsize=(16, 12))
     ax = sns.violinplot(
         x="Queue Type",
         y=Y_AXIS_LABEL,
@@ -123,6 +123,8 @@ def main():
 
     # Disable scientific notation on y-axis
     ax.ticklabel_format(style="plain", axis="y")
+
+    ax.set_yticks(np.arange(0, 3000000, 250000))
 
     # Add mean value annotations
     for i, (queue_type, mean_val) in enumerate(mean_values_dict.items()):

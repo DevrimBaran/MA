@@ -1,5 +1,5 @@
 // paper in /paper/dspc-uspsc-mspsc.pdf and /paper/dspc-uspsc.pdf (oriented towards latter one)
-use crate::spsc::lamport::LamportQueue;
+use crate::spsc::lamport::{LamportQueue, Padded}; // Add Padded import
 use crate::SpscQueue;
 use std::{
     ptr::{self, null_mut},
@@ -36,7 +36,7 @@ pub struct DynListQueue<T: Send + 'static> {
     next_free_node: AtomicUsize,
     _padding2: [u8; 128 - 16],
 
-    node_cache: LamportQueue<NodePtr<T>>, // Line 6 - SPSC cache
+    node_cache: LamportQueue<NodePtr<T>, Padded>, // Line 6 - SPSC cache - Changed to Padded
     pool_size: usize,
 }
 
@@ -50,7 +50,7 @@ impl<T: Send + 'static> DynListQueue<T> {
 
         let layout_self = Layout::new::<Self>();
         let layout_nodes = Layout::array::<Node<T>>(nodes_count).unwrap();
-        let lamport_size = LamportQueue::<NodePtr<T>>::shared_size(cache_capacity);
+        let lamport_size = LamportQueue::<NodePtr<T>, Padded>::shared_size(cache_capacity); // Changed
 
         let (layout1, _) = layout_self.extend(layout_nodes).unwrap();
         let (final_layout, _) = layout1
@@ -73,7 +73,7 @@ impl<T: Send + 'static> DynListQueue<T> {
 
         let layout_self = Layout::new::<Self>();
         let layout_nodes = Layout::array::<Node<T>>(nodes_count).unwrap();
-        let lamport_size = LamportQueue::<NodePtr<T>>::shared_size(cache_size);
+        let lamport_size = LamportQueue::<NodePtr<T>, Padded>::shared_size(cache_size); // Changed
 
         let (layout1, offset_nodes) = layout_self.extend(layout_nodes).unwrap();
         let (_, offset_cache) = layout1
@@ -98,7 +98,7 @@ impl<T: Send + 'static> DynListQueue<T> {
 
         // Initialize cache for node recycling
         let cache_ptr = mem_ptr.add(offset_cache);
-        let cache = LamportQueue::<NodePtr<T>>::init_in_shared(cache_ptr, cache_size);
+        let cache = LamportQueue::<NodePtr<T>, Padded>::init_in_shared(cache_ptr, cache_size); // Changed
 
         // Add all free nodes (except dummy) to cache
         for i in 1..nodes_count {
@@ -124,6 +124,7 @@ impl<T: Send + 'static> DynListQueue<T> {
         &mut *self_ptr
     }
 
+    // Rest of the implementation remains the same...
     // Lines 10-11 in Figure 2 - try cache (we allocate from pre allocated pool)
     fn alloc_node(&self, v: T) -> Option<*mut Node<T>> {
         if let Ok(node_ptr) = self.node_cache.pop() {

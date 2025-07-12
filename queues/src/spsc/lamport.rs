@@ -1,5 +1,6 @@
 //paper in /paper/spsc/lamport.pdf and Cache‐aware design of general‐purpose Single‐Producer Single‐Consumer queues.pdf
 //implementation of lamport queue more close to lamport queue from Cache‐aware design of general‐purpose Single‐Producer Single‐Consumer queues.pdf
+//padd option for ospsc, dspsc and mspsc. default is unpadded so we can bench original unpadded lamport queue
 use crate::SpscQueue;
 use std::{
     cell::UnsafeCell,
@@ -7,26 +8,66 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-#[derive(Debug)]
-pub struct LamportQueue<T: Send> {
-    pub mask: usize,
-    pub buf: ManuallyDrop<Box<[UnsafeCell<Option<T>>]>>, // Circular buffer - Section 3
-    pub head: AtomicUsize,                               // Read index - group B
-    pub tail: AtomicUsize,                               // Write index - group A
-    pub owns_buffer: bool,                               // IPC adaptation - tracks ownership
+// Padding traits and types
+pub trait PaddingMode: Send + Sync + 'static {
+    type Padding: Send + Sync + Default;
 }
 
-unsafe impl<T: Send> Sync for LamportQueue<T> {}
-unsafe impl<T: Send> Send for LamportQueue<T> {}
+#[derive(Default)]
+pub struct Unpadded;
 
-impl<T: Send> LamportQueue<T> {
+#[derive(Default)]
+pub struct Padded;
+
+#[repr(C)]
+#[derive(Default)]
+pub struct NoPadding;
+
+#[repr(C)]
+pub struct CachePadding {
+    _pad: [u8; 120],
+}
+
+impl Default for CachePadding {
+    fn default() -> Self {
+        Self { _pad: [0u8; 120] }
+    }
+}
+
+impl PaddingMode for Unpadded {
+    type Padding = NoPadding;
+}
+
+impl PaddingMode for Padded {
+    type Padding = CachePadding;
+}
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct LamportQueue<T: Send, P: PaddingMode = Unpadded> {
+    pub mask: usize,
+    pub buf: ManuallyDrop<Box<[UnsafeCell<Option<T>>]>>, // Circular buffer - Section 3
+
+    pub head: AtomicUsize, // Read index - group B
+    _padding1: P::Padding, // Cache line separation
+
+    pub tail: AtomicUsize, // Write index - group A
+    _padding2: P::Padding, // Cache line separation
+
+    pub owns_buffer: bool, // IPC adaptation - tracks ownership
+}
+
+unsafe impl<T: Send, P: PaddingMode> Sync for LamportQueue<T, P> {}
+unsafe impl<T: Send, P: PaddingMode> Send for LamportQueue<T, P> {}
+
+impl<T: Send, P: PaddingMode> LamportQueue<T, P> {
     #[inline]
     pub fn idx(&self, i: usize) -> usize {
         i & self.mask // Fast modulo for power-of-2 sizes
     }
 }
 
-impl<T: Send> LamportQueue<T> {
+impl<T: Send, P: PaddingMode> LamportQueue<T, P> {
     // IPC adaptation - calculate shared memory size
     pub const fn shared_size(cap: usize) -> usize {
         std::mem::size_of::<Self>() + cap * std::mem::size_of::<UnsafeCell<Option<T>>>()
@@ -51,7 +92,9 @@ impl<T: Send> LamportQueue<T> {
             mask: cap - 1,
             buf: ManuallyDrop::new(boxed),
             head: AtomicUsize::new(0),
+            _padding1: P::Padding::default(),
             tail: AtomicUsize::new(0),
+            _padding2: P::Padding::default(),
             owns_buffer: false, // IPC - buffer not heap allocated
         });
 
@@ -59,7 +102,7 @@ impl<T: Send> LamportQueue<T> {
     }
 }
 
-impl<T: Send> LamportQueue<T> {
+impl<T: Send, P: PaddingMode> LamportQueue<T, P> {
     #[inline]
     pub fn capacity(&self) -> usize {
         self.mask + 1
@@ -84,7 +127,7 @@ impl<T: Send> LamportQueue<T> {
     }
 }
 
-impl<T: Send + 'static> SpscQueue<T> for LamportQueue<T> {
+impl<T: Send + 'static, P: PaddingMode> SpscQueue<T> for LamportQueue<T, P> {
     type PushError = ();
     type PopError = ();
 
@@ -146,7 +189,7 @@ impl<T: Send + 'static> SpscQueue<T> for LamportQueue<T> {
     }
 }
 
-impl<T: Send> Drop for LamportQueue<T> {
+impl<T: Send, P: PaddingMode> Drop for LamportQueue<T, P> {
     fn drop(&mut self) {
         // IPC - cleanup handled externally
     }

@@ -1,5 +1,5 @@
 // paper in /paper/dspc-uspsc-mspsc.pdf and /paper/dspc-uspsc.pdf (oriented towards latter one)
-use crate::spsc::LamportQueue;
+use crate::spsc::{LamportQueue, Padded}; // Add Padded import
 use crate::{DynListQueue, SpscQueue};
 use std::{
     ptr,
@@ -8,7 +8,7 @@ use std::{
 
 // IPC: wrapper for LamportQueue pointers
 #[derive(Copy, Clone)]
-struct LamportPtr<T: Send + 'static>(*mut LamportQueue<T>);
+struct LamportPtr<T: Send + 'static>(*mut LamportQueue<T, Padded>); // Changed to Padded
 
 unsafe impl<T: Send + 'static> Send for LamportPtr<T> {}
 unsafe impl<T: Send + 'static> Sync for LamportPtr<T> {}
@@ -16,14 +16,15 @@ unsafe impl<T: Send + 'static> Sync for LamportPtr<T> {}
 // BufferPool - Figure 3, lines 22-41 in paper
 #[repr(C)]
 struct BufferPool<T: Send + 'static> {
-    inuse: DynListQueue<LamportPtr<T>>, // Line 23
-    cache: LamportQueue<LamportPtr<T>>, // Line 24
+    inuse: DynListQueue<LamportPtr<T>>,         // Line 23
+    cache: LamportQueue<LamportPtr<T>, Padded>, // Line 24 - Changed to Padded
     segment_size: usize,
 }
 
 impl<T: Send + 'static> BufferPool<T> {
     // next_w() - Lines 26-32 in Figure 3
-    fn next_w(&self) -> Option<*mut LamportQueue<T>> {
+    fn next_w(&self) -> Option<*mut LamportQueue<T, Padded>> {
+        // Changed return type
         // Line 28 - try cache first
         if let Ok(buf_wrapper) = self.cache.pop() {
             let buf_ptr = buf_wrapper.0;
@@ -44,12 +45,14 @@ impl<T: Send + 'static> BufferPool<T> {
     }
 
     // next_r() - Lines 33-36 in Figure 3
-    fn next_r(&self) -> Option<*mut LamportQueue<T>> {
+    fn next_r(&self) -> Option<*mut LamportQueue<T, Padded>> {
+        // Changed return type
         self.inuse.pop().ok().map(|wrapper| wrapper.0) // Line 35
     }
 
     // release() - Lines 37-40 in Figure 3
-    fn release(&self, buf: *mut LamportQueue<T>) {
+    fn release(&self, buf: *mut LamportQueue<T, Padded>) {
+        // Changed parameter type
         if buf.is_null() {
             return;
         }
@@ -68,10 +71,10 @@ impl<T: Send + 'static> BufferPool<T> {
 // uSPSC queue - corresponds to paper's unbounded queue
 #[repr(C, align(128))]
 pub struct UnboundedQueue<T: Send + 'static> {
-    buf_r: AtomicPtr<LamportQueue<T>>, // Reader's buffer pointer
-    _padding1: [u8; 120],              // IPC: cache line separation
+    buf_r: AtomicPtr<LamportQueue<T, Padded>>, // Reader's buffer pointer - Changed to Padded
+    _padding1: [u8; 120],                      // IPC: cache line separation
 
-    buf_w: AtomicPtr<LamportQueue<T>>, // Writer's buffer pointer
+    buf_w: AtomicPtr<LamportQueue<T, Padded>>, // Writer's buffer pointer - Changed to Padded
     _padding2: [u8; 120],
 
     pool: BufferPool<T>, // Pool of SPSC buffers
@@ -91,8 +94,8 @@ impl<T: Send + 'static> UnboundedQueue<T> {
 
         let layout_self = Layout::new::<Self>();
         let dspsc_size = DynListQueue::<LamportPtr<T>>::shared_size(pool_capacity, pool_capacity);
-        let cache_size = LamportQueue::<LamportPtr<T>>::shared_size(pool_capacity);
-        let segments_size = LamportQueue::<T>::shared_size(segment_size) * num_segments;
+        let cache_size = LamportQueue::<LamportPtr<T>, Padded>::shared_size(pool_capacity); // Changed
+        let segments_size = LamportQueue::<T, Padded>::shared_size(segment_size) * num_segments; // Changed
 
         let (layout1, _) = layout_self
             .extend(Layout::from_size_align(dspsc_size, 128).unwrap())
@@ -126,7 +129,7 @@ impl<T: Send + 'static> UnboundedQueue<T> {
 
         let layout_self = Layout::new::<Self>();
         let dspsc_size = DynListQueue::<LamportPtr<T>>::shared_size(pool_capacity, pool_capacity);
-        let cache_size = LamportQueue::<LamportPtr<T>>::shared_size(pool_capacity);
+        let cache_size = LamportQueue::<LamportPtr<T>, Padded>::shared_size(pool_capacity); // Changed
 
         let (layout1, offset_dspsc) = layout_self
             .extend(Layout::from_size_align(dspsc_size, 128).unwrap())
@@ -137,7 +140,7 @@ impl<T: Send + 'static> UnboundedQueue<T> {
         let (_, offset_segments) = layout2
             .extend(
                 Layout::from_size_align(
-                    LamportQueue::<T>::shared_size(segment_size) * num_segments,
+                    LamportQueue::<T, Padded>::shared_size(segment_size) * num_segments, // Changed
                     128,
                 )
                 .unwrap(),
@@ -149,9 +152,9 @@ impl<T: Send + 'static> UnboundedQueue<T> {
         let mut segment_ptrs = Vec::with_capacity(num_segments);
 
         for i in 0..num_segments {
-            let segment_offset = i * LamportQueue::<T>::shared_size(segment_size);
+            let segment_offset = i * LamportQueue::<T, Padded>::shared_size(segment_size); // Changed
             let segment_ptr = segments_base.add(segment_offset);
-            let segment = LamportQueue::init_in_shared(segment_ptr, segment_size);
+            let segment = LamportQueue::<T, Padded>::init_in_shared(segment_ptr, segment_size); // Changed
             segment_ptrs.push(segment as *mut _);
         }
 
@@ -163,7 +166,8 @@ impl<T: Send + 'static> UnboundedQueue<T> {
         let inuse_queue = DynListQueue::init_in_shared(dspsc_ptr, pool_capacity, pool_capacity);
 
         let cache_ptr = mem_ptr.add(offset_cache);
-        let cache_queue = LamportQueue::init_in_shared(cache_ptr, pool_capacity);
+        let cache_queue =
+            LamportQueue::<LamportPtr<T>, Padded>::init_in_shared(cache_ptr, pool_capacity); // Changed
 
         // Add remaining segments to cache
         for i in 1..num_segments {
@@ -197,6 +201,7 @@ impl<T: Send + 'static> UnboundedQueue<T> {
     }
 }
 
+// Rest of the implementation remains the same...
 impl<T: Send + 'static> SpscQueue<T> for UnboundedQueue<T> {
     type PushError = ();
     type PopError = ();

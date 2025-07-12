@@ -673,8 +673,9 @@ mod test_wcq_enhanced {
     #[test]
     fn test_wcq_cache_remap() {
         assert_eq!(WCQueue::<usize>::cache_remap(0, 1024), 0);
+        assert_eq!(WCQueue::<usize>::cache_remap(1, 1024), 67);
         assert_eq!(WCQueue::<usize>::cache_remap(1024, 1024), 0);
-        assert_eq!(WCQueue::<usize>::cache_remap(1025, 1024), 1);
+        assert_eq!(WCQueue::<usize>::cache_remap(1025, 1024), 67);
         assert_eq!(WCQueue::<usize>::cache_remap(2048, 1024), 0);
     }
 

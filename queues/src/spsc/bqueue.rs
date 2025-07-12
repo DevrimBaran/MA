@@ -18,7 +18,7 @@ pub struct BQueue<T: Send + 'static> {
     batch_history: AtomicUsize,    // Line N01: for adaptive backtracking
 }
 
-const BATCH_SIZE: usize = 32; // Reduced from 256 for Miri tests
+const BATCH_SIZE: usize = 256; // To do miri tests reduce to 32 for faster tests
 const INCREMENT: usize = 8; // Line N05: cache line worth of increments
 
 unsafe impl<T: Send + 'static> Sync for BQueue<T> {}

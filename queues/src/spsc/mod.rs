@@ -17,6 +17,7 @@ pub use dspsc::DynListQueue;
 pub use ffq::FfqQueue;
 pub use iffq::IffqQueue;
 pub use lamport::LamportQueue;
+pub use lamport::Padded;
 pub use llq::LlqQueue;
 pub use mspsc::MultiPushQueue;
 pub use sesd_jp_spsc_wrapper::SesdJpSpscBenchWrapper;

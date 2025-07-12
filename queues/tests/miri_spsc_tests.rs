@@ -7,8 +7,8 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 const MIRI_SMALL_CAPACITY: usize = 64;
-const MIRI_MEDIUM_CAPACITY: usize = 256;
-const MIRI_LARGE_CAPACITY: usize = 1024;
+const MIRI_MEDIUM_CAPACITY: usize = 1024;
+const MIRI_LARGE_CAPACITY: usize = 2048;
 
 struct AlignedMemory {
     ptr: *mut u8,
@@ -836,7 +836,7 @@ mod bqueue_tests {
 
         assert!(!queue.available() || queue.push(999).is_err());
 
-        let batch_size = 32;
+        let batch_size = 256;
         let pops_needed = batch_size.min(pushed);
 
         for _ in 0..pops_needed {
@@ -1694,7 +1694,8 @@ mod drop_semantics_tests {
         {
             let shared_size = LamportQueue::<DropCounter>::shared_size(64);
             let mut memory = AlignedMemory::new(shared_size, 64);
-            let queue = unsafe { LamportQueue::init_in_shared(memory.as_mut_ptr(), 64) };
+            let queue =
+                unsafe { LamportQueue::<DropCounter>::init_in_shared(memory.as_mut_ptr(), 64) };
 
             for i in 0..10 {
                 queue.push(DropCounter { _value: i }).unwrap();
@@ -1801,6 +1802,7 @@ mod drop_semantics_tests {
 }
 
 mod edge_case_tests {
+
     use super::*;
 
     #[test]
@@ -1810,7 +1812,7 @@ mod edge_case_tests {
 
         let shared_size = LamportQueue::<ZeroSized>::shared_size(32);
         let mut memory = AlignedMemory::new(shared_size, 64);
-        let queue = unsafe { LamportQueue::init_in_shared(memory.as_mut_ptr(), 32) };
+        let queue = unsafe { LamportQueue::<ZeroSized>::init_in_shared(memory.as_mut_ptr(), 32) };
 
         for _ in 0..10 {
             queue.push(ZeroSized).unwrap();
@@ -1830,7 +1832,7 @@ mod edge_case_tests {
 
         let shared_size = LamportQueue::<LargeType>::shared_size(16);
         let mut memory = AlignedMemory::new(shared_size, 64);
-        let queue = unsafe { LamportQueue::init_in_shared(memory.as_mut_ptr(), 16) };
+        let queue = unsafe { LamportQueue::<LargeType>::init_in_shared(memory.as_mut_ptr(), 16) };
 
         let item = LargeType { data: [42; 128] };
 
@@ -1842,7 +1844,7 @@ mod edge_case_tests {
     fn test_alternating_push_pop() {
         let shared_size = LamportQueue::<usize>::shared_size(4);
         let mut memory = AlignedMemory::new(shared_size, 64);
-        let queue = unsafe { LamportQueue::init_in_shared(memory.as_mut_ptr(), 4) };
+        let queue = unsafe { LamportQueue::<usize>::init_in_shared(memory.as_mut_ptr(), 4) };
 
         for i in 0..20 {
             queue.push(i).unwrap();
@@ -1880,7 +1882,7 @@ mod edge_case_tests {
         {
             let shared_size = LamportQueue::<String>::shared_size(16);
             let mut memory = AlignedMemory::new(shared_size, 64);
-            let queue = unsafe { LamportQueue::init_in_shared(memory.as_mut_ptr(), 16) };
+            let queue = unsafe { LamportQueue::<String>::init_in_shared(memory.as_mut_ptr(), 16) };
 
             for i in 0..10 {
                 queue.push(format!("test_{}", i)).unwrap();
@@ -1937,6 +1939,7 @@ mod edge_case_tests {
 }
 
 mod error_handling_tests {
+
     use super::*;
 
     #[test]
@@ -1969,7 +1972,7 @@ mod error_handling_tests {
     fn test_push_error_handling() {
         let shared_size = LamportQueue::<String>::shared_size(2);
         let mut memory = AlignedMemory::new(shared_size, 64);
-        let queue = unsafe { LamportQueue::init_in_shared(memory.as_mut_ptr(), 2) };
+        let queue = unsafe { LamportQueue::<String>::init_in_shared(memory.as_mut_ptr(), 2) };
 
         queue.push("first".to_string()).unwrap();
 
@@ -1985,9 +1988,9 @@ mod error_handling_tests {
 
     #[test]
     fn test_pop_error_handling() {
-        let shared_size = BQueue::<usize>::shared_size(128);
+        let shared_size = BQueue::<usize>::shared_size(1024);
         let mut memory = AlignedMemory::new(shared_size, 64);
-        let queue = unsafe { BQueue::init_in_shared(memory.as_mut_ptr(), 128) };
+        let queue = unsafe { BQueue::init_in_shared(memory.as_mut_ptr(), 1024) };
 
         assert!(queue.pop().is_err());
 
@@ -2047,11 +2050,11 @@ mod special_feature_tests {
 fn test_multiple_queues() {
     let shared_size1 = LamportQueue::<u32>::shared_size(32);
     let mut memory1 = AlignedMemory::new(shared_size1, 64);
-    let q1 = unsafe { LamportQueue::init_in_shared(memory1.as_mut_ptr(), 32) };
+    let q1 = unsafe { LamportQueue::<u32>::init_in_shared(memory1.as_mut_ptr(), 32) };
 
     let shared_size2 = LamportQueue::<u32>::shared_size(32);
     let mut memory2 = AlignedMemory::new(shared_size2, 64);
-    let q2 = unsafe { LamportQueue::init_in_shared(memory2.as_mut_ptr(), 32) };
+    let q2 = unsafe { LamportQueue::<u32>::init_in_shared(memory2.as_mut_ptr(), 32) };
 
     q1.push(100).unwrap();
     q2.push(200).unwrap();
@@ -2062,9 +2065,9 @@ fn test_multiple_queues() {
 
 #[test]
 fn test_arc_safety() {
-    let shared_size = BQueue::<i32>::shared_size(128);
+    let shared_size = BQueue::<i32>::shared_size(1024);
     let mut memory = AlignedMemory::new(shared_size, 64);
-    let queue = unsafe { BQueue::init_in_shared(memory.as_mut_ptr(), 128) };
+    let queue = unsafe { BQueue::init_in_shared(memory.as_mut_ptr(), 1024) };
 
     let queue_ptr = queue as *const BQueue<i32>;
     let queue_arc = Arc::new(queue_ptr);
@@ -2084,7 +2087,7 @@ fn test_different_types() {
     {
         let shared_size = LamportQueue::<u8>::shared_size(16);
         let mut memory = AlignedMemory::new(shared_size, 64);
-        let q_u8 = unsafe { LamportQueue::init_in_shared(memory.as_mut_ptr(), 16) };
+        let q_u8 = unsafe { LamportQueue::<u8>::init_in_shared(memory.as_mut_ptr(), 16) };
         q_u8.push(255u8).unwrap();
         assert_eq!(q_u8.pop().unwrap(), 255u8);
     }
@@ -2098,9 +2101,9 @@ fn test_different_types() {
     }
 
     {
-        let shared_size = BQueue::<Option<String>>::shared_size(128);
+        let shared_size = BQueue::<Option<String>>::shared_size(1024);
         let mut memory = AlignedMemory::new(shared_size, 64);
-        let q_opt = unsafe { BQueue::init_in_shared(memory.as_mut_ptr(), 128) };
+        let q_opt = unsafe { BQueue::init_in_shared(memory.as_mut_ptr(), 1024) };
         q_opt.push(Some("hello".to_string())).unwrap();
         q_opt.push(None).unwrap();
 
@@ -2110,6 +2113,7 @@ fn test_different_types() {
 }
 
 mod shared_memory_init_tests {
+
     use super::*;
 
     #[test]
@@ -2133,7 +2137,8 @@ mod shared_memory_init_tests {
                         if *offset < align {
                             let test_ptr = unsafe { ptr.add(*offset) };
                             if test_ptr as usize % align == 0 {
-                                let queue = unsafe { LamportQueue::init_in_shared(test_ptr, 64) };
+                                let queue =
+                                    unsafe { LamportQueue::<usize>::init_in_shared(test_ptr, 64) };
                                 queue.push(42).unwrap();
                                 assert_eq!(queue.pop().unwrap(), 42);
                             }
@@ -2168,7 +2173,7 @@ mod shared_memory_init_tests {
         let mem_ptr = memory.as_mut_ptr();
 
         {
-            let queue = unsafe { LamportQueue::init_in_shared(mem_ptr, 64) };
+            let queue = unsafe { LamportQueue::<usize>::init_in_shared(mem_ptr, 64) };
             for i in 0..10 {
                 queue.push(i).unwrap();
             }
@@ -2179,7 +2184,7 @@ mod shared_memory_init_tests {
         }
 
         {
-            let queue = unsafe { LamportQueue::init_in_shared(mem_ptr, 64) };
+            let queue = unsafe { LamportQueue::<usize>::init_in_shared(mem_ptr, 64) };
             assert!(queue.empty());
 
             queue.push(100).unwrap();

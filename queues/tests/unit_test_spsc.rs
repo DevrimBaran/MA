@@ -880,7 +880,7 @@ mod bqueue_tests {
         assert!(pushed > 0, "Should be able to push at least one item");
         assert!(!queue.available() || queue.push(999).is_err());
 
-        let batch_size = 32;
+        let batch_size = 256;
         let pops_needed = batch_size.min(pushed);
 
         for _ in 0..pops_needed {
@@ -1610,6 +1610,7 @@ mod shared_memory_tests {
 }
 
 mod edge_case_tests {
+
     use super::*;
 
     #[test]
@@ -1620,7 +1621,7 @@ mod edge_case_tests {
         let shared_size = LamportQueue::<ZeroSized>::shared_size(64);
         let memory = create_aligned_memory_box(shared_size, 64);
         let mem_ptr = Box::leak(memory).as_mut_ptr();
-        let queue = unsafe { LamportQueue::init_in_shared(mem_ptr, 64) };
+        let queue = unsafe { LamportQueue::<ZeroSized>::init_in_shared(mem_ptr, 64) };
 
         queue.push(ZeroSized).unwrap();
         assert_eq!(queue.pop().unwrap(), ZeroSized);
@@ -1640,7 +1641,7 @@ mod edge_case_tests {
         let shared_size = LamportQueue::<LargeType>::shared_size(16);
         let memory = create_aligned_memory_box(shared_size, 64);
         let mem_ptr = Box::leak(memory).as_mut_ptr();
-        let queue = unsafe { LamportQueue::init_in_shared(mem_ptr, 16) };
+        let queue = unsafe { LamportQueue::<LargeType>::init_in_shared(mem_ptr, 16) };
 
         let item = LargeType { data: [42; 128] };
 
@@ -1674,7 +1675,7 @@ mod edge_case_tests {
             let shared_size = LamportQueue::<DropCounter>::shared_size(64);
             let memory = create_aligned_memory_box(shared_size, 64);
             let mem_ptr = Box::leak(memory).as_mut_ptr();
-            let queue = unsafe { LamportQueue::init_in_shared(mem_ptr, 64) };
+            let queue = unsafe { LamportQueue::<DropCounter>::init_in_shared(mem_ptr, 64) };
 
             for i in 0..10 {
                 queue.push(DropCounter { _value: i }).unwrap();
@@ -1810,6 +1811,7 @@ mod special_feature_tests {
 }
 
 mod error_handling_tests {
+
     use super::*;
 
     #[test]
@@ -1826,7 +1828,7 @@ mod error_handling_tests {
         let shared_size = LamportQueue::<String>::shared_size(2);
         let memory = create_aligned_memory_box(shared_size, 64);
         let mem_ptr = Box::leak(memory).as_mut_ptr();
-        let queue = unsafe { LamportQueue::init_in_shared(mem_ptr, 2) };
+        let queue = unsafe { LamportQueue::<String>::init_in_shared(mem_ptr, 2) };
 
         queue.push("first".to_string()).unwrap();
 

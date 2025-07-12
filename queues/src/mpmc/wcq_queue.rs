@@ -221,7 +221,8 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
     // cache_remap - Section 2, SCQ paper
     #[inline]
     pub fn cache_remap(pos: usize, capacity: usize) -> usize {
-        pos % capacity
+        let pos_mod = pos % capacity;
+        (pos_mod.wrapping_mul(67)) % capacity
     }
 
     // IPC: Get entry from offset instead of direct pointer

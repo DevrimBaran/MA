@@ -1,5 +1,5 @@
 // paper in /paper/dspc-uspsc-mspsc.pdf
-use crate::spsc::LamportQueue;
+use crate::spsc::{LamportQueue, Padded}; // Add Padded import
 use crate::SpscQueue;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::{cell::UnsafeCell, fmt, mem::MaybeUninit, ptr};
@@ -8,10 +8,10 @@ use std::alloc::Layout;
 const LOCAL_BUF: usize = 32; // Paper's MULTIPUSH_BUFFER_SIZE
 
 pub struct MultiPushQueue<T: Send + 'static> {
-    inner: *mut LamportQueue<T>, // Underlying SPSC buffer
+    inner: *mut LamportQueue<T, Padded>, // Underlying SPSC buffer - Changed to Padded
     local_buf: UnsafeCell<[MaybeUninit<T>; LOCAL_BUF]>, // Local buffer for batching
-    pub local_count: AtomicUsize, // Paper's mcnt
-    shared: AtomicBool,          // IPC: track if in shared memory
+    pub local_count: AtomicUsize,        // Paper's mcnt
+    shared: AtomicBool,                  // IPC: track if in shared memory
 }
 
 unsafe impl<T: Send> Send for MultiPushQueue<T> {}
@@ -24,8 +24,8 @@ impl<T: Send + 'static> MultiPushQueue<T> {
 
         let self_layout = Layout::new::<Self>();
         let lamport_layout = Layout::from_size_align(
-            LamportQueue::<T>::shared_size(capacity),
-            core::mem::align_of::<LamportQueue<T>>(),
+            LamportQueue::<T, Padded>::shared_size(capacity), // Changed
+            core::mem::align_of::<LamportQueue<T, Padded>>(), // Changed
         )
         .expect("Failed to create layout for LamportQueue in init_in_shared");
 
@@ -34,7 +34,8 @@ impl<T: Send + 'static> MultiPushQueue<T> {
             .expect("Failed to extend layout for MultiPushQueue in init_in_shared");
 
         let lamport_q_ptr_raw = mem.add(lamport_offset);
-        let lamport_q_instance = LamportQueue::init_in_shared(lamport_q_ptr_raw, capacity);
+        let lamport_q_instance =
+            LamportQueue::<T, Padded>::init_in_shared(lamport_q_ptr_raw, capacity); // Changed
 
         let initial_value = Self::from_raw(lamport_q_instance as *mut _, true);
         ptr::write(self_ptr, MaybeUninit::new(initial_value));
@@ -45,8 +46,8 @@ impl<T: Send + 'static> MultiPushQueue<T> {
     pub fn shared_size(capacity: usize) -> usize {
         let self_layout = Layout::new::<Self>();
         let lamport_layout = Layout::from_size_align(
-            LamportQueue::<T>::shared_size(capacity),
-            core::mem::align_of::<LamportQueue<T>>(),
+            LamportQueue::<T, Padded>::shared_size(capacity), // Changed
+            core::mem::align_of::<LamportQueue<T, Padded>>(), // Changed
         )
         .expect("Failed to create layout for LamportQueue in shared_size");
 
@@ -58,7 +59,8 @@ impl<T: Send + 'static> MultiPushQueue<T> {
     }
 
     #[inline(always)]
-    fn from_raw(ring: *mut LamportQueue<T>, shared: bool) -> Self {
+    fn from_raw(ring: *mut LamportQueue<T, Padded>, shared: bool) -> Self {
+        // Changed parameter type
         Self {
             inner: ring,
             local_buf: UnsafeCell::new(unsafe { MaybeUninit::uninit().assume_init() }),
@@ -68,15 +70,18 @@ impl<T: Send + 'static> MultiPushQueue<T> {
     }
 
     #[inline(always)]
-    fn ring(&self) -> &LamportQueue<T> {
+    fn ring(&self) -> &LamportQueue<T, Padded> {
+        // Changed return type
         unsafe { &*self.inner }
     }
 
     #[inline(always)]
-    fn ring_mut(&self) -> &mut LamportQueue<T> {
+    fn ring_mut(&self) -> &mut LamportQueue<T, Padded> {
+        // Changed return type
         unsafe { &mut *self.inner }
     }
 
+    // Rest of the implementation remains the same...
     // Helper to calculate contiguous free space in ring
     #[inline(always)]
     fn contiguous_free_in_ring(&self) -> usize {
@@ -142,7 +147,7 @@ impl<T: Send + 'static> Drop for MultiPushQueue<T> {
 
 impl<T: Send + 'static> SpscQueue<T> for MultiPushQueue<T> {
     type PushError = ();
-    type PopError = <LamportQueue<T> as SpscQueue<T>>::PopError;
+    type PopError = <LamportQueue<T, Padded> as SpscQueue<T>>::PopError; // Changed
 
     // mpush() - Lines 26-36 in Figure 4
     #[inline]

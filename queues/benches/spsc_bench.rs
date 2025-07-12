@@ -22,6 +22,7 @@ const PERFORMANCE_TEST: bool = false;
 const RING_CAP: usize = 524_288;
 const ITERS: usize = 35_000_000;
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 1_000_000_000;
+const BATCH_SIZE: usize = 32;
 
 trait BenchSpscQueue<T: Send>: Send + Sync + 'static {
     fn bench_push(&self, item: T) -> Result<(), ()>;
@@ -430,25 +431,61 @@ where
                 std::hint::spin_loop();
             }
 
-            let mut push_attempts = 0;
-            for i in 0..ITERS {
-                while q.bench_push(i).is_err() {
-                    push_attempts += 1;
-                    if push_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS {
-                        panic!("Producer exceeded max spin retry attempts for push");
-                    }
-                    std::hint::spin_loop();
-                }
+            if let Some(blq_queue) = (q as &dyn std::any::Any).downcast_ref::<BlqQueue<usize>>() {
+                let mut i = 0;
+                let mut push_attempts = 0;
 
-                if needs_special_sync && i > 0 && i % 1000 == 0 {
-                    std::sync::atomic::fence(Ordering::SeqCst);
+                while i < ITERS {
+                    let remaining = ITERS - i;
+                    let batch_size = remaining.min(BATCH_SIZE);
 
-                    for _ in 0..10 {
+                    let space = blq_queue.blq_enq_space(batch_size);
+                    if space == 0 {
+                        push_attempts += 1;
+                        if push_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS {
+                            panic!("BLQ Producer exceeded max spin retry attempts");
+                        }
                         std::hint::spin_loop();
+                        continue;
+                    }
+
+                    let to_push = space.min(batch_size);
+                    let mut pushed = 0;
+                    for j in 0..to_push {
+                        if blq_queue.blq_enq_local(i + j).is_ok() {
+                            pushed += 1;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    if pushed > 0 {
+                        blq_queue.blq_enq_publish();
+                        i += pushed;
+                        push_attempts = 0;
+                    }
+                }
+            } else {
+                let mut push_attempts = 0;
+                for i in 0..ITERS {
+                    while q.bench_push(i).is_err() {
+                        push_attempts += 1;
+                        if push_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS {
+                            panic!("Producer exceeded max spin retry attempts for push");
+                        }
+                        std::hint::spin_loop();
+                    }
+
+                    if needs_special_sync && i > 0 && i % 1000 == 0 {
+                        std::sync::atomic::fence(Ordering::SeqCst);
+                        for _ in 0..10 {
+                            std::hint::spin_loop();
+                        }
                     }
                 }
             }
 
+            // Flush any remaining items
             if let Some(mp_queue) =
                 (q as &dyn std::any::Any).downcast_ref::<MultiPushQueue<usize>>()
             {
@@ -482,7 +519,6 @@ where
 
             if needs_special_sync {
                 std::sync::atomic::fence(Ordering::SeqCst);
-
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
 
@@ -505,46 +541,88 @@ where
             let mut pop_spin_attempts = 0;
             let mut consecutive_failures = 0;
 
-            while consumed_count < ITERS {
-                let producer_done = sync_atomic_flag.load(Ordering::Acquire) == 3;
+            if let Some(blq_queue) = (q as &dyn std::any::Any).downcast_ref::<BlqQueue<usize>>() {
+                while consumed_count < ITERS {
+                    let producer_done = sync_atomic_flag.load(Ordering::Acquire) == 3;
+                    let remaining = ITERS - consumed_count;
+                    let batch_size = remaining.min(BATCH_SIZE);
 
-                if let Ok(_item) = q.bench_pop() {
-                    consumed_count += 1;
-                    pop_spin_attempts = 0;
-                    consecutive_failures = 0;
-                } else {
-                    pop_spin_attempts += 1;
-                    consecutive_failures += 1;
+                    let available = blq_queue.blq_deq_space(batch_size);
+                    if available == 0 {
+                        pop_spin_attempts += 1;
+                        consecutive_failures += 1;
 
-                    if needs_special_sync && consecutive_failures > 100 {
-                        std::sync::atomic::fence(Ordering::SeqCst);
-                        std::thread::yield_now();
-                        consecutive_failures = 0;
-                    }
-
-                    if producer_done && consecutive_failures > 1000 {
-                        for _ in 0..100 {
-                            std::sync::atomic::fence(Ordering::SeqCst);
-                            std::thread::sleep(std::time::Duration::from_micros(10));
-
-                            if let Ok(_) = q.bench_pop() {
-                                consumed_count += 1;
-                                break;
-                            }
+                        if producer_done && consecutive_failures > 1000 {
+                            break;
                         }
 
-                        if consumed_count < ITERS {
+                        if pop_spin_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS && !producer_done {
+                            panic!("BLQ Consumer exceeded max spin retry attempts");
+                        }
+
+                        std::hint::spin_loop();
+                        continue;
+                    }
+
+                    let to_pop = available.min(batch_size);
+                    let mut popped = 0;
+                    for _ in 0..to_pop {
+                        if blq_queue.blq_deq_local().is_ok() {
+                            popped += 1;
+                        } else {
                             break;
                         }
                     }
 
-                    if pop_spin_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS && !producer_done {
-                        panic!(
-                            "Consumer exceeded max spin retry attempts for pop (producer not done)"
-                        );
+                    if popped > 0 {
+                        blq_queue.blq_deq_publish();
+                        consumed_count += popped;
+                        pop_spin_attempts = 0;
+                        consecutive_failures = 0;
                     }
+                }
+            } else {
+                while consumed_count < ITERS {
+                    let producer_done = sync_atomic_flag.load(Ordering::Acquire) == 3;
 
-                    std::hint::spin_loop();
+                    if let Ok(_item) = q.bench_pop() {
+                        consumed_count += 1;
+                        pop_spin_attempts = 0;
+                        consecutive_failures = 0;
+                    } else {
+                        pop_spin_attempts += 1;
+                        consecutive_failures += 1;
+
+                        if needs_special_sync && consecutive_failures > 100 {
+                            std::sync::atomic::fence(Ordering::SeqCst);
+                            std::thread::yield_now();
+                            consecutive_failures = 0;
+                        }
+
+                        if producer_done && consecutive_failures > 1000 {
+                            for _ in 0..100 {
+                                std::sync::atomic::fence(Ordering::SeqCst);
+                                std::thread::sleep(std::time::Duration::from_micros(10));
+
+                                if let Ok(_) = q.bench_pop() {
+                                    consumed_count += 1;
+                                    break;
+                                }
+                            }
+
+                            if consumed_count < ITERS {
+                                break;
+                            }
+                        }
+
+                        if pop_spin_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS && !producer_done {
+                            panic!(
+                                "Consumer exceeded max spin retry attempts for pop (producer not done)"
+                            );
+                        }
+
+                        std::hint::spin_loop();
+                    }
                 }
             }
 
@@ -575,7 +653,7 @@ where
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(2))
-        .measurement_time(Duration::from_secs(2500))
+        .measurement_time(Duration::from_secs(4200))
         .sample_size(500)
 }
 

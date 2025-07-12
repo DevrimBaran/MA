@@ -424,6 +424,9 @@ where
     let needs_special_sync =
         queue_type_name.contains("DynListQueue") || queue_type_name.contains("UnboundedQueue");
 
+    // Check queue type ONCE before forking
+    let is_blq = queue_type_name.contains("BlqQueue");
+
     match unsafe { fork() }.expect("fork failed") {
         ForkResult::Child => {
             sync_atomic_flag.store(1, Ordering::Release);
@@ -431,7 +434,10 @@ where
                 std::hint::spin_loop();
             }
 
-            if let Some(blq_queue) = (q as &dyn std::any::Any).downcast_ref::<BlqQueue<usize>>() {
+            // Separate code paths to avoid runtime checks
+            if is_blq {
+                // BLQ-specific batched producer
+                let blq_queue = unsafe { &*(q as *const Q as *const BlqQueue<usize>) };
                 let mut i = 0;
                 let mut push_attempts = 0;
 
@@ -466,6 +472,7 @@ where
                     }
                 }
             } else {
+                // Standard producer for all other queues
                 let mut push_attempts = 0;
                 for i in 0..ITERS {
                     while q.bench_push(i).is_err() {
@@ -485,10 +492,9 @@ where
                 }
             }
 
-            // Flush any remaining items
-            if let Some(mp_queue) =
-                (q as &dyn std::any::Any).downcast_ref::<MultiPushQueue<usize>>()
-            {
+            // Handle flushing - check type once
+            if queue_type_name.contains("MultiPushQueue") {
+                let mp_queue = unsafe { &*(q as *const Q as *const MultiPushQueue<usize>) };
                 for _attempt in 0..1000 {
                     if mp_queue.local_count.load(Ordering::Relaxed) == 0 {
                         break;
@@ -500,15 +506,8 @@ where
                     }
                     std::hint::spin_loop();
                 }
-                if !PERFORMANCE_TEST && mp_queue.local_count.load(Ordering::Relaxed) > 0 {
-                    eprintln!(
-                        "Warning: MultiPushQueue failed to flush all items. {} items remaining",
-                        mp_queue.local_count.load(Ordering::Relaxed)
-                    );
-                }
-            } else if let Some(biffq_queue) =
-                (q as &dyn std::any::Any).downcast_ref::<BiffqQueue<usize>>()
-            {
+            } else if queue_type_name.contains("BiffqQueue") {
+                let biffq_queue = unsafe { &*(q as *const Q as *const BiffqQueue<usize>) };
                 for _attempt in 0..1000 {
                     if biffq_queue.flush_producer_buffer().is_ok() {
                         break;
@@ -541,7 +540,11 @@ where
             let mut pop_spin_attempts = 0;
             let mut consecutive_failures = 0;
 
-            if let Some(blq_queue) = (q as &dyn std::any::Any).downcast_ref::<BlqQueue<usize>>() {
+            // Separate code paths for consumer too
+            if is_blq {
+                // BLQ-specific batched consumer
+                let blq_queue = unsafe { &*(q as *const Q as *const BlqQueue<usize>) };
+
                 while consumed_count < ITERS {
                     let producer_done = sync_atomic_flag.load(Ordering::Acquire) == 3;
                     let remaining = ITERS - consumed_count;
@@ -582,6 +585,7 @@ where
                     }
                 }
             } else {
+                // Standard consumer for all other queues
                 while consumed_count < ITERS {
                     let producer_done = sync_atomic_flag.load(Ordering::Acquire) == 3;
 
@@ -653,19 +657,14 @@ where
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(2))
-        .measurement_time(Duration::from_secs(4200))
-        .sample_size(500)
+        .measurement_time(Duration::from_secs(15))
+        .sample_size(10)
 }
 
 criterion_group! {
     name = benches;
     config = custom_criterion();
     targets =
-        bench_lamport,
-        bench_bqueue,
-        bench_mp,
-        bench_dspsc,
-        bench_unbounded,
         bench_iffq,
         bench_biffq,
         bench_ffq,

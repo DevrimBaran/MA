@@ -235,7 +235,6 @@ where
             }
 
             if is_blq {
-                // BLQ batched producer
                 let blq_queue = unsafe { &*(q as *const Q as *const BlqQueue<usize>) };
                 let mut i = 0;
                 let mut push_attempts = 0;
@@ -271,7 +270,6 @@ where
                     }
                 }
             } else {
-                // Standard producer for other queues
                 let mut push_attempts = 0;
                 for i in 0..ITERS {
                     while q.bench_push(i).is_err() {
@@ -300,7 +298,6 @@ where
             let mut consecutive_failures = 0;
 
             if is_blq {
-                // BLQ batched consumer
                 let blq_queue = unsafe { &*(q as *const Q as *const BlqQueue<usize>) };
 
                 while consumed_count < ITERS {
@@ -343,7 +340,6 @@ where
                     }
                 }
             } else {
-                // Standard consumer for other queues
                 while consumed_count < ITERS {
                     let producer_done = sync_atomic_flag.load(Ordering::Acquire) == 3;
 

@@ -11,14 +11,17 @@ use std::time::Duration;
 
 use queues::{
     spmc::{DavidQueue, EnqueuerState},
-    BiffqQueue, DQueue, SpscQueue, YangCrummeyQueue,
+    BlqQueue, DQueue, SpscQueue, YangCrummeyQueue,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
+
+use queues::spsc::blq::K_CACHE_LINE_SLOTS as BLQ_K_SLOTS;
 
 const PERFORMANCE_TEST: bool = false;
 const RING_CAP: usize = 32_768;
 const ITERS: usize = 300_000;
 const MAX_BENCH_SPIN_RETRY_ATTEMPTS: usize = 1_000_000_000;
+const BATCH_SIZE: usize = 32;
 
 trait BenchSpscQueue<T: Send>: Send + Sync + 'static {
     fn bench_push(&self, item: T) -> Result<(), ()>;
@@ -45,12 +48,12 @@ unsafe fn unmap_shared(ptr: *mut u8, len: usize) {
     assert_eq!(ret, 0, "munmap failed: {}", std::io::Error::last_os_error());
 }
 
-impl<T: Copy + Send + Default + 'static> BenchSpscQueue<T> for BiffqQueue<T> {
+impl<T: Send + 'static> BenchSpscQueue<T> for BlqQueue<T> {
     fn bench_push(&self, item: T) -> Result<(), ()> {
-        SpscQueue::push(self, item).map_err(|_e| ())
+        SpscQueue::push(self, item).map_err(|_| ())
     }
     fn bench_pop(&self) -> Result<T, ()> {
-        SpscQueue::pop(self).map_err(|_e| ())
+        SpscQueue::pop(self).map_err(|_| ())
     }
 }
 
@@ -89,23 +92,32 @@ impl<T: Send + Clone + 'static> BenchSpscQueue<T> for DavidQueueWrapper<T> {
     }
 }
 
-fn bench_biffq_native(c: &mut Criterion) {
-    c.bench_function("BiffQ (Native SPSC)", |b| {
+fn bench_blq_native(c: &mut Criterion) {
+    c.bench_function("BLQ (Native SPSC)", |b| {
         b.iter_custom(|_iters| {
-            assert!(RING_CAP.is_power_of_two());
-            assert_eq!(
-                RING_CAP % 32,
-                0,
-                "RING_CAP must be a multiple of BIFFQ H_PARTITION_SIZE (32)"
-            );
-            assert!(
-                RING_CAP >= 2 * 32,
-                "RING_CAP must be >= 2 * BIFFQ H_PARTITION_SIZE (64)"
-            );
+            let current_ring_cap = if RING_CAP <= BLQ_K_SLOTS {
+                let mut min_valid_cap = (BLQ_K_SLOTS + 1).next_power_of_two();
+                if min_valid_cap <= BLQ_K_SLOTS {
+                    min_valid_cap = (BLQ_K_SLOTS + 1).next_power_of_two();
+                    if min_valid_cap == 0 {
+                        min_valid_cap = 1 << (BLQ_K_SLOTS.leading_zeros() as usize + 1);
+                    }
+                }
+                if min_valid_cap < 16 {
+                    16
+                } else {
+                    min_valid_cap
+                }
+            } else {
+                RING_CAP.next_power_of_two()
+            };
 
-            let bytes = BiffqQueue::<usize>::shared_size(RING_CAP);
+            assert!(current_ring_cap.is_power_of_two());
+            assert!(current_ring_cap > BLQ_K_SLOTS);
+
+            let bytes = BlqQueue::<usize>::shared_size(current_ring_cap);
             let shm_ptr = unsafe { map_shared(bytes) };
-            let q = unsafe { BiffqQueue::init_in_shared(shm_ptr, RING_CAP) };
+            let q = unsafe { BlqQueue::init_in_shared(shm_ptr, current_ring_cap) };
 
             let dur = fork_and_run(q);
 
@@ -212,6 +224,9 @@ where
     let sync_atomic_flag = unsafe { &*(sync_shm as *const AtomicU32) };
     sync_atomic_flag.store(0, Ordering::Relaxed);
 
+    let queue_type_name = std::any::type_name::<Q>();
+    let is_blq = queue_type_name.contains("BlqQueue");
+
     match unsafe { fork() }.expect("fork failed") {
         ForkResult::Child => {
             sync_atomic_flag.store(1, Ordering::Release);
@@ -219,24 +234,53 @@ where
                 std::hint::spin_loop();
             }
 
-            let mut push_attempts = 0;
-            for i in 0..ITERS {
-                while q.bench_push(i).is_err() {
-                    push_attempts += 1;
-                    if push_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS {
-                        panic!("Producer exceeded max spin retry attempts for push");
-                    }
-                    std::hint::spin_loop();
-                }
-            }
+            if is_blq {
+                // BLQ batched producer
+                let blq_queue = unsafe { &*(q as *const Q as *const BlqQueue<usize>) };
+                let mut i = 0;
+                let mut push_attempts = 0;
 
-            if let Some(biffq_queue) = (q as &dyn std::any::Any).downcast_ref::<BiffqQueue<usize>>()
-            {
-                for _attempt in 0..1000 {
-                    if biffq_queue.flush_producer_buffer().is_ok() {
-                        break;
+                while i < ITERS {
+                    let remaining = ITERS - i;
+                    let batch_size = remaining.min(BATCH_SIZE);
+
+                    let space = blq_queue.blq_enq_space(batch_size);
+                    if space == 0 {
+                        push_attempts += 1;
+                        if push_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS {
+                            panic!("BLQ Producer exceeded max spin retry attempts");
+                        }
+                        std::hint::spin_loop();
+                        continue;
                     }
-                    std::hint::spin_loop();
+
+                    let to_push = space.min(batch_size);
+                    let mut pushed = 0;
+                    for j in 0..to_push {
+                        if blq_queue.blq_enq_local(i + j).is_ok() {
+                            pushed += 1;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    if pushed > 0 {
+                        blq_queue.blq_enq_publish();
+                        i += pushed;
+                        push_attempts = 0;
+                    }
+                }
+            } else {
+                // Standard producer for other queues
+                let mut push_attempts = 0;
+                for i in 0..ITERS {
+                    while q.bench_push(i).is_err() {
+                        push_attempts += 1;
+                        if push_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS {
+                            panic!("Producer exceeded max spin retry attempts for push");
+                        }
+                        std::hint::spin_loop();
+                    }
                 }
             }
 
@@ -253,23 +297,68 @@ where
             let start_time = std::time::Instant::now();
             let mut consumed_count = 0;
             let mut pop_spin_attempts = 0;
+            let mut consecutive_failures = 0;
 
-            while consumed_count < ITERS {
-                let producer_done = sync_atomic_flag.load(Ordering::Acquire) == 3;
+            if is_blq {
+                // BLQ batched consumer
+                let blq_queue = unsafe { &*(q as *const Q as *const BlqQueue<usize>) };
 
-                if let Ok(_item) = q.bench_pop() {
-                    consumed_count += 1;
-                    pop_spin_attempts = 0;
-                } else {
-                    pop_spin_attempts += 1;
+                while consumed_count < ITERS {
+                    let producer_done = sync_atomic_flag.load(Ordering::Acquire) == 3;
+                    let remaining = ITERS - consumed_count;
+                    let batch_size = remaining.min(BATCH_SIZE);
 
-                    if pop_spin_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS && !producer_done {
-                        panic!(
-                            "Consumer exceeded max spin retry attempts for pop (producer not done)"
-                        );
+                    let available = blq_queue.blq_deq_space(batch_size);
+                    if available == 0 {
+                        pop_spin_attempts += 1;
+                        consecutive_failures += 1;
+
+                        if producer_done && consecutive_failures > 1000 {
+                            break;
+                        }
+
+                        if pop_spin_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS && !producer_done {
+                            panic!("BLQ Consumer exceeded max spin retry attempts");
+                        }
+
+                        std::hint::spin_loop();
+                        continue;
                     }
 
-                    std::hint::spin_loop();
+                    let to_pop = available.min(batch_size);
+                    let mut popped = 0;
+                    for _ in 0..to_pop {
+                        if blq_queue.blq_deq_local().is_ok() {
+                            popped += 1;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    if popped > 0 {
+                        blq_queue.blq_deq_publish();
+                        consumed_count += popped;
+                        pop_spin_attempts = 0;
+                        consecutive_failures = 0;
+                    }
+                }
+            } else {
+                // Standard consumer for other queues
+                while consumed_count < ITERS {
+                    let producer_done = sync_atomic_flag.load(Ordering::Acquire) == 3;
+
+                    if let Ok(_item) = q.bench_pop() {
+                        consumed_count += 1;
+                        pop_spin_attempts = 0;
+                    } else {
+                        pop_spin_attempts += 1;
+
+                        if pop_spin_attempts > MAX_BENCH_SPIN_RETRY_ATTEMPTS && !producer_done {
+                            panic!("Consumer exceeded max spin retry attempts for pop (producer not done)");
+                        }
+
+                        std::hint::spin_loop();
+                    }
                 }
             }
 
@@ -300,15 +389,15 @@ where
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(1))
-        .measurement_time(Duration::from_secs(4200))
-        .sample_size(500)
+        .measurement_time(Duration::from_secs(15))
+        .sample_size(10)
 }
 
 criterion_group! {
     name = benches;
     config = custom_criterion();
     targets =
-        bench_biffq_native,
+        bench_blq_native,
         bench_ymc_as_spsc,
         bench_dqueue_as_spsc,
         bench_david_as_spsc,

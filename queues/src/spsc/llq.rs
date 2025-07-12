@@ -6,7 +6,7 @@ use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub const K_CACHE_LINE_SLOTS: usize = 8; // Section 3.2 - K value
+pub const K_CACHE_LINE_SLOTS: usize = 4; // Section 3.2 - K value
 
 // Shared control variables - groups A and B
 #[repr(C)]

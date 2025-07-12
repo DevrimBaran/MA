@@ -4,25 +4,48 @@ use std::cell::UnsafeCell;
 use std::fmt;
 use std::mem::MaybeUninit;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 const H_PARTITION_SIZE: usize = 32; // Section 4.2 - H value
 
-// Compact slot with atomic flag - Section 4.1
-#[repr(C)]
+// 8-byte slot with flag in pointer - Section 4.1
+#[repr(transparent)]
 struct Slot<T> {
-    flag: AtomicBool, // false = empty (NULL_ELEM), true = full
-    _pad: [u8; 8 - std::mem::size_of::<AtomicBool>()], // Align data to 8 bytes
-    data: UnsafeCell<MaybeUninit<T>>,
+    ptr: AtomicPtr<T>,
 }
 
 impl<T> Slot<T> {
+    const FLAG_BIT: usize = 0x1; // Use lowest bit as flag
+
     fn new() -> Self {
         Self {
-            flag: AtomicBool::new(false), // Initially empty
-            _pad: [0u8; 8 - std::mem::size_of::<AtomicBool>()],
-            data: UnsafeCell::new(MaybeUninit::uninit()),
+            ptr: AtomicPtr::new(ptr::null_mut()),
         }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        let ptr = self.ptr.load(Ordering::Acquire);
+        ptr.is_null() || (ptr as usize & Self::FLAG_BIT) == 0
+    }
+
+    #[inline]
+    fn store_data(&self, data_ptr: *mut T) {
+        // Set flag bit to indicate "full"
+        let tagged_ptr = ((data_ptr as usize) | Self::FLAG_BIT) as *mut T;
+        self.ptr.store(tagged_ptr, Ordering::Release);
+    }
+
+    #[inline]
+    fn load_data(&self) -> *mut T {
+        let tagged_ptr = self.ptr.load(Ordering::Acquire);
+        // Clear flag bit to get real pointer
+        ((tagged_ptr as usize) & !Self::FLAG_BIT) as *mut T
+    }
+
+    #[inline]
+    fn clear(&self) {
+        self.ptr.store(ptr::null_mut(), Ordering::Release);
     }
 }
 
@@ -48,7 +71,8 @@ pub struct IffqQueue<T: Send + 'static> {
     mask: usize,   // For fast modulo
     h_mask: usize, // H_PARTITION_SIZE - 1
     buffer: *mut Slot<T>,
-    owns_buffer: bool, // IPC adaptation
+    data_buffer: *mut UnsafeCell<MaybeUninit<T>>, // IPC: separate data storage
+    owns_buffer: bool,                            // IPC adaptation
 }
 
 unsafe impl<T: Send> Send for IffqQueue<T> {}
@@ -78,8 +102,13 @@ impl<T: Send + 'static> IffqQueue<T> {
         );
 
         let layout = std::alloc::Layout::new::<Self>();
-        let buffer_layout = std::alloc::Layout::array::<Slot<T>>(capacity).unwrap();
-        layout.extend(buffer_layout).unwrap().0.size()
+        let slot_layout = std::alloc::Layout::array::<Slot<T>>(capacity).unwrap();
+        let data_layout =
+            std::alloc::Layout::array::<UnsafeCell<MaybeUninit<T>>>(capacity).unwrap();
+
+        let (layout_with_slots, _) = layout.extend(slot_layout).unwrap();
+        let (final_layout, _) = layout_with_slots.extend(data_layout).unwrap();
+        final_layout.size()
     }
 
     // IPC adaptation - initialize in pre-allocated shared memory
@@ -99,11 +128,16 @@ impl<T: Send + 'static> IffqQueue<T> {
         );
 
         let queue_ptr = mem_ptr as *mut Self;
-        let buffer_data_ptr = mem_ptr.add(std::mem::size_of::<Self>()) as *mut Slot<T>;
+        let slot_buffer_ptr = mem_ptr.add(std::mem::size_of::<Self>()) as *mut Slot<T>;
+        let data_buffer_ptr = slot_buffer_ptr.add(capacity) as *mut UnsafeCell<MaybeUninit<T>>;
 
         // Initialize all slots as empty
         for i in 0..capacity {
-            ptr::write(buffer_data_ptr.add(i), Slot::new());
+            ptr::write(slot_buffer_ptr.add(i), Slot::new());
+            ptr::write(
+                data_buffer_ptr.add(i),
+                UnsafeCell::new(MaybeUninit::uninit()),
+            );
         }
 
         // Initialize with 2H slots unused - Section 4.2
@@ -121,7 +155,8 @@ impl<T: Send + 'static> IffqQueue<T> {
                 capacity,
                 mask: capacity - 1,
                 h_mask: H_PARTITION_SIZE - 1,
-                buffer: buffer_data_ptr,
+                buffer: slot_buffer_ptr,
+                data_buffer: data_buffer_ptr,
                 owns_buffer: false, // IPC - buffer not heap allocated
             },
         );
@@ -131,6 +166,11 @@ impl<T: Send + 'static> IffqQueue<T> {
     #[inline]
     fn get_slot(&self, index: usize) -> &Slot<T> {
         unsafe { &*self.buffer.add(index & self.mask) }
+    }
+
+    #[inline]
+    fn get_data_ptr(&self, index: usize) -> *mut UnsafeCell<MaybeUninit<T>> {
+        unsafe { self.data_buffer.add(index & self.mask) }
     }
 
     // iffq_enqueue - Figure 11 in paper
@@ -145,7 +185,7 @@ impl<T: Send + 'static> IffqQueue<T> {
             let slot_to_check_idx = next_limit_potential & self.mask;
 
             let slot = self.get_slot(slot_to_check_idx);
-            if slot.flag.load(Ordering::Acquire) {
+            if !slot.is_empty() {
                 // Slot occupied
                 return Err(IffqPushError(item));
             }
@@ -162,14 +202,15 @@ impl<T: Send + 'static> IffqQueue<T> {
         }
 
         let slot = self.get_slot(current_write);
+        let data_ptr = self.get_data_ptr(current_write);
 
         // Write data first
         unsafe {
-            (*slot.data.get()).write(item);
+            (*(*data_ptr).get()).write(item);
         }
 
-        // Set flag - linearization point
-        slot.flag.store(true, Ordering::Release);
+        // Set flag with data pointer - linearization point
+        slot.store_data(data_ptr as *mut T);
 
         self.prod
             .write
@@ -183,15 +224,16 @@ impl<T: Send + 'static> IffqQueue<T> {
         let slot = self.get_slot(current_read);
 
         // Check if slot is full
-        if !slot.flag.load(Ordering::Acquire) {
+        if slot.is_empty() {
             return Err(IffqPopError);
         }
 
-        // Read data
-        let item = unsafe { (*slot.data.get()).assume_init_read() };
+        // Get data pointer and read data
+        let data_ptr = slot.load_data() as *mut UnsafeCell<MaybeUninit<T>>;
+        let item = unsafe { (*(*data_ptr).get()).assume_init_read() };
 
         // Clear flag
-        slot.flag.store(false, Ordering::Release);
+        slot.clear();
 
         self.cons
             .read
@@ -247,16 +289,13 @@ impl<T: Send + 'static> SpscQueue<T> for IffqQueue<T> {
         // Check if can advance limit
         let next_limit_potential = limit.wrapping_add(H_PARTITION_SIZE);
         let slot_to_check_idx = next_limit_potential & self.mask;
-        !self
-            .get_slot(slot_to_check_idx)
-            .flag
-            .load(Ordering::Acquire)
+        self.get_slot(slot_to_check_idx).is_empty()
     }
 
     #[inline]
     fn empty(&self) -> bool {
         let current_read = self.cons.read.load(Ordering::Acquire);
-        !self.get_slot(current_read).flag.load(Ordering::Acquire)
+        self.get_slot(current_read).is_empty()
     }
 }
 

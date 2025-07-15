@@ -155,11 +155,28 @@ impl ThreadRecord {
     }
 }
 
-// GlobalPair - modified Head/Tail for phase2 pointer (Section 3.2)
+// GlobalPair - modified for versioned CAS approach
 #[repr(C)]
 pub struct GlobalPair {
     pub cnt: AtomicU64,
-    ptr: AtomicU64, // phase2 pointer
+    versioned_ptr: AtomicU64, // bits 0-47: ptr, bits 48-63: version
+}
+
+impl GlobalPair {
+    const PTR_MASK: u64 = (1 << 48) - 1;
+    const VERSION_SHIFT: u64 = 48;
+
+    fn pack_ptr_version(ptr: u64, version: u16) -> u64 {
+        ((version as u64) << Self::VERSION_SHIFT) | (ptr & Self::PTR_MASK)
+    }
+
+    fn extract_ptr(packed: u64) -> u64 {
+        packed & Self::PTR_MASK
+    }
+
+    fn extract_version(packed: u64) -> u16 {
+        (packed >> Self::VERSION_SHIFT) as u16
+    }
 }
 
 // InnerWCQ - core ring buffer structure
@@ -179,11 +196,11 @@ impl InnerWCQ {
             threshold: AtomicI32::new(-1),
             tail: GlobalPair {
                 cnt: AtomicU64::new(capacity as u64),
-                ptr: AtomicU64::new(0),
+                versioned_ptr: AtomicU64::new(0),
             },
             head: GlobalPair {
                 cnt: AtomicU64::new(capacity as u64),
-                ptr: AtomicU64::new(0),
+                versioned_ptr: AtomicU64::new(0),
             },
             ring_size,
             capacity,
@@ -672,7 +689,7 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         }
     }
 
-    // slow_F&A (modified faa not atomic) - Figure 7, lines 21-37
+    // slow_F&A (modified for versioned CAS) - Figure 7, lines 21-37
     unsafe fn slow_faa(
         &self,
         global: &GlobalPair,
@@ -722,7 +739,7 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             // Line 31 - prepare phase2 request
             self.prepare_phase2(phase2, local as *const _ as u64, cnt);
 
-            // Line 32 - increment global
+            // Line 32 - increment global with versioned CAS
             let mut global_attempts = 0;
             let mut success = false;
 
@@ -735,10 +752,33 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                         .compare_exchange(cnt, cnt + 1, Ordering::SeqCst, Ordering::Acquire)
                         .is_ok()
                     {
-                        global
-                            .ptr
-                            .store(phase2 as *const _ as u64, Ordering::SeqCst);
-                        success = true;
+                        // Now atomically update ptr with new version
+                        loop {
+                            let old_versioned = global.versioned_ptr.load(Ordering::Acquire);
+                            let version = GlobalPair::extract_version(old_versioned);
+
+                            let new_versioned = GlobalPair::pack_ptr_version(
+                                phase2 as *const _ as u64,
+                                version.wrapping_add(1),
+                            );
+
+                            if global
+                                .versioned_ptr
+                                .compare_exchange(
+                                    old_versioned,
+                                    new_versioned,
+                                    Ordering::SeqCst,
+                                    Ordering::Acquire,
+                                )
+                                .is_ok()
+                            {
+                                success = true;
+                                break;
+                            }
+
+                            // If failed, someone else updated - that's ok, cnt is already incremented
+                            break;
+                        }
                         break;
                     }
                 } else if old_cnt > cnt {
@@ -767,15 +807,26 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                 std::hint::spin_loop();
             }
 
-            // Line 35 - clear phase2 pointer
+            // Line 35 - clear phase2 pointer with versioned CAS
             if success {
                 let mut clear_attempts = 0;
                 while clear_attempts < 100 {
-                    let ptr = global.ptr.load(Ordering::Acquire);
-                    if ptr == phase2 as *const _ as u64 {
+                    let old_versioned = global.versioned_ptr.load(Ordering::Acquire);
+                    let old_ptr = GlobalPair::extract_ptr(old_versioned);
+
+                    if old_ptr == phase2 as *const _ as u64 {
+                        let version = GlobalPair::extract_version(old_versioned);
+                        let new_versioned =
+                            GlobalPair::pack_ptr_version(0, version.wrapping_add(1));
+
                         if global
-                            .ptr
-                            .compare_exchange(ptr, 0, Ordering::SeqCst, Ordering::Acquire)
+                            .versioned_ptr
+                            .compare_exchange(
+                                old_versioned,
+                                new_versioned,
+                                Ordering::SeqCst,
+                                Ordering::Acquire,
+                            )
                             .is_ok()
                         {
                             break;
@@ -792,7 +843,7 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
         }
     }
 
-    // load_global_help_phase2 - Figure 7, lines 77-88
+    // load_global_help_phase2 (modified for versioned CAS) - Figure 7, lines 77-88 (paper says we need cas2, not supported on synstem, so i changed alternative ll/sc version to versioned (knlöowledge from jayanti))
     unsafe fn load_global_help_phase2(
         &self,
         global: &GlobalPair,
@@ -814,7 +865,8 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
             }
 
             let gp_cnt = global.cnt.load(Ordering::Acquire); // Line 80
-            let gp_ptr = global.ptr.load(Ordering::Acquire); // Line 81
+            let versioned = global.versioned_ptr.load(Ordering::Acquire); // Line 81
+            let gp_ptr = GlobalPair::extract_ptr(versioned);
 
             if gp_ptr == 0 {
                 // Line 82
@@ -839,10 +891,17 @@ impl<T: Send + Clone + 'static> WCQueue<T> {
                     .ok(); // Line 86
             }
 
-            // Line 87 - clear phase2 pointer
+            // Line 87 - clear phase2 pointer with versioned CAS
+            let version = GlobalPair::extract_version(versioned);
+            let new_versioned = GlobalPair::pack_ptr_version(0, version.wrapping_add(1));
             global
-                .ptr
-                .compare_exchange(gp_ptr, 0, Ordering::Release, Ordering::Acquire)
+                .versioned_ptr
+                .compare_exchange(
+                    versioned,
+                    new_versioned,
+                    Ordering::Release,
+                    Ordering::Acquire,
+                )
                 .ok();
 
             return gp_cnt;

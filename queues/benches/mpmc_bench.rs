@@ -526,7 +526,7 @@ where
 }
 
 fn bench_wf_queue(c: &mut Criterion) {
-    let mut group = c.benchmark_group("VermaMPMC");
+    let mut group = c.benchmark_group("VermaMPMC_");
 
     for &(num_prods, num_cons) in PROCESS_COUNTS_TO_TEST {
         let items_per_process = ITEMS_PER_PROCESS_TARGET;
@@ -557,7 +557,7 @@ fn bench_wf_queue(c: &mut Criterion) {
 }
 
 fn bench_yang_crummey(c: &mut Criterion) {
-    let mut group = c.benchmark_group("YangCrummeyMPMC");
+    let mut group = c.benchmark_group("YangCrummeyMPMC_");
 
     for &(num_prods, num_cons) in PROCESS_COUNTS_TO_TEST {
         let items_per_process = ITEMS_PER_PROCESS_TARGET;
@@ -590,7 +590,7 @@ fn bench_yang_crummey(c: &mut Criterion) {
 }
 
 fn bench_wcq_queue(c: &mut Criterion) {
-    let mut group = c.benchmark_group("WCQueueMPMC");
+    let mut group = c.benchmark_group("WCQueueMPMC_");
 
     for &(num_prods, num_cons) in PROCESS_COUNTS_TO_TEST {
         let items_per_process = ITEMS_PER_PROCESS_TARGET;
@@ -621,7 +621,7 @@ fn bench_wcq_queue(c: &mut Criterion) {
 }
 
 fn bench_turn_queue(c: &mut Criterion) {
-    let mut group = c.benchmark_group("TurnQueueMPMC");
+    let mut group = c.benchmark_group("TurnQueueMPMC_");
 
     for &(num_prods, num_cons) in PROCESS_COUNTS_TO_TEST {
         let items_per_process = ITEMS_PER_PROCESS_TARGET;
@@ -652,7 +652,7 @@ fn bench_turn_queue(c: &mut Criterion) {
 }
 
 fn bench_feldman_dechev_wf_queue(c: &mut Criterion) {
-    let mut group = c.benchmark_group("FeldmanDechevWFMPMC");
+    let mut group = c.benchmark_group("FeldmanDechevWFMPMC_");
 
     for &(num_prods, num_cons) in PROCESS_COUNTS_TO_TEST {
         let items_per_process = ITEMS_PER_PROCESS_TARGET;
@@ -685,7 +685,7 @@ fn bench_feldman_dechev_wf_queue(c: &mut Criterion) {
 }
 
 fn bench_kogan_petrank_queue(c: &mut Criterion) {
-    let mut group = c.benchmark_group("KoganPetrankMPMC");
+    let mut group = c.benchmark_group("KoganPetrankMPMC_");
 
     for &(num_prods, num_cons) in PROCESS_COUNTS_TO_TEST {
         let items_per_process = ITEMS_PER_PROCESS_TARGET;
@@ -718,17 +718,14 @@ fn bench_kogan_petrank_queue(c: &mut Criterion) {
 fn custom_criterion() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_secs(1))
-        .measurement_time(Duration::from_secs(4200))
-        .sample_size(500)
+        .measurement_time(Duration::from_secs(15))
+        .sample_size(10)
 }
 
 criterion_group! {
     name = benches;
     config = custom_criterion();
     targets =
-        bench_feldman_dechev_wf_queue,
-        bench_wf_queue,
-        bench_yang_crummey,
         bench_wcq_queue,
         bench_turn_queue,
         bench_kogan_petrank_queue

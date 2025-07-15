@@ -1,0 +1,559 @@
+running 63 tests
+test miri_edge_cases::test_alternating_operations ... ok
+test miri_edge_cases::test_zero_items ... ok
+test miri_test_feldman_dechev::test_basic_operations ... warning: integer-to-pointer cast
+   --> /home/baran/Dokumente/Uni/MA/MA/queues/src/mpmc/feldman_dechev_queue.rs:62:27
+    |
+62  |                 let ptr = (self.value & !DELAY_MARK_MASK) as *mut ValueType<usize>;
+    |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+    |
+    = help: this program is using integer-to-pointer casts or (equivalently) `ptr::with_exposed_provenance`, which means that Miri might miss pointer bugs in this program
+    = help: see https://doc.rust-lang.org/nightly/std/ptr/fn.with_exposed_provenance.html for more details on that operation
+    = help: to ensure that Miri does not miss bugs in your program, use Strict Provenance APIs (https://doc.rust-lang.org/nightly/std/ptr/index.html#strict-provenance, https://crates.io/crates/sptr) instead
+    = help: you can then set `MIRIFLAGS=-Zmiri-strict-provenance` to ensure you are not relying on `with_exposed_provenance` semantics
+    = help: alternatively, `MIRIFLAGS=-Zmiri-permissive-provenance` disables this warning
+    = note: BACKTRACE on thread `miri_test_feldm`:
+    = note: inside `queues::Node::get_seqid` at /home/baran/Dokumente/Uni/MA/MA/queues/src/mpmc/feldman_dechev_queue.rs:62:27: 62:83
+note: inside `queues::FeldmanDechevWFQueue::<usize>::dequeue`
+   --> /home/baran/Dokumente/Uni/MA/MA/queues/src/mpmc/feldman_dechev_queue.rs:588:24
+    |
+588 |                     if node.get_seqid() > seqid {
+    |                        ^^^^^^^^^^^^^^^^
+note: inside `<queues::FeldmanDechevWFQueue<usize> as queues::MpmcQueue<usize>>::pop`
+   --> /home/baran/Dokumente/Uni/MA/MA/queues/src/mpmc/feldman_dechev_queue.rs:966:9
+    |
+966 |         self.dequeue(thread_id)
+    |         ^^^^^^^^^^^^^^^^^^^^^^^
+note: inside `miri_test_feldman_dechev::test_basic_operations`
+   --> tests/miri_mpmc_tests.rs:42:27
+    |
+42  |                       match queue.pop(0) {
+    |                             ^^^^^^^^^^^^
+...
+381 | / mpmc_miri_test_queue!(
+382 | |     miri_test_feldman_dechev,
+383 | |     FeldmanDechevWFQueue<usize>,
+384 | |     FeldmanDechevWFQueue::<usize>::init_in_shared,
+385 | |     FeldmanDechevWFQueue::<usize>::shared_size
+386 | | );
+    | |_- in this macro invocation
+note: inside closure
+   --> tests/miri_mpmc_tests.rs:31:39
+    |
+31  |               fn test_basic_operations() {
+    |                                         ^
+...
+381 | / mpmc_miri_test_queue!(
+382 | |     miri_test_feldman_dechev,
+383 | |     FeldmanDechevWFQueue<usize>,
+384 | |     FeldmanDechevWFQueue::<usize>::init_in_shared,
+385 | |     FeldmanDechevWFQueue::<usize>::shared_size
+386 | | );
+    | |_- in this macro invocation
+    = note: this warning originates in the macro `mpmc_miri_test_queue` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: integer-to-pointer cast
+   --> /home/baran/Dokumente/Uni/MA/MA/queues/src/mpmc/feldman_dechev_queue.rs:76:13
+    |
+76  |             (self.value & !DELAY_MARK_MASK) as *mut ValueType<usize>
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+    |
+    = note: BACKTRACE on thread `miri_test_feldm`:
+    = note: inside `queues::Node::get_value_ptr` at /home/baran/Dokumente/Uni/MA/MA/queues/src/mpmc/feldman_dechev_queue.rs:76:13: 76:69
+note: inside `queues::FeldmanDechevWFQueue::<usize>::dequeue`
+   --> /home/baran/Dokumente/Uni/MA/MA/queues/src/mpmc/feldman_dechev_queue.rs:615:49
+    |
+615 | ...                   let value_ptr = node.get_value_ptr();
+    |                                       ^^^^^^^^^^^^^^^^^^^^
+note: inside `<queues::FeldmanDechevWFQueue<usize> as queues::MpmcQueue<usize>>::pop`
+   --> /home/baran/Dokumente/Uni/MA/MA/queues/src/mpmc/feldman_dechev_queue.rs:966:9
+    |
+966 |         self.dequeue(thread_id)
+    |         ^^^^^^^^^^^^^^^^^^^^^^^
+note: inside `miri_test_feldman_dechev::test_basic_operations`
+   --> tests/miri_mpmc_tests.rs:42:27
+    |
+42  |                       match queue.pop(0) {
+    |                             ^^^^^^^^^^^^
+...
+381 | / mpmc_miri_test_queue!(
+382 | |     miri_test_feldman_dechev,
+383 | |     FeldmanDechevWFQueue<usize>,
+384 | |     FeldmanDechevWFQueue::<usize>::init_in_shared,
+385 | |     FeldmanDechevWFQueue::<usize>::shared_size
+386 | | );
+    | |_- in this macro invocation
+note: inside closure
+   --> tests/miri_mpmc_tests.rs:31:39
+    |
+31  |               fn test_basic_operations() {
+    |                                         ^
+...
+381 | / mpmc_miri_test_queue!(
+382 | |     miri_test_feldman_dechev,
+383 | |     FeldmanDechevWFQueue<usize>,
+384 | |     FeldmanDechevWFQueue::<usize>::init_in_shared,
+385 | |     FeldmanDechevWFQueue::<usize>::shared_size
+386 | | );
+    | |_- in this macro invocation
+    = note: this warning originates in the macro `mpmc_miri_test_queue` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+ok
+test miri_test_feldman_dechev::test_concurrent_enqueue ... warning: integer-to-pointer cast
+   --> tests/miri_mpmc_tests.rs:229:48
+    |
+229 |                               let q = unsafe { &*(queue_ptr as *const $queue_type) };
+    |                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+...
+381 | / mpmc_miri_test_queue!(
+382 | |     miri_test_feldman_dechev,
+383 | |     FeldmanDechevWFQueue<usize>,
+384 | |     FeldmanDechevWFQueue::<usize>::init_in_shared,
+385 | |     FeldmanDechevWFQueue::<usize>::shared_size
+386 | | );
+    | |_- in this macro invocation
+    |
+    = note: BACKTRACE on thread `unnamed-5`:
+    = note: inside closure at tests/miri_mpmc_tests.rs:229:48: 229:81
+    = note: this warning originates in the macro `mpmc_miri_test_queue` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+ok
+test miri_test_feldman_dechev::test_is_full_basic ... ok
+test miri_test_feldman_dechev::test_multiple_operations ... ok
+test miri_test_feldman_dechev::test_simple_concurrent ... warning: integer-to-pointer cast
+   --> tests/miri_mpmc_tests.rs:168:44
+    |
+168 |                           let q = unsafe { &*(queue_ptr as *const $queue_type) };
+    |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+...
+381 | / mpmc_miri_test_queue!(
+382 | |     miri_test_feldman_dechev,
+383 | |     FeldmanDechevWFQueue<usize>,
+384 | |     FeldmanDechevWFQueue::<usize>::init_in_shared,
+385 | |     FeldmanDechevWFQueue::<usize>::shared_size
+386 | | );
+    | |_- in this macro invocation
+    |
+    = note: BACKTRACE on thread `unnamed-10`:
+    = note: inside closure at tests/miri_mpmc_tests.rs:168:44: 168:77
+    = note: this warning originates in the macro `mpmc_miri_test_queue` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: integer-to-pointer cast
+   --> tests/miri_mpmc_tests.rs:182:44
+    |
+182 |                           let q = unsafe { &*(queue_ptr as *const $queue_type) };
+    |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+...
+381 | / mpmc_miri_test_queue!(
+382 | |     miri_test_feldman_dechev,
+383 | |     FeldmanDechevWFQueue<usize>,
+384 | |     FeldmanDechevWFQueue::<usize>::init_in_shared,
+385 | |     FeldmanDechevWFQueue::<usize>::shared_size
+386 | | );
+    | |_- in this macro invocation
+    |
+    = note: BACKTRACE on thread `unnamed-11`:
+    = note: inside closure at tests/miri_mpmc_tests.rs:182:44: 182:77
+    = note: this warning originates in the macro `mpmc_miri_test_queue` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+ok
+test miri_test_feldman_dechev::test_small_sequence ... ok
+test miri_test_feldman_dechev::test_thread_id_bounds ... ok
+test miri_test_feldman_dechev_enhanced::test_active_operations_miri ... ok
+test miri_test_feldman_dechev_enhanced::test_alternating_operations_miri ... ok
+test miri_test_feldman_dechev_enhanced::test_is_empty_and_is_full_miri ... ok
+test miri_test_feldman_dechev_enhanced::test_node_methods_miri ... ok
+test miri_test_feldman_dechev_enhanced::test_operation_record_methods_miri ... ok
+test miri_test_kogan_petrank::test_basic_operations ... warning: integer-to-pointer cast
+   --> /home/baran/Dokumente/Uni/MA/MA/queues/src/mpmc/kogan_petrank.rs:87:19
+    |
+87  |         let ptr = self.data.load(Ordering::Acquire) as *const OpDesc<T>;
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+    |
+    = note: BACKTRACE on thread `miri_test_kogan`:
+    = note: inside `queues::mpmc::kogan_petrank::AtomicOpDesc::<usize>::load` at /home/baran/Dokumente/Uni/MA/MA/queues/src/mpmc/kogan_petrank.rs:87:19: 87:72
+note: inside `queues::KPQueue::<usize>::max_phase`
+   --> /home/baran/Dokumente/Uni/MA/MA/queues/src/mpmc/kogan_petrank.rs:229:35
+    |
+229 |             let desc: OpDesc<T> = self.get_state(i).load();
+    |                                   ^^^^^^^^^^^^^^^^^^^^^^^^
+note: inside `queues::KPQueue::<usize>::enqueue`
+   --> /home/baran/Dokumente/Uni/MA/MA/queues/src/mpmc/kogan_petrank.rs:425:25
+    |
+425 |             let phase = self.max_phase() + 1; // Line 62
+    |                         ^^^^^^^^^^^^^^^^
+note: inside `<queues::KPQueue<usize> as queues::MpmcQueue<usize>>::push`
+   --> /home/baran/Dokumente/Uni/MA/MA/queues/src/mpmc/kogan_petrank.rs:591:9
+    |
+591 |         self.enqueue(thread_id, item)
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: inside `miri_test_kogan_petrank::test_basic_operations`
+   --> tests/miri_mpmc_tests.rs:40:29
+    |
+40  |                       assert!(queue.push(1, 0).is_ok(), "Push should succeed");
+    |                               ^^^^^^^^^^^^^^^^
+...
+560 | / mpmc_miri_test_queue!(
+561 | |     miri_test_kogan_petrank,
+562 | |     KPQueue<usize>,
+563 | |     KPQueue::<usize>::init_in_shared,
+564 | |     KPQueue::<usize>::shared_size
+565 | | );
+    | |_- in this macro invocation
+note: inside closure
+   --> tests/miri_mpmc_tests.rs:31:39
+    |
+31  |               fn test_basic_operations() {
+    |                                         ^
+...
+560 | / mpmc_miri_test_queue!(
+561 | |     miri_test_kogan_petrank,
+562 | |     KPQueue<usize>,
+563 | |     KPQueue::<usize>::init_in_shared,
+564 | |     KPQueue::<usize>::shared_size
+565 | | );
+    | |_- in this macro invocation
+    = note: this warning originates in the macro `mpmc_miri_test_queue` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: integer-to-pointer cast
+   --> /home/baran/Dokumente/Uni/MA/MA/queues/src/mpmc/kogan_petrank.rs:109:27
+    |
+109 |         let current_ptr = self.data.load(Ordering::Acquire) as *mut OpDesc<T>;
+    |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+    |
+    = note: BACKTRACE on thread `miri_test_kogan`:
+    = note: inside `queues::mpmc::kogan_petrank::AtomicOpDesc::<usize>::compare_exchange` at /home/baran/Dokumente/Uni/MA/MA/queues/src/mpmc/kogan_petrank.rs:109:27: 109:78
+note: inside `queues::KPQueue::<usize>::help_finish_enq`
+   --> /home/baran/Dokumente/Uni/MA/MA/queues/src/mpmc/kogan_petrank.rs:312:29
+    |
+312 |                       let _ = self.get_state(tid).compare_exchange(
+    |  _____________________________^
+313 | |                         &cur_desc,
+314 | |                         new_desc,
+315 | |                         self.get_desc_pool(tid),
+316 | |                     );
+    | |_____________________^
+note: inside `queues::KPQueue::<usize>::help_enq`
+   --> /home/baran/Dokumente/Uni/MA/MA/queues/src/mpmc/kogan_petrank.rs:282:33
+    |
+282 | ...                   self.help_finish_enq(); // Line 75
+    |                       ^^^^^^^^^^^^^^^^^^^^^^
+note: inside `queues::KPQueue::<usize>::help`
+   --> /home/baran/Dokumente/Uni/MA/MA/queues/src/mpmc/kogan_petrank.rs:249:21
+    |
+249 |                     self.help_enq(i, desc.phase);
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: inside `queues::KPQueue::<usize>::enqueue`
+   --> /home/baran/Dokumente/Uni/MA/MA/queues/src/mpmc/kogan_petrank.rs:433:13
+    |
+433 |             self.help(phase); // Line 64
+    |             ^^^^^^^^^^^^^^^^
+note: inside `<queues::KPQueue<usize> as queues::MpmcQueue<usize>>::push`
+   --> /home/baran/Dokumente/Uni/MA/MA/queues/src/mpmc/kogan_petrank.rs:591:9
+    |
+591 |         self.enqueue(thread_id, item)
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: inside `miri_test_kogan_petrank::test_basic_operations`
+   --> tests/miri_mpmc_tests.rs:40:29
+    |
+40  |                       assert!(queue.push(1, 0).is_ok(), "Push should succeed");
+    |                               ^^^^^^^^^^^^^^^^
+...
+560 | / mpmc_miri_test_queue!(
+561 | |     miri_test_kogan_petrank,
+562 | |     KPQueue<usize>,
+563 | |     KPQueue::<usize>::init_in_shared,
+564 | |     KPQueue::<usize>::shared_size
+565 | | );
+    | |_- in this macro invocation
+note: inside closure
+   --> tests/miri_mpmc_tests.rs:31:39
+    |
+31  |               fn test_basic_operations() {
+    |                                         ^
+...
+560 | / mpmc_miri_test_queue!(
+561 | |     miri_test_kogan_petrank,
+562 | |     KPQueue<usize>,
+563 | |     KPQueue::<usize>::init_in_shared,
+564 | |     KPQueue::<usize>::shared_size
+565 | | );
+    | |_- in this macro invocation
+    = note: this warning originates in the macro `mpmc_miri_test_queue` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+ok
+test miri_test_kogan_petrank::test_concurrent_enqueue ... warning: integer-to-pointer cast
+   --> tests/miri_mpmc_tests.rs:229:48
+    |
+229 |                               let q = unsafe { &*(queue_ptr as *const $queue_type) };
+    |                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+...
+560 | / mpmc_miri_test_queue!(
+561 | |     miri_test_kogan_petrank,
+562 | |     KPQueue<usize>,
+563 | |     KPQueue::<usize>::init_in_shared,
+564 | |     KPQueue::<usize>::shared_size
+565 | | );
+    | |_- in this macro invocation
+    |
+    = note: BACKTRACE on thread `unnamed-21`:
+    = note: inside closure at tests/miri_mpmc_tests.rs:229:48: 229:81
+    = note: this warning originates in the macro `mpmc_miri_test_queue` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+ok
+test miri_test_kogan_petrank::test_is_full_basic ... ok
+test miri_test_kogan_petrank::test_multiple_operations ... ok
+test miri_test_kogan_petrank::test_simple_concurrent ... warning: integer-to-pointer cast
+   --> tests/miri_mpmc_tests.rs:168:44
+    |
+168 |                           let q = unsafe { &*(queue_ptr as *const $queue_type) };
+    |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+...
+560 | / mpmc_miri_test_queue!(
+561 | |     miri_test_kogan_petrank,
+562 | |     KPQueue<usize>,
+563 | |     KPQueue::<usize>::init_in_shared,
+564 | |     KPQueue::<usize>::shared_size
+565 | | );
+    | |_- in this macro invocation
+    |
+    = note: BACKTRACE on thread `unnamed-26`:
+    = note: inside closure at tests/miri_mpmc_tests.rs:168:44: 168:77
+    = note: this warning originates in the macro `mpmc_miri_test_queue` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: integer-to-pointer cast
+   --> tests/miri_mpmc_tests.rs:182:44
+    |
+182 |                           let q = unsafe { &*(queue_ptr as *const $queue_type) };
+    |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+...
+560 | / mpmc_miri_test_queue!(
+561 | |     miri_test_kogan_petrank,
+562 | |     KPQueue<usize>,
+563 | |     KPQueue::<usize>::init_in_shared,
+564 | |     KPQueue::<usize>::shared_size
+565 | | );
+    | |_- in this macro invocation
+    |
+    = note: BACKTRACE on thread `unnamed-27`:
+    = note: inside closure at tests/miri_mpmc_tests.rs:182:44: 182:77
+    = note: this warning originates in the macro `mpmc_miri_test_queue` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+ok
+test miri_test_kogan_petrank::test_small_sequence ... ok
+test miri_test_kogan_petrank::test_thread_id_bounds ... ok
+test miri_test_turn_queue::test_basic_operations ... ok
+test miri_test_turn_queue::test_concurrent_enqueue ... warning: integer-to-pointer cast
+   --> tests/miri_mpmc_tests.rs:229:48
+    |
+229 |                               let q = unsafe { &*(queue_ptr as *const $queue_type) };
+    |                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+...
+374 | / mpmc_miri_test_queue!(
+375 | |     miri_test_turn_queue,
+376 | |     TurnQueue<usize>,
+377 | |     TurnQueue::<usize>::init_in_shared,
+378 | |     TurnQueue::<usize>::shared_size
+379 | | );
+    | |_- in this macro invocation
+    |
+    = note: BACKTRACE on thread `unnamed-32`:
+    = note: inside closure at tests/miri_mpmc_tests.rs:229:48: 229:81
+    = note: this warning originates in the macro `mpmc_miri_test_queue` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+ok
+test miri_test_turn_queue::test_is_full_basic ... ok
+test miri_test_turn_queue::test_multiple_operations ... ok
+test miri_test_turn_queue::test_simple_concurrent ... warning: integer-to-pointer cast
+   --> tests/miri_mpmc_tests.rs:168:44
+    |
+168 |                           let q = unsafe { &*(queue_ptr as *const $queue_type) };
+    |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+...
+374 | / mpmc_miri_test_queue!(
+375 | |     miri_test_turn_queue,
+376 | |     TurnQueue<usize>,
+377 | |     TurnQueue::<usize>::init_in_shared,
+378 | |     TurnQueue::<usize>::shared_size
+379 | | );
+    | |_- in this macro invocation
+    |
+    = note: BACKTRACE on thread `unnamed-37`:
+    = note: inside closure at tests/miri_mpmc_tests.rs:168:44: 168:77
+    = note: this warning originates in the macro `mpmc_miri_test_queue` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: integer-to-pointer cast
+   --> tests/miri_mpmc_tests.rs:182:44
+    |
+182 |                           let q = unsafe { &*(queue_ptr as *const $queue_type) };
+    |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+...
+374 | / mpmc_miri_test_queue!(
+375 | |     miri_test_turn_queue,
+376 | |     TurnQueue<usize>,
+377 | |     TurnQueue::<usize>::init_in_shared,
+378 | |     TurnQueue::<usize>::shared_size
+379 | | );
+    | |_- in this macro invocation
+    |
+    = note: BACKTRACE on thread `unnamed-38`:
+    = note: inside closure at tests/miri_mpmc_tests.rs:182:44: 182:77
+    = note: this warning originates in the macro `mpmc_miri_test_queue` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+ok
+test miri_test_turn_queue::test_small_sequence ... ok
+test miri_test_turn_queue::test_thread_id_bounds ... ok
+test miri_test_wcq_enhanced::test_entry_and_entrypair_packing_miri ... ok
+test miri_test_wcq_enhanced::test_inner_wcq_new_miri ... ok
+test miri_test_wcq_enhanced::test_phase2rec_new_miri ... ok
+test miri_test_wcq_enhanced::test_wcq_basic_operations_miri ... ok
+test miri_test_wcq_enhanced::test_wcq_cache_remap_miri ... ok
+test miri_test_wcq_enhanced::test_wcq_cycle_calculation_miri ... ok
+test miri_test_wcq_enhanced::test_wcq_is_empty_and_is_full_miri ... ok
+test miri_test_wcqueue::test_basic_operations ... ok
+test miri_test_wcqueue::test_concurrent_enqueue ... warning: integer-to-pointer cast
+   --> tests/miri_mpmc_tests.rs:229:48
+    |
+229 |                               let q = unsafe { &*(queue_ptr as *const $queue_type) };
+    |                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+...
+567 | / mpmc_miri_test_queue!(
+568 | |     miri_test_wcqueue,
+569 | |     WCQueue<usize>,
+570 | |     WCQueue::<usize>::init_in_shared,
+571 | |     WCQueue::<usize>::shared_size
+572 | | );
+    | |_- in this macro invocation
+    |
+    = note: BACKTRACE on thread `unnamed-50`:
+    = note: inside closure at tests/miri_mpmc_tests.rs:229:48: 229:81
+    = note: this warning originates in the macro `mpmc_miri_test_queue` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+ok
+test miri_test_wcqueue::test_is_full_basic ... ok
+test miri_test_wcqueue::test_multiple_operations ... ok
+test miri_test_wcqueue::test_simple_concurrent ... warning: integer-to-pointer cast
+   --> tests/miri_mpmc_tests.rs:168:44
+    |
+168 |                           let q = unsafe { &*(queue_ptr as *const $queue_type) };
+    |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+...
+567 | / mpmc_miri_test_queue!(
+568 | |     miri_test_wcqueue,
+569 | |     WCQueue<usize>,
+570 | |     WCQueue::<usize>::init_in_shared,
+571 | |     WCQueue::<usize>::shared_size
+572 | | );
+    | |_- in this macro invocation
+    |
+    = note: BACKTRACE on thread `unnamed-55`:
+    = note: inside closure at tests/miri_mpmc_tests.rs:168:44: 168:77
+    = note: this warning originates in the macro `mpmc_miri_test_queue` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: integer-to-pointer cast
+   --> tests/miri_mpmc_tests.rs:182:44
+    |
+182 |                           let q = unsafe { &*(queue_ptr as *const $queue_type) };
+    |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+...
+567 | / mpmc_miri_test_queue!(
+568 | |     miri_test_wcqueue,
+569 | |     WCQueue<usize>,
+570 | |     WCQueue::<usize>::init_in_shared,
+571 | |     WCQueue::<usize>::shared_size
+572 | | );
+    | |_- in this macro invocation
+    |
+    = note: BACKTRACE on thread `unnamed-56`:
+    = note: inside closure at tests/miri_mpmc_tests.rs:182:44: 182:77
+    = note: this warning originates in the macro `mpmc_miri_test_queue` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+ok
+test miri_test_wcqueue::test_small_sequence ... ok
+test miri_test_wcqueue::test_thread_id_bounds ... ok
+test miri_test_wfqueue::test_basic_operations ... ok
+test miri_test_wfqueue::test_concurrent_enqueue ... ok
+test miri_test_wfqueue::test_is_full_basic ... ok
+test miri_test_wfqueue::test_multiple_operations ... ok
+test miri_test_wfqueue::test_simple_concurrent ... ok
+test miri_test_wfqueue::test_small_sequence ... warning: integer-to-pointer cast
+   --> tests/miri_mpmc_tests.rs:719:36
+    |
+719 |                 let q = unsafe { &*(queue_ptr as *const WFQueue<usize>) };
+    |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+    |
+    = note: BACKTRACE on thread `unnamed-65`:
+    = note: inside closure at tests/miri_mpmc_tests.rs:719:36: 719:72
+
+ok
+test miri_test_wfqueue::test_thread_id_bounds ... ok
+test miri_test_yang_crummey::test_basic_operations ... ok
+test miri_test_yang_crummey::test_concurrent_enqueue ... warning: integer-to-pointer cast
+   --> tests/miri_mpmc_tests.rs:229:48
+    |
+229 |                               let q = unsafe { &*(queue_ptr as *const $queue_type) };
+    |                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+...
+269 | / mpmc_miri_test_queue!(
+270 | |     miri_test_yang_crummey,
+271 | |     YangCrummeyQueue<usize>,
+272 | |     YangCrummeyQueue::<usize>::init_in_shared,
+273 | |     YangCrummeyQueue::<usize>::shared_size
+274 | | );
+    | |_- in this macro invocation
+    |
+    = note: BACKTRACE on thread `unnamed-69`:
+    = note: inside closure at tests/miri_mpmc_tests.rs:229:48: 229:81
+    = note: this warning originates in the macro `mpmc_miri_test_queue` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+ok
+test miri_test_yang_crummey::test_is_full_basic ... ok
+test miri_test_yang_crummey::test_multiple_operations ... ok
+test miri_test_yang_crummey::test_simple_concurrent ... warning: integer-to-pointer cast
+   --> tests/miri_mpmc_tests.rs:168:44
+    |
+168 |                           let q = unsafe { &*(queue_ptr as *const $queue_type) };
+    |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+...
+269 | / mpmc_miri_test_queue!(
+270 | |     miri_test_yang_crummey,
+271 | |     YangCrummeyQueue<usize>,
+272 | |     YangCrummeyQueue::<usize>::init_in_shared,
+273 | |     YangCrummeyQueue::<usize>::shared_size
+274 | | );
+    | |_- in this macro invocation
+    |
+    = note: BACKTRACE on thread `unnamed-74`:
+    = note: inside closure at tests/miri_mpmc_tests.rs:168:44: 168:77
+    = note: this warning originates in the macro `mpmc_miri_test_queue` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: integer-to-pointer cast
+   --> tests/miri_mpmc_tests.rs:182:44
+    |
+182 |                           let q = unsafe { &*(queue_ptr as *const $queue_type) };
+    |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+...
+269 | / mpmc_miri_test_queue!(
+270 | |     miri_test_yang_crummey,
+271 | |     YangCrummeyQueue<usize>,
+272 | |     YangCrummeyQueue::<usize>::init_in_shared,
+273 | |     YangCrummeyQueue::<usize>::shared_size
+274 | | );
+    | |_- in this macro invocation
+    |
+    = note: BACKTRACE on thread `unnamed-75`:
+    = note: inside closure at tests/miri_mpmc_tests.rs:182:44: 182:77
+    = note: this warning originates in the macro `mpmc_miri_test_queue` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+ok
+test miri_test_yang_crummey::test_small_sequence ... ok
+test miri_test_yang_crummey::test_thread_id_bounds ... ok
+test miri_test_ymc_enhanced::test_deq_req_methods_miri ... ok
+test miri_test_ymc_enhanced::test_enq_req_methods_miri ... ok
+test miri_test_ymc_enhanced::test_ymc_basic_operations_miri ... ok
+test miri_test_ymc_enhanced::test_ymc_constants_miri ... ok
+test miri_test_ymc_enhanced::test_ymc_is_empty_and_is_full_miri ... ok
+test test_memory_allocation_helpers ... ok
+test test_type_names ... ok
+
+test result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3377.93s
